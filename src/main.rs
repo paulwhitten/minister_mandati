@@ -13,6 +13,7 @@ mod eval;
 mod loop_guard;
 mod presenter;
 mod schema;
+mod session;
 mod tools;
 
 use approval::needs_approval;
@@ -20,7 +21,9 @@ use config::Config;
 use context::{AgentContext, Message};
 use loop_guard::{Intervention, LoopGuards};
 use presenter::{Approval, CliPresenter, Presenter};
-use tools::ToolRegistry;
+use serde_json::{Value, json};
+use std::time::Instant;
+use tools::{ToolRegistry, truncate_middle};
 
 /// Retries after the server rejects a prompt as too long (see docs/context.md).
 const MAX_OVERFLOW_RETRIES: u32 = 2;
@@ -50,6 +53,36 @@ struct Cli {
     /// instruction is given on a terminal).
     #[arg(short, long)]
     interactive: bool,
+
+    /// Write a transcript of this session to the transcript directory
+    /// (default ~/.mima/transcripts). Off by default.
+    #[arg(long)]
+    transcript: bool,
+}
+
+/// How mima was invoked; recorded in the transcript and used for messages.
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    OneShot,
+    Piped,
+    Interactive,
+}
+
+impl Mode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Mode::OneShot => "one_shot",
+            Mode::Piped => "piped",
+            Mode::Interactive => "interactive",
+        }
+    }
+}
+
+/// How a turn ended.
+enum TurnOutcome {
+    Answered(String),
+    LoopGuard,
+    StepCap,
 }
 
 #[tokio::main]
@@ -78,31 +111,44 @@ async fn run(cli: Cli, presenter: &mut dyn Presenter) -> Result<(), snafu::Whate
     configure_window(&mut ctx).await;
 
     let joined = cli.instruction.join(" ");
-    let instruction = joined.trim();
-
-    if cli.interactive {
-        let seed = (!instruction.is_empty()).then(|| instruction.to_string());
-        return run_repl(&mut ctx, &registry, presenter, seed).await;
-    }
-
-    if !instruction.is_empty() {
-        return run_single_shot(&mut ctx, &registry, presenter, instruction).await;
-    }
-
-    // No instruction: REPL on a terminal, otherwise consume piped stdin once.
-    if io::stdin().is_terminal() {
-        run_repl(&mut ctx, &registry, presenter, None).await
-    } else {
+    let mut task = joined.trim().to_string();
+    let mode = if cli.interactive || (task.is_empty() && io::stdin().is_terminal()) {
+        Mode::Interactive
+    } else if task.is_empty() {
         let mut piped = String::new();
         io::stdin()
             .read_to_string(&mut piped)
             .whatever_context("failed to read stdin")?;
-        let piped = piped.trim();
-        if piped.is_empty() {
+        task = piped.trim().to_string();
+        if task.is_empty() {
             return Ok(());
         }
-        run_single_shot(&mut ctx, &registry, presenter, piped).await
+        Mode::Piped
+    } else {
+        Mode::OneShot
+    };
+
+    if cli.transcript || ctx.config.session.transcripts {
+        enable_transcript(&mut ctx, mode);
     }
+    if mode != Mode::Interactive {
+        announce_transcript(&ctx, mode); // the REPL announces after its banner
+    }
+
+    let result = match mode {
+        Mode::Interactive => {
+            let seed = (!task.is_empty()).then_some(task);
+            run_repl(&mut ctx, &registry, presenter, seed).await
+        }
+        _ => run_single_shot(&mut ctx, &registry, presenter, &task)
+            .await
+            .map(|()| "task_done"),
+    };
+    match &result {
+        Ok(reason) => end_session(&mut ctx, reason, None),
+        Err(e) => end_session(&mut ctx, "fatal", Some(e.to_string())),
+    }
+    result.map(|_| ())
 }
 
 /// Sets the context window: `[context].window` if configured, else what the
@@ -124,6 +170,93 @@ async fn configure_window(ctx: &mut AgentContext) {
     }
 }
 
+/// Starts recording the current session. Returns false (after telling the
+/// operator) if the transcript cannot be opened; the agent keeps working.
+fn enable_transcript(ctx: &mut AgentContext, mode: Mode) -> bool {
+    let c = &ctx.config;
+    let b = ctx.stats().budget;
+    let header = json!({
+        "mode": mode.as_str(),
+        "mima_version": env!("CARGO_PKG_VERSION"),
+        "cwd": std::env::current_dir().ok(),
+        "model": c.provider.default_model,
+        "base_url": c.provider.base_url,
+        "window": b.window,
+        "budget": b.operating,
+        "approvals": {
+            "bash": c.security.require_approval_for_bash,
+            "writes": c.security.require_approval_for_writes,
+            "auto_approve_bash": c.security.auto_approve_bash,
+        },
+        "allowed_paths": c.security.allowed_paths,
+    });
+    match ctx.session.enable(header) {
+        Ok(path) => {
+            tracing::info!(path = %path.display(), "transcript enabled");
+            true
+        }
+        Err(e) => {
+            eprintln!("could not enable transcripts: {e}");
+            tracing::warn!(error = %e, "transcript could not be opened");
+            false
+        }
+    }
+}
+
+/// States at startup whether this session is being recorded. Interactive
+/// mode prints with the banner; one-shot modes print to stderr so stdout
+/// stays reserved for the answer.
+fn announce_transcript(ctx: &AgentContext, mode: Mode) {
+    let msg = match ctx.session.transcript_path() {
+        Some(path) => format!("Transcripts: on ({})", path.display()),
+        None if mode == Mode::Interactive => {
+            "Transcripts: off. Enable with /enable_transcript.".to_string()
+        }
+        None => "Transcripts: off. Enable with --transcript.".to_string(),
+    };
+    if mode == Mode::Interactive {
+        println!("{msg}");
+    } else {
+        eprintln!("{msg}");
+    }
+}
+
+/// Writes `session_end` (when recording) with the session's token totals.
+fn end_session(ctx: &mut AgentContext, reason: &str, error: Option<String>) {
+    let tokens = ledger_json(ctx);
+    ctx.session
+        .end(reason, json!({ "tokens": tokens, "error": error }));
+}
+
+fn ledger_json(ctx: &AgentContext) -> Value {
+    let l = ctx.token_ledger();
+    json!({
+        "requests": l.requests,
+        "prompt": l.prompt_tokens,
+        "completion": l.completion_tokens,
+        "unreported_requests": l.unreported_requests,
+    })
+}
+
+/// Records how a turn ended (`turn_end`).
+fn finish_turn(ctx: &mut AgentContext, outcome: &str, answer: Option<&str>, error: Option<String>) {
+    let tokens = ledger_json(ctx);
+    let turn = ctx.session.turn();
+    ctx.session.record(
+        "turn_end",
+        json!({ "turn": turn, "outcome": outcome, "answer": answer, "error": error, "tokens": tokens }),
+    );
+}
+
+fn record_outcome(ctx: &mut AgentContext, result: &Result<TurnOutcome, snafu::Whatever>) {
+    match result {
+        Ok(TurnOutcome::Answered(a)) => finish_turn(ctx, "answered", Some(a), None),
+        Ok(TurnOutcome::LoopGuard) => finish_turn(ctx, "loop_guard", None, None),
+        Ok(TurnOutcome::StepCap) => finish_turn(ctx, "step_cap", None, None),
+        Err(e) => finish_turn(ctx, "error", None, Some(e.to_string())),
+    }
+}
+
 /// One task with top-level Ctrl-C cancellation (exit 130).
 async fn run_single_shot(
     ctx: &mut AgentContext,
@@ -131,24 +264,34 @@ async fn run_single_shot(
     presenter: &mut dyn Presenter,
     instruction: &str,
 ) -> Result<(), snafu::Whatever> {
-    tokio::select! {
-        result = run_turn(ctx, registry, presenter, instruction) => result,
-        _ = tokio::signal::ctrl_c() => {
+    let result = tokio::select! {
+        result = run_turn(ctx, registry, presenter, instruction) => Some(result),
+        _ = tokio::signal::ctrl_c() => None,
+    };
+    match result {
+        Some(result) => {
+            record_outcome(ctx, &result);
+            result.map(|_| ())
+        }
+        None => {
             eprintln!("\ninterrupted");
             tracing::info!("cancelled by user (ctrl-c)");
+            finish_turn(ctx, "cancelled", None, None);
+            end_session(ctx, "interrupted", None);
             std::process::exit(130);
         }
     }
 }
 
-/// Interactive loop over a single persistent `AgentContext`. Ctrl-C cancels the
+/// Interactive loop over a persistent `AgentContext`. Ctrl-C cancels the
 /// current turn and returns to the prompt; Ctrl-D (EOF) or `/exit` quits.
+/// Returns why the session ended.
 async fn run_repl(
     ctx: &mut AgentContext,
     registry: &ToolRegistry,
     presenter: &mut dyn Presenter,
     seed: Option<String>,
-) -> Result<(), snafu::Whatever> {
+) -> Result<&'static str, snafu::Whatever> {
     use tokio::signal::unix::{SignalKind, signal};
 
     // A persistent SIGINT stream keeps Ctrl-C from killing the REPL process.
@@ -156,6 +299,7 @@ async fn run_repl(
         signal(SignalKind::interrupt()).whatever_context("failed to install SIGINT handler")?;
 
     println!("minister_mandati (mima) — interactive mode. /help for commands, Ctrl-D to exit.");
+    announce_transcript(ctx, Mode::Interactive);
 
     if let Some(seed) = seed {
         run_turn_cancellable(ctx, registry, presenter, &seed, &mut sigint).await;
@@ -170,7 +314,7 @@ async fn run_repl(
             .whatever_context("failed to read input")?;
         if read == 0 {
             println!();
-            break; // Ctrl-D / EOF
+            return Ok("eof"); // Ctrl-D
         }
         let line = line.trim();
         if line.is_empty() {
@@ -178,10 +322,19 @@ async fn run_repl(
         }
         if let Some(cmd) = line.strip_prefix('/') {
             match cmd {
-                "exit" | "quit" => break,
-                "reset" => {
-                    ctx.reset();
-                    println!("context reset.");
+                "exit" | "quit" => return Ok("exit"),
+                "new" | "reset" => new_session(ctx),
+                "session" => print_session(ctx),
+                "enable_transcript" => {
+                    if let Some(path) = ctx.session.transcript_path() {
+                        println!("Transcripts: already on ({})", path.display());
+                    } else if enable_transcript(ctx, Mode::Interactive) {
+                        announce_transcript(ctx, Mode::Interactive);
+                    }
+                }
+                "disable_transcript" => {
+                    ctx.session.disable();
+                    println!("Transcripts: off.");
                 }
                 "tokens" => print_tokens(ctx),
                 "context" => print_context(ctx),
@@ -192,7 +345,35 @@ async fn run_repl(
         }
         run_turn_cancellable(ctx, registry, presenter, line, &mut sigint).await;
     }
-    Ok(())
+}
+
+/// `/new`: ends the current session and starts a fresh one (new id, empty
+/// context). Recording carries over: if the old session had a transcript,
+/// the new one gets its own.
+fn new_session(ctx: &mut AgentContext) {
+    let recording = ctx.session.is_recording();
+    end_session(ctx, "new", None);
+    ctx.reset();
+    ctx.session = ctx.session.successor();
+    if recording {
+        enable_transcript(ctx, Mode::Interactive);
+    }
+    println!("New session {}.", ctx.session.id());
+    announce_transcript(ctx, Mode::Interactive);
+}
+
+/// Prints the session id, start time and transcript state (REPL `/session`).
+fn print_session(ctx: &AgentContext) {
+    let s = &ctx.session;
+    let transcript = s
+        .transcript_path()
+        .map_or("off".to_string(), |p| p.display().to_string());
+    println!(
+        "session {} — started {}, turns: {}, transcript: {transcript}",
+        s.id(),
+        s.started_utc(),
+        s.turn()
+    );
 }
 
 /// Run one turn but abandon it cleanly on Ctrl-C, rolling history back to its
@@ -205,32 +386,41 @@ async fn run_turn_cancellable(
     sigint: &mut tokio::signal::unix::Signal,
 ) {
     let checkpoint = ctx.checkpoint();
-    let cancelled = tokio::select! {
-        result = run_turn(ctx, registry, presenter, instruction) => {
+    let result = tokio::select! {
+        result = run_turn(ctx, registry, presenter, instruction) => Some(result),
+        _ = sigint.recv() => None,
+    };
+    match result {
+        Some(result) => {
+            record_outcome(ctx, &result);
             if let Err(e) = result {
                 eprintln!("error: {e}"); // keep the REPL alive on turn errors
             }
-            false
         }
-        _ = sigint.recv() => true,
-    };
-    if cancelled {
-        ctx.rollback_to(checkpoint);
-        eprintln!("\n^C — cancelled; back to prompt.");
+        None => {
+            ctx.rollback_to(checkpoint);
+            finish_turn(ctx, "cancelled", None, None);
+            eprintln!("\n^C — cancelled; back to prompt.");
+        }
     }
 }
 
 /// A single agent task: seed the instruction, then run the tool loop to a final
-/// answer or the step cap.
+/// answer, a loop-guard stop, or the step cap.
 async fn run_turn(
     ctx: &mut AgentContext,
     registry: &ToolRegistry,
     presenter: &mut dyn Presenter,
     instruction: &str,
-) -> Result<(), snafu::Whatever> {
+) -> Result<TurnOutcome, snafu::Whatever> {
     tracing::info!(instruction = %instruction, "starting task");
     presenter.task_started(instruction);
     ctx.begin_turn(instruction);
+    let turn = ctx.session.next_turn();
+    ctx.session.record(
+        "turn_start",
+        json!({ "turn": turn, "instruction": instruction }),
+    );
 
     let max_steps = ctx.config.agent.max_steps;
     let mut guards = LoopGuards::new(
@@ -246,13 +436,42 @@ async fn run_turn(
         let mut overflow_retries = 0;
         let response = loop {
             ctx.prepare_request();
+            let started = Instant::now();
             let result =
                 client::generate_completion(ctx, &mut |delta| presenter.stream_delta(delta)).await;
             // Terminate any streamed line before logging, so log lines never run
             // into the model's output.
             presenter.stream_end();
+            let duration_ms = started.elapsed().as_millis() as u64;
             match result {
-                Err(e) if e.is_context_overflow() && overflow_retries < MAX_OVERFLOW_RETRIES => {
+                Ok(r) => {
+                    let calls: Vec<Value> = r
+                        .tool_calls
+                        .iter()
+                        .flatten()
+                        .map(|c| json!({ "id": c.id, "name": c.name, "args": c.args }))
+                        .collect();
+                    let usage = r.usage.map(
+                        |u| json!({ "prompt": u.prompt_tokens, "completion": u.completion_tokens }),
+                    );
+                    ctx.session.record(
+                        "model_response",
+                        json!({ "turn": turn, "step": step, "duration_ms": duration_ms,
+                                "content": r.content, "tool_calls": calls, "usage": usage }),
+                    );
+                    break r;
+                }
+                Err(e) => {
+                    let overflow = e.is_context_overflow();
+                    let retry = overflow && overflow_retries < MAX_OVERFLOW_RETRIES;
+                    ctx.session.record(
+                        "model_error",
+                        json!({ "turn": turn, "step": step, "duration_ms": duration_ms,
+                                "error": e.to_string(), "overflow": overflow, "retry": retry }),
+                    );
+                    if !retry {
+                        return Err(e).whatever_context("model completion failed");
+                    }
                     overflow_retries += 1;
                     tracing::warn!(error = %e, attempt = overflow_retries, "prompt too long for the model; compacting and retrying");
                     if !ctx.handle_overflow(e.reported_window(), e.reported_prompt_tokens()) {
@@ -262,7 +481,6 @@ async fn run_turn(
                         );
                     }
                 }
-                other => break other.whatever_context("model completion failed")?,
             }
         };
 
@@ -287,7 +505,7 @@ async fn run_turn(
                 }
                 log_token_summary(ctx);
                 tracing::info!("task complete");
-                return Ok(());
+                return Ok(TurnOutcome::Answered(final_msg));
             }
         };
 
@@ -304,26 +522,34 @@ async fn run_turn(
             let repeats = guards.observe(fp);
             let policy = registry.dedupe_policy(&call.name);
 
-            let payload = if let Some(skipped) = guards.skip_result(&call.name, policy, fp) {
+            let started = Instant::now();
+            let output = if let Some(skipped) = guards.skip_result(&call.name, policy, fp) {
                 tracing::info!(tool = %call.name, "duplicate call skipped");
+                record_approval(ctx, turn, &call.id, "skipped_duplicate");
                 skipped
             } else {
-                if needs_approval(&ctx.config, &call) {
+                let decision = if needs_approval(&ctx.config, &call) {
                     let decision = presenter
                         .request_approval(&call)
                         .whatever_context("approval prompt failed")?;
                     if decision == Approval::Deny {
+                        record_approval(ctx, turn, &call.id, "denied");
                         ctx.add_message(Message::tool_result(
                             &call.id,
                             "Error: user denied permission for this action.",
                         ));
                         continue;
                     }
-                }
-                match registry
-                    .execute(&call.name, &call.args, ctx.output_cap_bytes())
-                    .await
+                    "approved"
+                } else if call.name == "execute_bash"
+                    && ctx.config.security.require_approval_for_bash
                 {
+                    "auto_approved"
+                } else {
+                    "not_required"
+                };
+                record_approval(ctx, turn, &call.id, decision);
+                match registry.execute(&call.name, &call.args).await {
                     Ok(out) => {
                         guards.record_success(policy, fp, &out);
                         out
@@ -334,21 +560,40 @@ async fn run_turn(
                     }
                 }
             };
-            presenter.tool_completed(&call.name, &payload);
-            ctx.add_message(Message::tool_result(&call.id, &payload));
+            // Stage 0 (docs/context.md): the model sees a capped copy; the
+            // transcript keeps the full output.
+            let sent = truncate_middle(output.clone(), ctx.output_cap_bytes());
+            let stored = ctx.session.stored_output(&output);
+            ctx.session.record(
+                "tool_result",
+                json!({ "turn": turn, "call_id": call.id, "tool": call.name,
+                        "duration_ms": started.elapsed().as_millis() as u64,
+                        "failed": context::is_failure(&output),
+                        "bytes": output.len(), "sent_bytes": sent.len(), "output": stored }),
+            );
+            presenter.tool_completed(&call.name, &sent);
+            ctx.add_message(Message::tool_result(&call.id, &sent));
 
             match guards.intervention(repeats) {
                 Intervention::None => {}
                 Intervention::Nudge => {
                     tracing::warn!(repeats, tool = %call.name, "loop guard: nudge injected");
+                    ctx.session.record(
+                        "loop_guard",
+                        json!({ "turn": turn, "action": "nudge", "repeats": repeats, "tool": call.name }),
+                    );
                     nudge = true;
                 }
                 Intervention::Terminate => {
                     tracing::warn!(repeats, tool = %call.name, "loop guard tripped: terminating turn");
+                    ctx.session.record(
+                        "loop_guard",
+                        json!({ "turn": turn, "action": "terminate", "repeats": repeats, "tool": call.name }),
+                    );
                     ctx.normalize();
                     presenter.loop_detected(repeats);
                     log_token_summary(ctx);
-                    return Ok(());
+                    return Ok(TurnOutcome::LoopGuard);
                 }
             }
         }
@@ -363,7 +608,14 @@ async fn run_turn(
     tracing::warn!(max = max_steps, "reached step cap without completion");
     presenter.step_cap_reached(max_steps);
     log_token_summary(ctx);
-    Ok(())
+    Ok(TurnOutcome::StepCap)
+}
+
+fn record_approval(ctx: &mut AgentContext, turn: u64, call_id: &str, decision: &str) {
+    ctx.session.record(
+        "approval",
+        json!({ "turn": turn, "call_id": call_id, "decision": decision }),
+    );
 }
 
 /// Prints the context budget and current estimate (REPL `/context`).
@@ -397,8 +649,15 @@ fn print_tokens(ctx: &AgentContext) {
 /// Lists the REPL slash-commands.
 fn print_help() {
     println!(
-        "commands:\n  /help    show this help\n  /tokens  show token usage\n  /context show context budget\n  /reset   \
-         clear the conversation\n  /exit    quit (also Ctrl-D)"
+        "commands:\n  \
+         /help                show this help\n  \
+         /tokens              show token usage\n  \
+         /context             show context budget\n  \
+         /session             show session id, start time and transcript\n  \
+         /new                 start a new session (alias: /reset)\n  \
+         /enable_transcript   record this session to a transcript\n  \
+         /disable_transcript  stop recording\n  \
+         /exit                quit (also Ctrl-D)"
     );
 }
 

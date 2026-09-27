@@ -149,9 +149,11 @@ Planned, in order:
    rate (forgetting shows up as re-reading, not only as failures[^cost]).
    Small models may tolerate masking less well: Qwen3-32B scored 15.0% with
    masking versus 17.0% with no management[^trap].
-2. **Session transcript on disk**, so placeholders can point to the full
-   output instead of asking for a re-run. Off by default, since it stores tool
-   output locally.
+2. **Recall from the transcript.** Session transcripts now keep full tool
+   outputs and record which calls were masked ([sessions.md](sessions.md)).
+   Next: a read-only `recall_output(call_id)` tool so placeholders can point
+   to the stored output instead of asking for a re-run. Only possible when the
+   session is being recorded (transcripts are off by default).
 3. **Optional `/compact`**: a structured LLM summary of the masked span
    (goal, constraints, files, done and pending work, errors, next step),
    treating history as untrusted input and rejected if it does not shrink the

@@ -36,6 +36,8 @@ pub struct Config {
     pub security: Security,
     #[serde(default)]
     pub context: Context,
+    #[serde(default)]
+    pub session: SessionConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,6 +103,29 @@ pub struct Context {
     pub mask_to: f64,
     /// Newest tool output (fraction of E) protected from masking.
     pub keep_recent: f64,
+}
+
+/// Sessions and transcripts (see `docs/sessions.md`).
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct SessionConfig {
+    /// Write a transcript for each session. Off by default; can also be
+    /// enabled with `--transcript` or `/enable_transcript`.
+    pub transcripts: bool,
+    /// Where transcripts go; a leading `~/` means the home directory.
+    pub transcript_dir: String,
+    /// Largest single tool output stored in a transcript, in bytes.
+    pub max_output_bytes: usize,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            transcripts: false,
+            transcript_dir: "~/.mima/transcripts".to_string(),
+            max_output_bytes: 1 << 20,
+        }
+    }
 }
 
 impl Default for Context {

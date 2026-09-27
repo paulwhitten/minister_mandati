@@ -103,25 +103,17 @@ impl ToolRegistry {
     }
 
     /// Dispatch by name. Unknown tools return an error the loop surfaces to the model.
-    /// Output is capped at `max_output_bytes` (head and tail kept) to protect
-    /// the context window; the caller derives the cap from the context budget.
+    /// Returns the full output; the caller caps what enters the model's context
+    /// (see `truncate_middle`) and may keep the full copy in the transcript.
     #[tracing::instrument(skip_all, fields(tool = %name))]
-    pub async fn execute(
-        &self,
-        name: &str,
-        args: &Value,
-        max_output_bytes: usize,
-    ) -> Result<String> {
-        let out = match self.tools.get(name) {
-            Some(tool) => tool.execute(args).await?,
-            None => {
-                return UnknownToolSnafu {
-                    name: name.to_string(),
-                }
-                .fail();
+    pub async fn execute(&self, name: &str, args: &Value) -> Result<String> {
+        match self.tools.get(name) {
+            Some(tool) => tool.execute(args).await,
+            None => UnknownToolSnafu {
+                name: name.to_string(),
             }
-        };
-        Ok(truncate_middle(out, max_output_bytes))
+            .fail(),
+        }
     }
 }
 
