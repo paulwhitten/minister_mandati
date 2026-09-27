@@ -17,6 +17,7 @@ use crate::budget::{Budget, Estimator, FALLBACK_WINDOW, MIN_MASK_GAIN};
 use crate::client::{CompletionResponse, TokenUsage};
 use crate::config::Config;
 use crate::schema;
+use crate::session::{Session, expand_home};
 use crate::tools::ToolSpec;
 
 /// A single chat message in OpenAI wire format.
@@ -149,7 +150,7 @@ fn tool_call_ids(tool_calls: &Value) -> Vec<String> {
 
 /// Whether a tool result reports failure: a tool error, or a shell command
 /// with a non-zero exit status.
-fn is_failure(content: &str) -> bool {
+pub fn is_failure(content: &str) -> bool {
     content.starts_with("Error:")
         || (content.starts_with("exit: ") && !content.starts_with("exit: 0\n"))
 }
@@ -169,6 +170,8 @@ fn clip(s: &str, max: usize) -> &str {
 pub struct AgentContext {
     pub config: Config,
     pub tool_specs: Vec<ToolSpec>,
+    /// The current session and its (optional) transcript.
+    pub session: Session,
     messages: Vec<Message>,
     /// Number of leading messages that are never evicted (system + first user turn).
     pinned: usize,
@@ -194,9 +197,14 @@ impl AgentContext {
         let window = config.context.window.unwrap_or(FALLBACK_WINDOW);
         let budget = Budget::new(window, &config);
         let tool_schema_chars = schema::to_openai_tools(&tool_specs).to_string().len();
+        let session = Session::new(
+            expand_home(&config.session.transcript_dir),
+            config.session.max_output_bytes,
+        );
         Self {
             config,
             tool_specs,
+            session,
             messages: vec![Message::system(&system_prompt)],
             pinned: 1,
             turn_start: None,
@@ -416,6 +424,10 @@ impl AgentContext {
                 dropped_results = dropped,
                 "repaired tool call/result pairing"
             );
+            self.session.record(
+                "compaction",
+                json!({ "stage": "normalize", "added_results": added, "dropped_results": dropped }),
+            );
         }
     }
 
@@ -451,6 +463,7 @@ impl AgentContext {
         let before = self.estimated_tokens();
         let mut est = before;
         let mut count = 0;
+        let mut call_ids = Vec::new();
         for (i, placeholder, saved) in candidates {
             if est <= target {
                 break;
@@ -458,6 +471,7 @@ impl AgentContext {
             let m = &mut self.messages[i];
             m.content = Some(placeholder);
             m.masked = true;
+            call_ids.extend(m.tool_call_id.clone());
             est = est.saturating_sub(saved);
             count += 1;
         }
@@ -471,6 +485,12 @@ impl AgentContext {
             target,
             source = self.estimator.source(),
             "context compaction"
+        );
+        let after = self.estimated_tokens();
+        self.session.record(
+            "compaction",
+            json!({ "stage": "mask", "reason": reason, "call_ids": call_ids,
+                    "est_tokens_before": before, "est_tokens_after": after, "target": target }),
         );
         count
     }
@@ -527,12 +547,14 @@ impl AgentContext {
     fn evict(&mut self, target: usize, reason: &str) -> usize {
         let before = self.estimated_tokens();
         let mut removed = 0;
+        let mut call_ids: Vec<String> = Vec::new();
         while self.estimated_tokens() > target {
-            let n = self.evict_oldest_group();
-            if n == 0 {
+            let group = self.evict_oldest_group();
+            if group.is_empty() {
                 break;
             }
-            removed += n;
+            removed += group.len();
+            call_ids.extend(group.into_iter().filter_map(|m| m.tool_call_id));
         }
         if removed == 0 {
             return 0;
@@ -556,14 +578,21 @@ impl AgentContext {
             source = self.estimator.source(),
             "context compaction"
         );
+        let after = self.estimated_tokens();
+        self.session.record(
+            "compaction",
+            json!({ "stage": "evict", "reason": reason, "messages_removed": removed,
+                    "call_ids": call_ids, "est_tokens_before": before,
+                    "est_tokens_after": after, "target": target }),
+        );
         removed
     }
 
-    /// Removes the oldest evictable group and returns its size (0 when none).
+    /// Removes the oldest evictable group and returns it (empty when none).
     /// Earlier turns go first, then the current turn after its instruction.
     /// Never removed: the pinned leaders, the current instruction, the newest
     /// group, and groups holding protected results (see `protected_results`).
-    fn evict_oldest_group(&mut self) -> usize {
+    fn evict_oldest_group(&mut self) -> Vec<Message> {
         let protected = self.protected_results();
         let len = self.messages.len();
         let mut start = self.pinned;
@@ -574,21 +603,21 @@ impl AgentContext {
             }
             let end = self.group_end(start);
             if end >= len {
-                return 0; // the newest group stays
+                return Vec::new(); // the newest group stays
             }
             if protected.iter().any(|&p| (start..end).contains(&p)) {
                 start = end;
                 continue;
             }
-            self.messages.drain(start..end);
+            let group: Vec<Message> = self.messages.drain(start..end).collect();
             if let Some(t) = self.turn_start.as_mut()
                 && *t > start
             {
                 *t -= end - start;
             }
-            return end - start;
+            return group;
         }
-        0
+        Vec::new()
     }
 
     /// End (exclusive) of the group starting at `start`: an assistant tool-call

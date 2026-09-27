@@ -68,6 +68,9 @@ Options:
   -i, --interactive
           Stay in the interactive REPL after running INSTRUCTION (implied when no instruction is given on a terminal)
 
+      --transcript
+          Write a transcript of this session to the transcript directory (default ~/.mima/transcripts). Off by default
+
   -h, --help
           Print help (see a summary with '-h')
 
@@ -93,7 +96,8 @@ Modes:
 `-i` matters only when you also pass an instruction: plain `mima` on a
 terminal already starts the REPL, so `mima -i` on its own behaves the same.
 
-In the REPL, `/help` lists commands (`/tokens`, `/context`, `/reset`, `/exit`). Ctrl-C
+In the REPL, `/help` lists commands (`/tokens`, `/context`, `/session`, `/new`,
+`/enable_transcript`, `/disable_transcript`, `/exit`). Ctrl-C
 cancels the current turn and returns to the prompt; Ctrl-D exits. In one-shot
 mode, Ctrl-C aborts with exit code 130.
 
@@ -141,6 +145,21 @@ Static glibc still resolves hostnames through NSS at runtime, so behavior can
 differ from the dynamic build on hosts with unusual NSS configuration. A musl
 build (`--target x86_64-unknown-linux-musl`) avoids this but needs a musl C
 compiler (e.g. the `musl-tools` package) for the `ring` crate.
+
+## Sessions and transcripts
+
+Each run of `mima` is a session; in the REPL, `/new` starts a fresh one. A
+session can be recorded to a **transcript**: a JSON Lines file of timestamped
+events (UTC) in `~/.mima/transcripts/`, covering instructions, model
+responses, approvals, full tool outputs, context compactions and token usage.
+
+Transcripts are **off by default**, and `mima` says so when it starts. Enable
+them with `/enable_transcript` (REPL), `--transcript` (one run), or
+`[session].transcripts = true`. Files are private to your user (0600) and
+never leave the machine; they can contain source code and command output, so
+prune them as needed:
+`find ~/.mima/transcripts -name '*.jsonl' -mtime +30 -delete`. Format and
+record types: [docs/sessions.md](docs/sessions.md).
 
 ## Context management
 
