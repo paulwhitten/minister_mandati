@@ -29,6 +29,103 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+impl Error {
+    /// True when the server rejected the request because the prompt (plus the
+    /// reply reserve) does not fit the model's context window.
+    pub fn is_context_overflow(&self) -> bool {
+        match self {
+            Error::Status {
+                status: 400 | 413,
+                body,
+            } => {
+                let b = body.to_ascii_lowercase();
+                [
+                    "maximum context length",
+                    "context length",
+                    "context_length_exceeded",
+                    "context window",
+                    "prompt is too long",
+                    "too many tokens",
+                ]
+                .iter()
+                .any(|p| b.contains(p))
+            }
+            _ => false,
+        }
+    }
+
+    /// The window the server states in an overflow error, e.g. vLLM's "This
+    /// model's maximum context length is 8192 tokens".
+    pub fn reported_window(&self) -> Option<usize> {
+        let Error::Status { body, .. } = self else {
+            return None;
+        };
+        let lower = body.to_ascii_lowercase();
+        let rest = &lower[lower.find("maximum context length is")? + 25..];
+        let digits: String = rest
+            .trim_start()
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        digits.parse().ok()
+    }
+
+    /// The prompt size the server measured, when an overflow error states it:
+    /// vLLM's "(4904 in the messages, ...)" or "your request has 4500 input
+    /// tokens". Lets the caller recalibrate its estimate from the real count.
+    pub fn reported_prompt_tokens(&self) -> Option<u64> {
+        let Error::Status { body, .. } = self else {
+            return None;
+        };
+        let lower = body.to_ascii_lowercase();
+        if let Some(i) = lower.find(" in the messages") {
+            let digits: String = lower[..i]
+                .chars()
+                .rev()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            return digits.chars().rev().collect::<String>().parse().ok();
+        }
+        let rest = &lower[lower.find("your request has ")? + 17..];
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok()
+    }
+}
+
+/// Asks the server for the model's context window. vLLM lists it as
+/// `max_model_len` in `GET {base_url}/models`; other servers may not report
+/// it, in which case this returns `None`. Uses only the configured endpoint.
+pub async fn discover_context_window(cfg: &Config) -> Option<usize> {
+    let url = format!("{}/models", cfg.provider.base_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .ok()?;
+    let resp = client
+        .get(&url)
+        .bearer_auth(&cfg.provider.api_key)
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        tracing::debug!(status = resp.status().as_u16(), "model list unavailable");
+        return None;
+    }
+    let payload: Value = resp.json().await.ok()?;
+    window_from_models(&payload, &cfg.provider.default_model)
+}
+
+/// Picks `max_model_len` for `model` from a `/models` payload, or from the
+/// only listed model when ids differ (servers often alias the served name).
+fn window_from_models(payload: &Value, model: &str) -> Option<usize> {
+    let data = payload.get("data")?.as_array()?;
+    let entry = data
+        .iter()
+        .find(|m| m["id"].as_str() == Some(model))
+        .or_else(|| (data.len() == 1).then(|| &data[0]))?;
+    entry["max_model_len"].as_u64().map(|w| w as usize)
+}
+
 /// Token accounting from a single model response.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TokenUsage {
@@ -64,8 +161,6 @@ impl TokenUsage {
 pub struct CompletionResponse {
     pub content: Option<String>,
     pub tool_calls: Option<Vec<ToolCall>>,
-    /// Raw OpenAI `tool_calls` JSON, echoed back into history on the next turn.
-    pub raw_tool_calls: Option<Value>,
     /// Server-reported token usage for this request, when available.
     pub usage: Option<TokenUsage>,
 }
@@ -288,7 +383,6 @@ fn build_response(message: &Value, usage: Option<TokenUsage>, cfg: &Config) -> C
         .get("content")
         .and_then(|c| c.as_str())
         .map(|s| s.to_string());
-    let raw_tool_calls = message.get("tool_calls").cloned();
 
     // vLLM normalizes model-specific tool formats (e.g. Qwen3 XML via
     // --tool-call-parser qwen3_xml) into standard OpenAI tool_calls, so native
@@ -316,7 +410,6 @@ fn build_response(message: &Value, usage: Option<TokenUsage>, cfg: &Config) -> C
     CompletionResponse {
         content,
         tool_calls,
-        raw_tool_calls,
         usage,
     }
 }
@@ -324,6 +417,53 @@ fn build_response(message: &Value, usage: Option<TokenUsage>, cfg: &Config) -> C
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn status(code: u16, body: &str) -> Error {
+        Error::Status {
+            status: code,
+            body: body.into(),
+        }
+    }
+
+    #[test]
+    fn detects_vllm_overflow_and_reads_window() {
+        let e = status(
+            400,
+            r#"{"error":{"message":"This model's maximum context length is 8192 tokens. However, you requested 9000 tokens (4904 in the messages, 4096 in the completion)."}}"#,
+        );
+        assert!(e.is_context_overflow());
+        assert_eq!(e.reported_window(), Some(8192));
+        assert_eq!(e.reported_prompt_tokens(), Some(4904));
+
+        let newer = status(
+            400,
+            "'max_tokens' is too large: 4096. This model's maximum context length is 32768 tokens and your request has 30000 input tokens",
+        );
+        assert!(newer.is_context_overflow());
+        assert_eq!(newer.reported_window(), Some(32768));
+        assert_eq!(newer.reported_prompt_tokens(), Some(30000));
+    }
+
+    #[test]
+    fn other_errors_are_not_overflow() {
+        assert!(!status(400, "invalid tool schema").is_context_overflow());
+        assert!(!status(500, "maximum context length is 8192").is_context_overflow());
+        assert_eq!(status(400, "bad request").reported_window(), None);
+    }
+
+    #[test]
+    fn window_from_models_payload() {
+        let p = json!({ "data": [
+            { "id": "a", "max_model_len": 8192 },
+            { "id": "b", "max_model_len": 32768 },
+        ]});
+        assert_eq!(window_from_models(&p, "b"), Some(32768));
+        assert_eq!(window_from_models(&p, "missing"), None);
+        let single = json!({ "data": [{ "id": "served-name", "max_model_len": 131072 }] });
+        assert_eq!(window_from_models(&single, "alias"), Some(131072));
+        let ollama = json!({ "data": [{ "id": "llama3" }] });
+        assert_eq!(window_from_models(&ollama, "llama3"), None);
+    }
 
     #[test]
     fn tool_call_deltas_accumulate_across_chunks() {

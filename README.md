@@ -93,7 +93,7 @@ Modes:
 `-i` matters only when you also pass an instruction: plain `mima` on a
 terminal already starts the REPL, so `mima -i` on its own behaves the same.
 
-In the REPL, `/help` lists commands (`/tokens`, `/reset`, `/exit`). Ctrl-C
+In the REPL, `/help` lists commands (`/tokens`, `/context`, `/reset`, `/exit`). Ctrl-C
 cancels the current turn and returns to the prompt; Ctrl-D exits. In one-shot
 mode, Ctrl-C aborts with exit code 130.
 
@@ -142,6 +142,16 @@ differ from the dynamic build on hosts with unusual NSS configuration. A musl
 build (`--target x86_64-unknown-linux-musl`) avoids this but needs a musl C
 compiler (e.g. the `musl-tools` package) for the `ring` crate.
 
+## Context management
+
+`mima` sizes its working budget from the model's context window, which it
+reads from the server (vLLM reports `max_model_len`) or from `[context].window`.
+As the conversation grows it first hides old tool outputs behind one-line
+placeholders, keeping its own reasoning and tool calls, and only then drops
+the oldest steps. Tool calls and their results are never split. `/context`
+shows the current budget. Details and the research behind the approach:
+[docs/context.md](docs/context.md).
+
 ## Observability
 
 Logs use [`tracing`](https://docs.rs/tracing) and go to stderr (stdout stays
@@ -160,9 +170,9 @@ MIMA_LOG_FORMAT=json cargo run -- "..." # structured JSON logs for auditing
   `["cargo test", "git status"]`. Matching is whole-word, and any command with
   shell operators (`;`, `&`, `|`, `$`, backticks, parentheses, redirects,
   backslashes, newlines) still prompts. Auto-approvals are logged.
-- Shell commands are killed after `bash_timeout_secs` (default 300), and tool
-  output over `max_tool_output_bytes` (default 32 KiB) is truncated, keeping
-  the head and tail.
+- Shell commands are killed after `bash_timeout_secs` (default 300). Tool
+  output is capped relative to the model's context window, keeping the head
+  and tail.
 - `allowed_paths` sandboxes the **filesystem tools only**; it is not a shell
   sandbox — shell safety relies on the approval gate.
 

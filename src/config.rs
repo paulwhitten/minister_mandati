@@ -34,6 +34,8 @@ pub struct Config {
     pub agent: Agent,
     #[serde(default)]
     pub security: Security,
+    #[serde(default)]
+    pub context: Context,
 }
 
 #[derive(Debug, Deserialize)]
@@ -53,7 +55,7 @@ pub struct Provider {
 #[derive(Debug, Deserialize)]
 pub struct Agent {
     pub temperature: f32,
-    pub max_history_turns: usize,
+    /// Reply limit per request; also reserved out of the context window.
     pub max_tokens: usize,
     /// "native" | "react" | "auto"
     pub tool_calling: String,
@@ -82,10 +84,35 @@ pub struct Agent {
     /// Hard cap on tool/reasoning steps per task.
     #[serde(default = "default_max_steps")]
     pub max_steps: usize,
-    /// Tool output larger than this is truncated (head and tail kept) before it
-    /// is fed back to the model, to protect the context window.
-    #[serde(default = "default_max_tool_output_bytes")]
-    pub max_tool_output_bytes: usize,
+}
+
+/// Context-window management (see `docs/context.md`). Fractions are of the
+/// operating budget E = min(usable window, `budget`).
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct Context {
+    /// Context window in tokens; `None` discovers it from the server.
+    pub window: Option<usize>,
+    /// Operate below the window (tokens); `None` uses the whole usable window.
+    pub budget: Option<usize>,
+    /// Mask old tool outputs above this fraction of E ...
+    pub mask_at: f64,
+    /// ... down to this fraction (evicting oldest steps if masking cannot).
+    pub mask_to: f64,
+    /// Newest tool output (fraction of E) protected from masking.
+    pub keep_recent: f64,
+}
+
+impl Default for Context {
+    fn default() -> Self {
+        Self {
+            window: None,
+            budget: None,
+            mask_at: 0.6,
+            mask_to: 0.4,
+            keep_recent: 0.25,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -107,7 +134,6 @@ impl Default for Agent {
     fn default() -> Self {
         Self {
             temperature: 0.2,
-            max_history_turns: 20,
             max_tokens: 4096,
             tool_calling: "auto".to_string(),
             stream: true,
@@ -119,7 +145,6 @@ impl Default for Agent {
             loop_guard_window: 6,
             loop_guard_repeat_threshold: 3,
             max_steps: 50,
-            max_tool_output_bytes: default_max_tool_output_bytes(),
         }
     }
 }
@@ -178,10 +203,6 @@ fn default_loop_threshold() -> usize {
 
 fn default_max_steps() -> usize {
     50
-}
-
-fn default_max_tool_output_bytes() -> usize {
-    32 * 1024
 }
 
 fn default_bash_timeout_secs() -> u64 {
