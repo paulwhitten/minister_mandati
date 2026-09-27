@@ -1,0 +1,42 @@
+[provider]
+# "openai" | "anthropic" | "custom" (any OpenAI-compatible server)
+type = "custom"
+# Expanded from the environment at load time; use any stub value for local vLLM/Ollama.
+api_key = "${MIMA_API_KEY}"
+# Point at the AGX Thor on the LAN (vLLM default port 8000), or a local Ollama, or a cloud API.
+base_url = "http://thor.local:8000/v1"
+default_model = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
+
+[agent]
+temperature = 0.2
+max_history_turns = 20
+max_tokens = 4096
+# "native" | "react" | "auto" (probe native, fall back to ReAct)
+tool_calling = "auto"
+stream = true
+# Full-replacement system prompt; when non-empty it bypasses composition.
+system_prompt_override = ""
+# Composable system prompt. Omit a key to use the built-in default; set to ""
+# to suppress that segment. Env overrides: MIMA_SYSTEM_PROMPT_PREFIX / _BODY /
+# _SUFFIX, or MIMA_SYSTEM_PROMPT for a full replacement.
+# system_prompt_prefix = ""
+# system_prompt_body = ""
+# system_prompt_suffix = ""
+# Loop guards (see docs/design/design-loop-guards.md). Defaults shown.
+# dedupe_identical_writes = true      # skip identical, already-successful writes
+# loop_guard_window = 6               # sliding window for repeat detection
+# loop_guard_repeat_threshold = 3     # repeats within the window that intervene
+# max_steps = 50                      # hard cap on tool/reasoning steps per task
+# max_tool_output_bytes = 32768       # larger tool output is truncated (head+tail kept)
+
+[security]
+require_approval_for_bash = true
+require_approval_for_writes = true
+# Shell commands that skip the approval prompt. Each entry is a whole-word
+# prefix: "cargo test" also allows "cargo test --release". Any command with
+# shell operators (; & | ` $ ( ) < > \ or a newline) always prompts. Keep
+# entries specific: "git" alone would allow "git push --force".
+# auto_approve_bash = ["cargo test", "cargo build", "git status", "git diff"]
+# bash_timeout_secs = 300             # kill a shell command after this long
+# Sandbox for the filesystem tools ONLY. Does NOT constrain shell commands.
+allowed_paths = ["./"]
