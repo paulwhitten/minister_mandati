@@ -1,0 +1,36 @@
+[package]
+name = "minister_mandati"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Auditable, single-binary, edge-native, Linux-first coding agent"
+rust-version = "1.88"
+repository = "https://github.com/paulwhitten/minister_mandati"
+readme = "README.md"
+keywords = ["agent", "llm", "cli", "coding-agent", "edge"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "mima"
+path = "src/main.rs"
+
+[dependencies]
+async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+snafu = "0.8"
+toml = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "fs", "io-std", "io-util", "signal", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+# rustls (not OpenSSL) keeps the binary self-contained and easy to audit / statically link.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Small, auditable release binary. For a static build see "Building" in README.md.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
