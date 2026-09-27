@@ -1,6 +1,6 @@
 # Technical Specification: Lightweight Open-Source Rust Coding Agent
 
-> **Version:** v0.13.0 (design consolidated post-Phase 0)
+> **Version:** v0.15.0 (context management by window budget)
 > **Status:** Phase 0 research complete; scaffold runnable; consolidating design
 > **Crate name:** `minister_mandati` (binary `mima`)
 > **Config file:** `agent.toml` · **Binary:** `mima`
@@ -78,7 +78,7 @@ Established conventions:
 | Config file | `./agent.toml`, then `~/.config/minister_mandati/agent.toml` | explicit path argument |
 | Secrets | `${ENV_VAR}` expansion in config | any environment variable |
 | Temperature | `0.2` | `[agent].temperature` |
-| History window | `20` turns | `[agent].max_history_turns` |
+| Context budget | model window from the server (fallback 32768) | `[context]` (see [docs/context.md](docs/context.md)) |
 | Response budget | `4096` tokens | `[agent].max_tokens` |
 | Tool calling | `auto` (native, ReAct fallback) | `[agent].tool_calling` |
 | Approvals | bash and writes require approval | `[security]` flags |
@@ -179,6 +179,14 @@ lesson of both Berkeley MOOCs.
 * **Harness-swappable** so production == test (expose over MCP where practical).
 
 ## Changelog
+
+### v0.15.0
+
+* **Replaced** the message-count history window (`max_history_turns`) with a
+  budget derived from the model's context window: tool-output cap, masking of
+  old tool outputs, then whole-step eviction, with a pairing-normalization
+  pass before every request and compact-and-retry on server overflow. Design
+  and evidence in [docs/context.md](docs/context.md).
 
 ### v0.14.0
 
@@ -329,7 +337,6 @@ default_model = "deepseek-coder:32b"
 
 [agent]
 temperature = 0.2
-max_history_turns = 20      # sliding-window cap; see context management
 max_tokens = 4096           # response budget
 tool_calling = "auto"       # "native" | "react" | "auto" (probe, then fall back)
 stream = true               # stream assistant output to the terminal
@@ -415,7 +422,6 @@ async fn main() -> Result<()> {
             ctx.add_message(Message::tool_result(&call.id, &payload));
         }
 
-        ctx.enforce_budget(); // trim history to max_history_turns / token budget
     }
 
     eprintln!("Reached MAX_STEPS ({MAX_STEPS}) without completion.");
@@ -584,26 +590,15 @@ The parser extracts the fenced `action` block, deserializes it, and synthesizes 
 
 ## 5. Context & Token Management (`src/context.rs`)
 
-`AgentContext` owns the running message history plus the system prompt and tool specs. Because long agent sessions overflow the model's context window, it enforces a budget after every step:
+`AgentContext` owns the running message history plus the system prompt and tool specs. Before every model request it runs a budget pass sized from the model's context window (read from the server or `[context].window`):
 
-* **Turn window** — keep at most `max_history_turns` user/assistant/tool exchanges, always preserving the system prompt and the original user instruction.
-* **Token estimate** — approximate token count (chars/4 heuristic, or a real tokenizer later) and evict the oldest non-pinned turns until the request fits `context_window − max_tokens`.
-* **Tool-output truncation** — cap large stdout/stderr payloads (head+tail with an elision marker) before they enter history.
+* **Normalize** — every tool call has exactly one result, directly after it.
+* **Cap** — each tool output is limited relative to the budget (head + tail) as it enters history.
+* **Mask** — above 60% of the budget, the oldest tool-result bodies become one-line placeholders (call, size, error gist), keeping the agent's reasoning and tool calls.
+* **Evict** — if masking cannot reach 40%, the oldest whole steps are dropped; the system prompt, first instruction, current instruction, newest step and protected output stay.
+* **Overflow** — if the server still rejects the prompt as too long, compact further and retry (at most twice).
 
-```rust
-impl AgentContext {
-    /// Trim history to satisfy both the turn window and the token budget.
-    pub fn enforce_budget(&mut self) {
-        while self.turn_count() > self.config.agent.max_history_turns
-            || self.estimated_tokens() > self.token_ceiling()
-        {
-            if !self.evict_oldest_unpinned() {
-                break; // nothing left to evict but the pinned system + first user turn
-            }
-        }
-    }
-}
-```
+The strategy, thresholds and the research behind them are in [docs/context.md](docs/context.md).
 
 ## Error Handling & Observability
 

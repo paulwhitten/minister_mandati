@@ -3,6 +3,7 @@ use snafu::prelude::*;
 use std::io::{self, IsTerminal, Read, Write};
 
 mod approval;
+mod budget;
 mod client;
 mod config;
 mod context;
@@ -20,6 +21,9 @@ use context::{AgentContext, Message};
 use loop_guard::{Intervention, LoopGuards};
 use presenter::{Approval, CliPresenter, Presenter};
 use tools::ToolRegistry;
+
+/// Retries after the server rejects a prompt as too long (see docs/context.md).
+const MAX_OVERFLOW_RETRIES: u32 = 2;
 
 /// minister_mandati (`mima`) — an auditable, edge-native coding agent.
 ///
@@ -71,6 +75,7 @@ async fn run(cli: Cli, presenter: &mut dyn Presenter) -> Result<(), snafu::Whate
     let registry = ToolRegistry::init_default(&config);
     let specs = registry.specs();
     let mut ctx = AgentContext::new(config, specs);
+    configure_window(&mut ctx).await;
 
     let joined = cli.instruction.join(" ");
     let instruction = joined.trim();
@@ -97,6 +102,25 @@ async fn run(cli: Cli, presenter: &mut dyn Presenter) -> Result<(), snafu::Whate
             return Ok(());
         }
         run_single_shot(&mut ctx, &registry, presenter, piped).await
+    }
+}
+
+/// Sets the context window: `[context].window` if configured, else what the
+/// server reports, else the fallback (with a warning, since it may be wrong).
+async fn configure_window(ctx: &mut AgentContext) {
+    if ctx.config.context.window.is_some() {
+        return;
+    }
+    match client::discover_context_window(&ctx.config).await {
+        Some(w) => {
+            tracing::info!(window = w, "context window discovered from server");
+            ctx.set_window(w);
+        }
+        None => tracing::warn!(
+            window = budget::FALLBACK_WINDOW,
+            "context window not reported by the server; assuming the fallback. \
+             Set [context].window in agent.toml if this is wrong"
+        ),
     }
 }
 
@@ -160,6 +184,7 @@ async fn run_repl(
                     println!("context reset.");
                 }
                 "tokens" => print_tokens(ctx),
+                "context" => print_context(ctx),
                 "help" => print_help(),
                 other => println!("unknown command: /{other} (try /help)"),
             }
@@ -205,7 +230,7 @@ async fn run_turn(
 ) -> Result<(), snafu::Whatever> {
     tracing::info!(instruction = %instruction, "starting task");
     presenter.task_started(instruction);
-    ctx.add_message(Message::user(instruction));
+    ctx.begin_turn(instruction);
 
     let max_steps = ctx.config.agent.max_steps;
     let mut guards = LoopGuards::new(
@@ -218,12 +243,28 @@ async fn run_turn(
         let span = tracing::info_span!("step", n = step);
         let _enter = span.enter();
 
-        let response =
-            client::generate_completion(ctx, &mut |delta| presenter.stream_delta(delta)).await;
-        // Terminate any streamed line before logging, so log lines never run
-        // into the model's output.
-        presenter.stream_end();
-        let response = response.whatever_context("model completion failed")?;
+        let mut overflow_retries = 0;
+        let response = loop {
+            ctx.prepare_request();
+            let result =
+                client::generate_completion(ctx, &mut |delta| presenter.stream_delta(delta)).await;
+            // Terminate any streamed line before logging, so log lines never run
+            // into the model's output.
+            presenter.stream_end();
+            match result {
+                Err(e) if e.is_context_overflow() && overflow_retries < MAX_OVERFLOW_RETRIES => {
+                    overflow_retries += 1;
+                    tracing::warn!(error = %e, attempt = overflow_retries, "prompt too long for the model; compacting and retrying");
+                    if !ctx.handle_overflow(e.reported_window(), e.reported_prompt_tokens()) {
+                        snafu::whatever!(
+                            "the conversation no longer fits the model's context window \
+                             and nothing more can be removed: {e}"
+                        );
+                    }
+                }
+                other => break other.whatever_context("model completion failed")?,
+            }
+        };
 
         ctx.record_usage(response.usage);
         if let Some(u) = response.usage {
@@ -240,6 +281,10 @@ async fn run_turn(
             _ => {
                 let final_msg = response.content.clone().unwrap_or_default();
                 presenter.final_answer(&final_msg);
+                // Keep the answer so follow-up turns (REPL) can see it.
+                if !final_msg.is_empty() {
+                    ctx.add_message(Message::assistant(&final_msg));
+                }
                 log_token_summary(ctx);
                 tracing::info!("task complete");
                 return Ok(());
@@ -248,6 +293,9 @@ async fn run_turn(
 
         ctx.add_message(Message::assistant_tool_calls(&response));
 
+        // A nudge is a user message, so it must wait until every tool result
+        // of this step is in; results have to follow their request directly.
+        let mut nudge = false;
         for call in calls {
             tracing::info!(tool = %call.name, args = %call.args, "tool requested");
             presenter.tool_requested(&call);
@@ -272,7 +320,10 @@ async fn run_turn(
                         continue;
                     }
                 }
-                match registry.execute(&call.name, &call.args).await {
+                match registry
+                    .execute(&call.name, &call.args, ctx.output_cap_bytes())
+                    .await
+                {
                     Ok(out) => {
                         guards.record_success(policy, fp, &out);
                         out
@@ -290,27 +341,48 @@ async fn run_turn(
                 Intervention::None => {}
                 Intervention::Nudge => {
                     tracing::warn!(repeats, tool = %call.name, "loop guard: nudge injected");
-                    ctx.add_message(Message::user(
-                        "A repeated identical action was detected that already succeeded. \
-                         If the task is complete, reply without further tool calls.",
-                    ));
+                    nudge = true;
                 }
                 Intervention::Terminate => {
                     tracing::warn!(repeats, tool = %call.name, "loop guard tripped: terminating turn");
+                    ctx.normalize();
                     presenter.loop_detected(repeats);
                     log_token_summary(ctx);
                     return Ok(());
                 }
             }
         }
-
-        ctx.enforce_budget();
+        if nudge {
+            ctx.add_message(Message::user(
+                "A repeated identical action was detected that already succeeded. \
+                 If the task is complete, reply without further tool calls.",
+            ));
+        }
     }
 
     tracing::warn!(max = max_steps, "reached step cap without completion");
     presenter.step_cap_reached(max_steps);
     log_token_summary(ctx);
     Ok(())
+}
+
+/// Prints the context budget and current estimate (REPL `/context`).
+fn print_context(ctx: &AgentContext) {
+    let s = ctx.stats();
+    let b = s.budget;
+    let pct = s.estimated_tokens * 100 / b.operating.max(1);
+    println!(
+        "context — window: {}, usable: {}, budget: {}, estimated: {} ({pct}% of budget, {}), \
+         messages: {}, masked: {}, evicted: {}",
+        b.window,
+        b.usable,
+        b.operating,
+        s.estimated_tokens,
+        s.estimate_source,
+        s.messages,
+        s.masked_total,
+        s.evicted_total
+    );
 }
 
 /// Prints the cumulative token ledger to stdout (REPL `/tokens`).
@@ -325,7 +397,7 @@ fn print_tokens(ctx: &AgentContext) {
 /// Lists the REPL slash-commands.
 fn print_help() {
     println!(
-        "commands:\n  /help    show this help\n  /tokens  show token usage\n  /reset   \
+        "commands:\n  /help    show this help\n  /tokens  show token usage\n  /context show context budget\n  /reset   \
          clear the conversation\n  /exit    quit (also Ctrl-D)"
     );
 }

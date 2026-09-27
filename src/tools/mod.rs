@@ -69,7 +69,6 @@ pub trait BaseTool: Send + Sync {
 
 pub struct ToolRegistry {
     tools: HashMap<String, Box<dyn BaseTool>>,
-    max_output_bytes: usize,
 }
 
 impl ToolRegistry {
@@ -87,10 +86,7 @@ impl ToolRegistry {
         for tool in tools {
             map.insert(tool.spec().name, tool);
         }
-        Self {
-            tools: map,
-            max_output_bytes: config.agent.max_tool_output_bytes,
-        }
+        Self { tools: map }
     }
 
     /// All specs, used to build the OpenAI `tools` array and the ReAct prompt.
@@ -107,9 +103,15 @@ impl ToolRegistry {
     }
 
     /// Dispatch by name. Unknown tools return an error the loop surfaces to the model.
-    /// Output is capped at `max_output_bytes` to protect the context window.
+    /// Output is capped at `max_output_bytes` (head and tail kept) to protect
+    /// the context window; the caller derives the cap from the context budget.
     #[tracing::instrument(skip_all, fields(tool = %name))]
-    pub async fn execute(&self, name: &str, args: &Value) -> Result<String> {
+    pub async fn execute(
+        &self,
+        name: &str,
+        args: &Value,
+        max_output_bytes: usize,
+    ) -> Result<String> {
         let out = match self.tools.get(name) {
             Some(tool) => tool.execute(args).await?,
             None => {
@@ -119,7 +121,7 @@ impl ToolRegistry {
                 .fail();
             }
         };
-        Ok(truncate_middle(out, self.max_output_bytes))
+        Ok(truncate_middle(out, max_output_bytes))
     }
 }
 

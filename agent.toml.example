@@ -9,7 +9,7 @@ default_model = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
 
 [agent]
 temperature = 0.2
-max_history_turns = 20
+# Reply limit per request; also reserved out of the context window.
 max_tokens = 4096
 # "native" | "react" | "auto" (probe native, fall back to ReAct)
 tool_calling = "auto"
@@ -27,7 +27,6 @@ system_prompt_override = ""
 # loop_guard_window = 6               # sliding window for repeat detection
 # loop_guard_repeat_threshold = 3     # repeats within the window that intervene
 # max_steps = 50                      # hard cap on tool/reasoning steps per task
-# max_tool_output_bytes = 32768       # larger tool output is truncated (head+tail kept)
 
 [security]
 require_approval_for_bash = true
@@ -40,3 +39,11 @@ require_approval_for_writes = true
 # bash_timeout_secs = 300             # kill a shell command after this long
 # Sandbox for the filesystem tools ONLY. Does NOT constrain shell commands.
 allowed_paths = ["./"]
+
+# Context-window management (see docs/context.md). Defaults shown.
+[context]
+# window = 32768      # tokens; default: discovered from the server (vLLM max_model_len)
+# budget = 96000      # operate below the window (tokens); default: whole usable window
+# mask_at = 0.6       # compact above this fraction of the operating budget ...
+# mask_to = 0.4       # ... down to this fraction (hide old tool output, then drop old steps)
+# keep_recent = 0.25  # newest tool output protected from compaction (fraction of budget)
