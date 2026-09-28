@@ -1,6 +1,6 @@
 use clap::Parser;
 use snafu::prelude::*;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Read};
 
 mod approval;
 mod budget;
@@ -109,6 +109,7 @@ async fn run(cli: Cli, presenter: &mut dyn Presenter) -> Result<(), snafu::Whate
     let specs = registry.specs();
     let mut ctx = AgentContext::new(config, specs);
     configure_window(&mut ctx).await;
+    configure_token_counter(&mut ctx).await;
 
     let joined = cli.instruction.join(" ");
     let mut task = joined.trim().to_string();
@@ -170,6 +171,48 @@ async fn configure_window(ctx: &mut AgentContext) {
     }
 }
 
+/// Enables exact token counting when the server offers `/tokenize` (and
+/// `[context].server_tokenize` allows it); otherwise counts are anchored on the
+/// usage the server reports after each response.
+async fn configure_token_counter(ctx: &mut AgentContext) {
+    if !ctx.config.context.server_tokenize {
+        tracing::info!("server token counting disabled; using reported usage plus estimates");
+        return;
+    }
+    match client::probe_tokenize(&ctx.config).await {
+        Some(url) => {
+            tracing::info!(%url, "exact token counting via the server's /tokenize");
+            ctx.token_counter = Some(url);
+        }
+        None => {
+            tracing::info!("server has no /tokenize endpoint; using reported usage plus estimates")
+        }
+    }
+}
+
+/// Counts the request exactly via the server, when available. A failure
+/// falls back to the estimate for this request.
+async fn count_exactly(ctx: &mut AgentContext) {
+    let Some(url) = ctx.token_counter.clone() else {
+        return;
+    };
+    match client::count_prompt_tokens(ctx, &url).await {
+        Ok(n) => ctx.record_counted(n),
+        Err(e) => tracing::warn!(error = %e, "exact token count failed; using the estimate"),
+    }
+}
+
+/// Brings the next request within budget: normalize, count, compact, and
+/// recount if compaction changed the history, then seal.
+async fn prepare_request(ctx: &mut AgentContext) {
+    ctx.normalize();
+    count_exactly(ctx).await;
+    if ctx.compact() {
+        count_exactly(ctx).await;
+    }
+    ctx.seal_request();
+}
+
 /// Starts recording the current session. Returns false (after telling the
 /// operator) if the transcript cannot be opened; the agent keeps working.
 fn enable_transcript(ctx: &mut AgentContext, mode: Mode) -> bool {
@@ -189,6 +232,7 @@ fn enable_transcript(ctx: &mut AgentContext, mode: Mode) -> bool {
             "auto_approve_bash": c.security.auto_approve_bash,
         },
         "allowed_paths": c.security.allowed_paths,
+        "token_counting": if ctx.token_counter.is_some() { "tokenize" } else { "usage+estimate" },
     });
     match ctx.session.enable(header) {
         Ok(path) => {
@@ -301,25 +345,29 @@ async fn run_repl(
     println!("minister_mandati (mima) — interactive mode. /help for commands, Ctrl-D to exit.");
     announce_transcript(ctx, Mode::Interactive);
 
+    // Line editing (arrow keys, Home/End, Delete, history with Up/Down).
+    // History stays in memory for this process; nothing is written to disk.
+    let mut editor =
+        rustyline::DefaultEditor::new().whatever_context("failed to initialize line editor")?;
+
     if let Some(seed) = seed {
         run_turn_cancellable(ctx, registry, presenter, &seed, &mut sigint).await;
     }
 
     loop {
-        print!("\n> ");
-        io::stdout().flush().ok();
-        let mut line = String::new();
-        let read = io::stdin()
-            .read_line(&mut line)
-            .whatever_context("failed to read input")?;
-        if read == 0 {
-            println!();
-            return Ok("eof"); // Ctrl-D
-        }
+        println!();
+        let line = match editor.readline("> ") {
+            Ok(line) => line,
+            // Ctrl-C at the prompt clears the line, as in a shell.
+            Err(rustyline::error::ReadlineError::Interrupted) => continue,
+            Err(rustyline::error::ReadlineError::Eof) => return Ok("eof"), // Ctrl-D
+            Err(e) => return Err(e).whatever_context("failed to read input"),
+        };
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
+        let _ = editor.add_history_entry(line);
         if let Some(cmd) = line.strip_prefix('/') {
             match cmd {
                 "exit" | "quit" => return Ok("exit"),
@@ -435,7 +483,8 @@ async fn run_turn(
 
         let mut overflow_retries = 0;
         let response = loop {
-            ctx.prepare_request();
+            prepare_request(ctx).await;
+            let counted = ctx.stats();
             let started = Instant::now();
             let result =
                 client::generate_completion(ctx, &mut |delta| presenter.stream_delta(delta)).await;
@@ -457,7 +506,9 @@ async fn run_turn(
                     ctx.session.record(
                         "model_response",
                         json!({ "turn": turn, "step": step, "duration_ms": duration_ms,
-                                "content": r.content, "tool_calls": calls, "usage": usage }),
+                                "content": r.content, "tool_calls": calls, "usage": usage,
+                                "counted_prompt_tokens": counted.tokens,
+                                "count_source": counted.token_source }),
                     );
                     break r;
                 }
@@ -534,10 +585,15 @@ async fn run_turn(
                         .whatever_context("approval prompt failed")?;
                     if decision == Approval::Deny {
                         record_approval(ctx, turn, &call.id, "denied");
-                        ctx.add_message(Message::tool_result(
-                            &call.id,
-                            "Error: user denied permission for this action.",
-                        ));
+                        let denied = "Error: user denied permission for this action.";
+                        ctx.session.record(
+                            "tool_result",
+                            json!({ "turn": turn, "call_id": call.id, "tool": call.name,
+                                    "duration_ms": 0, "failed": true, "executed": false,
+                                    "bytes": denied.len(), "sent_bytes": denied.len(),
+                                    "output": denied }),
+                        );
+                        ctx.add_message(Message::tool_result(&call.id, denied));
                         continue;
                     }
                     "approved"
@@ -622,15 +678,20 @@ fn record_approval(ctx: &mut AgentContext, turn: u64, call_id: &str, decision: &
 fn print_context(ctx: &AgentContext) {
     let s = ctx.stats();
     let b = s.budget;
-    let pct = s.estimated_tokens * 100 / b.operating.max(1);
+    let pct = s.tokens * 100 / b.operating.max(1);
     println!(
-        "context — window: {}, usable: {}, budget: {}, estimated: {} ({pct}% of budget, {}), \
-         messages: {}, masked: {}, evicted: {}",
+        "context — window: {}, usable: {}, budget: {}, tokens: {} ({pct}% of budget, {}), \
+         counting: {}, messages: {}, masked: {}, evicted: {}",
         b.window,
         b.usable,
         b.operating,
-        s.estimated_tokens,
-        s.estimate_source,
+        s.tokens,
+        s.token_source,
+        if ctx.token_counter.is_some() {
+            "exact (/tokenize)"
+        } else {
+            "usage + estimate"
+        },
         s.messages,
         s.masked_total,
         s.evicted_total

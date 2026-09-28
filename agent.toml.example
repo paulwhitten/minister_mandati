@@ -47,6 +47,7 @@ allowed_paths = ["./"]
 # mask_at = 0.6       # compact above this fraction of the operating budget ...
 # mask_to = 0.4       # ... down to this fraction (hide old tool output, then drop old steps)
 # keep_recent = 0.25  # newest tool output protected from compaction (fraction of budget)
+# server_tokenize = true  # count each request exactly via the server's /tokenize (vLLM)
 
 # Sessions and transcripts (see docs/sessions.md). Transcripts are off by
 # default; enable per run with --transcript or in the REPL with /enable_transcript.

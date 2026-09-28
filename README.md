@@ -98,7 +98,9 @@ terminal already starts the REPL, so `mima -i` on its own behaves the same.
 
 In the REPL, `/help` lists commands (`/tokens`, `/context`, `/session`, `/new`,
 `/enable_transcript`, `/disable_transcript`, `/exit`). Ctrl-C
-cancels the current turn and returns to the prompt; Ctrl-D exits. In one-shot
+cancels the current turn and returns to the prompt; Ctrl-D exits. The prompt
+supports line editing (arrow keys, Home/End, Delete) and Up/Down history for
+the current session; history is not saved to disk. In one-shot
 mode, Ctrl-C aborts with exit code 130.
 
 ### Examples
@@ -184,7 +186,9 @@ MIMA_LOG_FORMAT=json cargo run -- "..." # structured JSON logs for auditing
 ## Safety
 
 - Shell commands (`execute_bash`) and file writes (`write_file`) prompt for
-  approval by default (`[security]` in `agent.toml`).
+  approval by default (`[security]` in `agent.toml`). The prompt shows the
+  full command, or the file and size for a write. Answer `y`/`yes` or
+  `n`/`no` (any case); Enter means no, and anything else is asked again.
 - `auto_approve_bash` lists shell command prefixes that skip the prompt, e.g.
   `["cargo test", "git status"]`. Matching is whole-word, and any command with
   shell operators (`;`, `&`, `|`, `$`, backticks, parentheses, redirects,

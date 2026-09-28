@@ -52,24 +52,45 @@ impl Budget {
     }
 }
 
-/// Converts characters to tokens with a ratio calibrated from the server's
-/// reported `prompt_tokens` for the characters actually sent.
+/// Where an exact token count came from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CountSource {
+    /// The server's `/tokenize` endpoint, before sending.
+    Tokenize,
+    /// The server's reported `usage.prompt_tokens`, after a response.
+    Usage,
+}
+
+/// An exact count for a known request size.
+#[derive(Debug, Clone, Copy)]
+struct Anchor {
+    chars: usize,
+    tokens: usize,
+    source: CountSource,
+}
+
+/// Token counting anchored on exact server counts. The current size is the
+/// last exact count plus an estimate of the characters added or removed since
+/// (converted with a ratio calibrated from exact counts). With no change since
+/// the last count it is exact. Before any exact count it falls back to a
+/// conservative characters-per-token default.
 #[derive(Debug, Clone, Copy)]
 pub struct Estimator {
     chars_per_token: f64,
-    calibrated: bool,
+    anchor: Option<Anchor>,
 }
 
 impl Default for Estimator {
     fn default() -> Self {
         Self {
             chars_per_token: DEFAULT_CHARS_PER_TOKEN,
-            calibrated: false,
+            anchor: None,
         }
     }
 }
 
 impl Estimator {
+    /// Estimated tokens for a fragment (e.g. one message) of `chars` characters.
     pub fn tokens(&self, chars: usize) -> usize {
         (chars as f64 / self.chars_per_token).ceil() as usize
     }
@@ -78,23 +99,46 @@ impl Estimator {
         (tokens as f64 * self.chars_per_token) as usize
     }
 
-    /// Updates the ratio from one request: `chars_sent` characters were billed
-    /// as `prompt_tokens`. Ignores empty reports.
-    pub fn calibrate(&mut self, chars_sent: usize, prompt_tokens: u64) {
-        if chars_sent == 0 || prompt_tokens == 0 {
-            return;
+    /// Tokens for a whole request of `chars` characters: exact at the anchor,
+    /// anchor plus the estimated difference elsewhere.
+    pub fn total(&self, chars: usize) -> usize {
+        match self.anchor {
+            Some(a) => {
+                let delta = (chars as f64 - a.chars as f64) / self.chars_per_token;
+                (a.tokens as f64 + delta).ceil().max(0.0) as usize
+            }
+            None => self.tokens(chars),
         }
-        let ratio = chars_sent as f64 / prompt_tokens as f64;
-        self.chars_per_token = ratio.clamp(MIN_CHARS_PER_TOKEN, MAX_CHARS_PER_TOKEN);
-        self.calibrated = true;
     }
 
-    /// Where the ratio came from, for audit logs.
-    pub fn source(&self) -> &'static str {
-        if self.calibrated {
-            "usage-calibrated"
-        } else {
-            "default-ratio"
+    /// Records an exact count: a request of `chars` characters is `tokens`
+    /// tokens. Also recalibrates the ratio used for differences. Ignores
+    /// empty counts.
+    pub fn record_exact(&mut self, chars: usize, tokens: usize, source: CountSource) {
+        if chars == 0 || tokens == 0 {
+            return;
+        }
+        let ratio = chars as f64 / tokens as f64;
+        self.chars_per_token = ratio.clamp(MIN_CHARS_PER_TOKEN, MAX_CHARS_PER_TOKEN);
+        self.anchor = Some(Anchor {
+            chars,
+            tokens,
+            source,
+        });
+    }
+
+    /// How `total(chars)` was obtained, for logs and transcripts.
+    pub fn source(&self, chars: usize) -> &'static str {
+        match self.anchor {
+            None => "default-ratio",
+            Some(a) if a.chars == chars => match a.source {
+                CountSource::Tokenize => "tokenize",
+                CountSource::Usage => "usage",
+            },
+            Some(a) => match a.source {
+                CountSource::Tokenize => "tokenize+estimate",
+                CountSource::Usage => "usage+estimate",
+            },
         }
     }
 
@@ -142,16 +186,31 @@ mod tests {
     }
 
     #[test]
-    fn estimator_calibrates_and_clamps() {
+    fn estimator_is_exact_at_the_anchor_and_estimates_the_difference() {
         let mut e = Estimator::default();
-        assert_eq!(e.source(), "default-ratio");
-        assert_eq!(e.tokens(300), 100);
-        e.calibrate(4_000, 1_000);
-        assert_eq!(e.tokens(4_000), 1_000);
-        assert_eq!(e.source(), "usage-calibrated");
-        e.calibrate(1_000_000, 1);
+        assert_eq!(e.source(300), "default-ratio");
+        assert_eq!(e.total(300), 100);
+
+        e.record_exact(4_000, 1_000, CountSource::Tokenize);
+        assert_eq!(e.total(4_000), 1_000);
+        assert_eq!(e.source(4_000), "tokenize");
+        // 400 more characters at the calibrated 4 chars/token.
+        assert_eq!(e.total(4_400), 1_100);
+        assert_eq!(e.source(4_400), "tokenize+estimate");
+        // Masking removed 2,000 characters.
+        assert_eq!(e.total(2_000), 500);
+
+        e.record_exact(5_000, 1_234, CountSource::Usage);
+        assert_eq!(e.total(5_000), 1_234);
+        assert_eq!(e.source(5_000), "usage");
+    }
+
+    #[test]
+    fn estimator_clamps_odd_ratios_and_ignores_empty_counts() {
+        let mut e = Estimator::default();
+        e.record_exact(1_000_000, 1, CountSource::Usage);
         assert_eq!(e.chars_per_token(), MAX_CHARS_PER_TOKEN);
-        e.calibrate(0, 5); // ignored
+        e.record_exact(0, 5, CountSource::Usage);
         assert_eq!(e.chars_per_token(), MAX_CHARS_PER_TOKEN);
     }
 }
