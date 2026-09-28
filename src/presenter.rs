@@ -2,7 +2,7 @@
 //! decisions through a `Presenter`, so the same loop can drive a plain CLI, a
 //! TUI, or a REST front end without touching core logic (see `REQ-UI-*`).
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 
 use crate::tools::ToolCall;
 
@@ -37,6 +37,51 @@ pub fn describe_action(call: &ToolCall) -> String {
         ),
         name => format!("Call {name} with {}", display_safe(&call.args.to_string())),
     }
+}
+
+/// A tool's preview (header line, then a unified diff) made safe to print,
+/// optionally colored: additions green, removals red, hunk headers cyan.
+pub fn render_preview(preview: &str, color: bool) -> String {
+    let paint = |code: &str, line: &str| {
+        if color {
+            format!("\x1b[{code}m{line}\x1b[0m")
+        } else {
+            line.to_string()
+        }
+    };
+    preview
+        .lines()
+        .enumerate()
+        .map(|(i, raw)| {
+            let line = escape_controls(raw);
+            if i == 0 {
+                paint("1", &line)
+            } else if line.starts_with("@@") {
+                paint("36", &line)
+            } else if line.starts_with('+') && !line.starts_with("+++") {
+                paint("32", &line)
+            } else if line.starts_with('-') && !line.starts_with("---") {
+                paint("31", &line)
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Control characters (other than TAB) shown escaped, so model-supplied text
+/// cannot drive the terminal.
+fn escape_controls(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    for c in line.chars() {
+        if c.is_control() && c != '\t' {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Model-supplied text made safe to print: control characters (which could
@@ -104,8 +149,10 @@ pub trait Presenter {
     /// The loop guard stopped the turn after repeated identical actions.
     fn loop_detected(&mut self, _repeats: usize) {}
 
-    /// Ask the operator to approve a state-changing action.
-    fn request_approval(&mut self, call: &ToolCall) -> io::Result<Approval>;
+    /// Ask the operator to approve a state-changing action. `preview` is
+    /// what the tool will change (a diff for edits and overwrites), if it
+    /// provides one; otherwise the front end describes the call itself.
+    fn request_approval(&mut self, call: &ToolCall, preview: Option<&str>) -> io::Result<Approval>;
 
     /// The final assistant answer for the task.
     fn final_answer(&mut self, content: &str);
@@ -151,12 +198,12 @@ impl Presenter for CliPresenter {
         self.close_line();
     }
 
-    fn request_approval(&mut self, call: &ToolCall) -> io::Result<Approval> {
-        let decision = ask_approval(
-            &describe_action(call),
-            &mut io::stdin().lock(),
-            &mut io::stdout(),
-        )?;
+    fn request_approval(&mut self, call: &ToolCall, preview: Option<&str>) -> io::Result<Approval> {
+        let question = match preview {
+            Some(p) => render_preview(p, io::stdout().is_terminal()),
+            None => describe_action(call),
+        };
+        let decision = ask_approval(&question, &mut io::stdin().lock(), &mut io::stdout())?;
         if decision == Approval::Deny {
             println!("Denied.");
         }
@@ -219,6 +266,21 @@ mod tests {
     fn end_of_input_denies() {
         assert_eq!(ask("").0, Approval::Deny);
         assert_eq!(ask("maybe\n").0, Approval::Deny);
+    }
+
+    #[test]
+    fn preview_is_escaped_and_optionally_colored() {
+        let p = "Edit f.rs  (+1 -1, exact match)\n--- a/f.rs\n+++ b/f.rs\n@@ -1,1 +1,1 @@\n-old\n+new\u{1b}[2J";
+        let plain = render_preview(p, false);
+        assert!(plain.contains("+new\\u{1b}[2J"), "{plain}");
+        assert!(!plain.contains('\u{1b}'));
+        let colored = render_preview(p, true);
+        assert!(colored.contains("\x1b[32m+new"));
+        assert!(colored.contains("\x1b[31m-old"));
+        assert!(
+            colored.contains("--- a/f.rs\n"),
+            "file headers are not colored"
+        );
     }
 
     #[test]

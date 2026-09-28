@@ -25,7 +25,7 @@ pub fn needs_approval(cfg: &Config, call: &ToolCall) -> bool {
             }
             true
         }
-        "write_file" => cfg.security.require_approval_for_writes,
+        "write_file" | "edit_file" => cfg.security.require_approval_for_writes,
         _ => false, // read-only tools never prompt
     }
 }

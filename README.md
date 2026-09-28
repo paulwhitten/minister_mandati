@@ -185,9 +185,11 @@ MIMA_LOG_FORMAT=json cargo run -- "..." # structured JSON logs for auditing
 
 ## Safety
 
-- Shell commands (`execute_bash`) and file writes (`write_file`) prompt for
-  approval by default (`[security]` in `agent.toml`). The prompt shows the
-  full command, or the file and size for a write. Answer `y`/`yes` or
+- Shell commands (`execute_bash`) and file changes (`edit_file`,
+  `write_file`) prompt for approval by default (`[security]` in
+  `agent.toml`). The prompt shows the full command, or a diff of the file
+  change. The model must have read a file's current content before changing
+  it; see [docs/editing.md](docs/editing.md). Answer `y`/`yes` or
   `n`/`no` (any case); Enter means no, and anything else is asked again.
 - `auto_approve_bash` lists shell command prefixes that skip the prompt, e.g.
   `["cargo test", "git status"]`. Matching is whole-word, and any command with

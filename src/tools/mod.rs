@@ -1,11 +1,13 @@
 //! Tool framework: the `BaseTool` trait, tool specs, and the registry.
 
+pub mod edit;
 pub mod fs;
 
 use async_trait::async_trait;
 use serde_json::Value;
 use snafu::prelude::*;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::Config;
@@ -27,6 +29,10 @@ pub enum Error {
         source: std::io::Error,
         path: String,
     },
+    /// A tool declined the call; `message` is written for the model and says
+    /// what to do next.
+    #[snafu(display("{message}"))]
+    Refused { message: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -57,10 +63,23 @@ pub enum DedupePolicy {
     SkipIfIdenticalSuccess,
 }
 
+/// Per-call information from the agent loop.
+pub struct ToolEnv {
+    /// Largest output (bytes) that reaches the model uncut; tools that can
+    /// stop at a clean boundary (read_file at a whole line) use it.
+    pub output_budget: usize,
+}
+
 #[async_trait]
 pub trait BaseTool: Send + Sync {
     fn spec(&self) -> ToolSpec;
-    async fn execute(&self, args: &Value) -> Result<String>;
+    async fn execute(&self, args: &Value, env: &ToolEnv) -> Result<String>;
+    /// What the operator approves, e.g. a diff; computed without side
+    /// effects. An error means the call cannot succeed as given and goes
+    /// straight back to the model, with nothing to approve.
+    async fn preview(&self, _args: &Value) -> Result<Option<String>> {
+        Ok(None)
+    }
     /// Default: always execute. Idempotent mutating tools override this.
     fn dedupe_policy(&self) -> DedupePolicy {
         DedupePolicy::Always
@@ -69,29 +88,50 @@ pub trait BaseTool: Send + Sync {
 
 pub struct ToolRegistry {
     tools: HashMap<String, Box<dyn BaseTool>>,
+    /// Which files the model has read (shared by the file tools).
+    files: Arc<edit::FileTracker>,
 }
 
 impl ToolRegistry {
     pub fn init_default(config: &Config) -> Self {
         let allowed = config.security.allowed_paths.clone();
+        let files = edit::FileTracker::shared();
         let tools: Vec<Box<dyn BaseTool>> = vec![
             Box::new(BashExecutor {
                 timeout: Duration::from_secs(config.security.bash_timeout_secs),
             }),
-            Box::new(fs::ReadFile::new(allowed.clone())),
-            Box::new(fs::WriteFile::new(allowed.clone())),
+            Box::new(fs::ReadFile::new(allowed.clone(), files.clone())),
+            Box::new(edit::EditFile::new(allowed.clone(), files.clone())),
+            Box::new(fs::WriteFile::new(allowed.clone(), files.clone())),
             Box::new(fs::ListDir::new(allowed)),
         ];
         let mut map: HashMap<String, Box<dyn BaseTool>> = HashMap::new();
         for tool in tools {
             map.insert(tool.spec().name, tool);
         }
-        Self { tools: map }
+        Self { tools: map, files }
     }
 
     /// All specs, used to build the OpenAI `tools` array and the ReAct prompt.
+    /// Sorted by name so every request is identical (deterministic, and the
+    /// server's prefix cache stays valid).
     pub fn specs(&self) -> Vec<ToolSpec> {
-        self.tools.values().map(|t| t.spec()).collect()
+        let mut specs: Vec<ToolSpec> = self.tools.values().map(|t| t.spec()).collect();
+        specs.sort_by(|a, b| a.name.cmp(&b.name));
+        specs
+    }
+
+    /// Forgets which files were read (a new session).
+    pub fn reset_files(&self) {
+        self.files.clear();
+    }
+
+    /// The tool's approval preview (see `BaseTool::preview`).
+    pub async fn preview(&self, name: &str, args: &Value) -> Result<Option<String>> {
+        match self.tools.get(name) {
+            Some(tool) => tool.preview(args).await,
+            None => Ok(None),
+        }
     }
 
     /// The dedupe policy for a tool by name (unknown tools default to `Always`).
@@ -106,9 +146,9 @@ impl ToolRegistry {
     /// Returns the full output; the caller caps what enters the model's context
     /// (see `truncate_middle`) and may keep the full copy in the transcript.
     #[tracing::instrument(skip_all, fields(tool = %name))]
-    pub async fn execute(&self, name: &str, args: &Value) -> Result<String> {
+    pub async fn execute(&self, name: &str, args: &Value, env: &ToolEnv) -> Result<String> {
         match self.tools.get(name) {
-            Some(tool) => tool.execute(args).await,
+            Some(tool) => tool.execute(args, env).await,
             None => UnknownToolSnafu {
                 name: name.to_string(),
             }
@@ -164,7 +204,7 @@ impl BaseTool for BashExecutor {
         }
     }
 
-    async fn execute(&self, args: &Value) -> Result<String> {
+    async fn execute(&self, args: &Value, _env: &ToolEnv) -> Result<String> {
         let cmd = args["command"].as_str().context(MissingArgSnafu {
             tool: "execute_bash".to_string(),
             arg: "command".to_string(),
@@ -197,6 +237,12 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn env() -> ToolEnv {
+        ToolEnv {
+            output_budget: 1 << 20,
+        }
+    }
+
     #[test]
     fn short_output_is_untouched() {
         assert_eq!(truncate_middle("abc".into(), 10), "abc");
@@ -223,7 +269,7 @@ mod tests {
             timeout: Duration::from_secs(10),
         };
         let out = bash
-            .execute(&json!({ "command": "echo hi; exit 3" }))
+            .execute(&json!({ "command": "echo hi; exit 3" }), &env())
             .await
             .unwrap();
         assert!(out.starts_with("exit: 3\nSTDOUT:\nhi\n"));
@@ -236,7 +282,7 @@ mod tests {
         };
         let start = std::time::Instant::now();
         let err = bash
-            .execute(&json!({ "command": "sleep 5" }))
+            .execute(&json!({ "command": "sleep 5" }), &env())
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Timeout { .. }));
