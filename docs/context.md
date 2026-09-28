@@ -57,12 +57,35 @@ size. If the server rejects a request because the prompt is too long and
 states its limit, `mima` adopts that limit as `W`; if it states the prompt's
 measured size (vLLM does), `mima` recalibrates its estimate from it.
 
-**Counting tokens.** After each response, `mima` calibrates a
-characters-per-token ratio from the server's `usage.prompt_tokens` and the
-characters it sent (messages plus tool schemas). The current size is the
-total characters divided by that ratio. Before the first response the ratio
-is 3.0, a deliberately conservative default. The estimate only needs to be
-good enough to trigger stages; the server remains the final authority.
+**Counting tokens.** Counts come from the server, not from a local
+tokenizer:
+
+- **Exact, before sending** (servers with `/tokenize`, such as vLLM). At
+  startup `mima` checks for the endpoint. Before each request it sends the
+  exact messages and tool schemas to `/tokenize`, which applies the model's
+  own chat template, so the count equals the `prompt_tokens` the server then
+  reports. If compaction changes the history, the request is counted again.
+  One extra call to the local server per step.
+- **Anchored estimate** (servers without `/tokenize`, such as Ollama). The
+  `usage.prompt_tokens` reported for the last request is exact for that
+  request; messages added or removed since are estimated with a
+  characters-per-token ratio calibrated from those exact counts. Before the
+  first response the ratio is 3.0, deliberately conservative.
+- A prompt-too-long error that states the measured size (vLLM does) also
+  anchors the count.
+
+Cumulative totals (`/tokens`, transcripts) always use the server's reported
+usage. Logs, `/context` and transcripts label each count's source:
+`tokenize`, `usage`, `tokenize+estimate`, `usage+estimate`, or
+`default-ratio`. Set `[context].server_tokenize = false` to skip the
+`/tokenize` calls.
+
+Measured against Nemotron 3 Super on vLLM, the `/tokenize` count matched the
+reported `prompt_tokens` on every step. Local tokenizer libraries were not
+used: the Hugging Face `tokenizers` crate would still need each model's chat
+template reproduced to be exact, adds a large dependency, and needs the
+model's tokenizer file supplied locally; `tiktoken-rs` only covers OpenAI
+tokenizers.
 
 ## Stages
 
@@ -129,6 +152,7 @@ nearly fills the budget. Serve models with a window of 32k or more.
 # mask_at = 0.6       # compact above this fraction of the operating budget E
 # mask_to = 0.4       # ... down to this fraction
 # keep_recent = 0.25  # newest tool output protected (fraction of E)
+# server_tokenize = true  # exact counts via the server's /tokenize when available
 ```
 
 The REPL command `/context` shows the window, budget, current estimate and
@@ -137,10 +161,10 @@ the counts of masked and evicted messages.
 ## Status and next steps
 
 Implemented: budget from the window (config, `/v1/models`, or the server's
-error), calibrated counting (including from the server's error), stages 0-3,
+error), exact counting via `/tokenize` with an anchored estimate as fallback, stages 0-3,
 normalization, eviction notice, per-event logging, overflow retry. Tested
-with unit tests and against a mock OpenAI-compatible server; not yet
-evaluated on real tasks.
+with unit tests and against a mock OpenAI-compatible server; exact counting
+also checked live against vLLM. Not yet evaluated on real tasks.
 
 Planned, in order:
 

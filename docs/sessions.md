@@ -111,9 +111,9 @@ happens, so a crash loses at most the event in progress. Every line has
 
 | `type` | Written when | Key fields |
 |---|---|---|
-| `session_start` | recording begins (at session start, or when enabled later) | `schema`, `session`, `session_started`, `turns_before`, `mima_version`, `mode`, `cwd`, `model`, `base_url`, `window`, `budget`, `approvals`, `allowed_paths` |
+| `session_start` | recording begins (at session start, or when enabled later) | `schema`, `session`, `session_started`, `turns_before`, `mima_version`, `mode`, `cwd`, `model`, `base_url`, `window`, `budget`, `approvals`, `allowed_paths`, `token_counting` (`tokenize` or `usage+estimate`) |
 | `turn_start` | an instruction arrives | `turn`, `instruction` |
-| `model_response` | a completion returns | `turn`, `step`, `duration_ms`, `content`, `tool_calls`, `usage` |
+| `model_response` | a completion returns | `turn`, `step`, `duration_ms`, `content`, `tool_calls`, `usage` (server-reported), `counted_prompt_tokens` and `count_source` (the count before sending; see [context.md](context.md)) |
 | `model_error` | a completion fails | `turn`, `step`, `error`, `overflow` (bool), `retry` |
 | `approval` | before a tool runs | `call_id`, `decision`: `not_required`, `auto_approved`, `approved`, `denied`, `skipped_duplicate` |
 | `tool_result` | a tool finishes | `call_id`, `tool`, `duration_ms`, `failed`, `bytes`, `sent_bytes` (after the stage 0 cap), `output` (full) |

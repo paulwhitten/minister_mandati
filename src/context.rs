@@ -13,7 +13,7 @@
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::budget::{Budget, Estimator, FALLBACK_WINDOW, MIN_MASK_GAIN};
+use crate::budget::{Budget, CountSource, Estimator, FALLBACK_WINDOW, MIN_MASK_GAIN};
 use crate::client::{CompletionResponse, TokenUsage};
 use crate::config::Config;
 use crate::schema;
@@ -122,8 +122,8 @@ pub struct TokenLedger {
 #[derive(Debug, Clone, Copy)]
 pub struct ContextStats {
     pub budget: Budget,
-    pub estimated_tokens: usize,
-    pub estimate_source: &'static str,
+    pub tokens: usize,
+    pub token_source: &'static str,
     pub messages: usize,
     pub masked_total: usize,
     pub evicted_total: usize,
@@ -172,6 +172,8 @@ pub struct AgentContext {
     pub tool_specs: Vec<ToolSpec>,
     /// The current session and its (optional) transcript.
     pub session: Session,
+    /// Server endpoint for exact token counts (vLLM `/tokenize`), when available.
+    pub token_counter: Option<String>,
     messages: Vec<Message>,
     /// Number of leading messages that are never evicted (system + first user turn).
     pinned: usize,
@@ -205,6 +207,7 @@ impl AgentContext {
             config,
             tool_specs,
             session,
+            token_counter: None,
             messages: vec![Message::system(&system_prompt)],
             pinned: 1,
             turn_start: None,
@@ -237,8 +240,8 @@ impl AgentContext {
     pub fn stats(&self) -> ContextStats {
         ContextStats {
             budget: self.budget,
-            estimated_tokens: self.estimated_tokens(),
-            estimate_source: self.estimator.source(),
+            tokens: self.estimated_tokens(),
+            token_source: self.estimator.source(self.total_chars()),
             messages: self.messages.len(),
             masked_total: self.masked_total,
             evicted_total: self.evicted_total,
@@ -260,8 +263,11 @@ impl AgentContext {
                 self.usage.prompt_tokens += u.prompt_tokens;
                 self.usage.completion_tokens += u.completion_tokens;
                 self.usage.total_tokens += u.total_tokens;
-                self.estimator
-                    .calibrate(self.chars_at_last_request, u.prompt_tokens);
+                self.estimator.record_exact(
+                    self.chars_at_last_request,
+                    u.prompt_tokens as usize,
+                    CountSource::Usage,
+                );
             }
             None => self.usage.unreported_requests += 1,
         }
@@ -321,10 +327,27 @@ impl AgentContext {
         self.evicted_total = 0;
     }
 
-    /// Run before every model request: normalize, then mask and evict as the
-    /// budget requires. Records the size sent, for estimator calibration.
+    /// Run before every model request without a server count: normalize,
+    /// compact as the budget requires, and seal. With exact counting, `main`
+    /// calls the steps separately and counts in between.
+    #[cfg(test)]
     pub fn prepare_request(&mut self) {
         self.normalize();
+        self.compact();
+        self.seal_request();
+    }
+
+    /// Records an exact token count for the request as it stands now (from
+    /// the server's `/tokenize`), anchoring all later estimates on it.
+    pub fn record_counted(&mut self, tokens: usize) {
+        self.estimator
+            .record_exact(self.total_chars(), tokens, CountSource::Tokenize);
+    }
+
+    /// Masks and evicts as the budget requires. Returns true if the history
+    /// changed (so an exact count taken before is stale).
+    pub fn compact(&mut self) -> bool {
+        let before = (self.masked_total, self.evicted_total);
         let b = self.budget;
         let (mask_at, mask_to) = (self.config.context.mask_at, self.config.context.mask_to);
         if self.estimated_tokens() > b.of(mask_at) {
@@ -336,12 +359,20 @@ impl AgentContext {
                 self.evict(b.of(mask_to), "mask-insufficient");
             }
         }
+        before != (self.masked_total, self.evicted_total)
+    }
+
+    /// Final check before sending: warns if the request still exceeds the
+    /// usable window, and records its size to pair with the reported usage.
+    pub fn seal_request(&mut self) {
+        let b = self.budget;
         let est = self.estimated_tokens();
         if est > b.usable {
             tracing::warn!(
                 est_tokens = est,
                 usable = b.usable,
-                "context estimate exceeds the usable window; nothing more is safely removable"
+                source = self.estimator.source(self.total_chars()),
+                "context exceeds the usable window; nothing more is safely removable"
             );
         }
         self.chars_at_last_request = self.total_chars();
@@ -360,7 +391,8 @@ impl AgentContext {
             self.set_window(w);
         }
         if let Some(p) = server_prompt_tokens {
-            self.estimator.calibrate(self.chars_at_last_request, p);
+            self.estimator
+                .record_exact(self.chars_at_last_request, p as usize, CountSource::Usage);
         }
         let est = self.estimated_tokens();
         // Our estimate was evidently too low, so aim below both it and the target.
@@ -483,7 +515,7 @@ impl AgentContext {
             est_tokens_before = before,
             est_tokens_after = self.estimated_tokens(),
             target,
-            source = self.estimator.source(),
+            source = self.estimator.source(self.total_chars()),
             "context compaction"
         );
         let after = self.estimated_tokens();
@@ -575,7 +607,7 @@ impl AgentContext {
             est_tokens_before = before,
             est_tokens_after = self.estimated_tokens(),
             target,
-            source = self.estimator.source(),
+            source = self.estimator.source(self.total_chars()),
             "context compaction"
         );
         let after = self.estimated_tokens();
@@ -638,7 +670,7 @@ impl AgentContext {
     }
 
     fn estimated_tokens(&self) -> usize {
-        self.estimator.tokens(self.total_chars())
+        self.estimator.total(self.total_chars())
     }
 }
 
@@ -747,7 +779,7 @@ mod tests {
         let s = c.stats();
         assert!(s.masked_total > 0, "old outputs masked");
         assert_eq!(s.evicted_total, 0, "no step evicted while masking suffices");
-        assert!(s.estimated_tokens <= c.budget.of(0.6));
+        assert!(s.tokens <= c.budget.of(0.6));
         // All assistant tool-call messages are still present.
         let calls = c
             .messages()
@@ -810,7 +842,7 @@ mod tests {
         step(&mut c, &["a"], 200);
         step(&mut c, &["b"], 200);
         // Over mask_at, but masking small outputs cannot free 10% of E.
-        assert!(c.stats().estimated_tokens > c.budget.of(0.6));
+        assert!(c.stats().tokens > c.budget.of(0.6));
         assert_eq!(c.stats().masked_total, 0);
     }
 
@@ -911,10 +943,10 @@ mod tests {
         for n in 0..3 {
             step(&mut c, &[&format!("c{n}")], 600);
         }
-        let before = c.stats().estimated_tokens;
+        let before = c.stats().tokens;
         assert!(c.handle_overflow(Some(3_000), None));
         assert_eq!(c.stats().budget.window, 3_000);
-        assert!(c.stats().estimated_tokens < before);
+        assert!(c.stats().tokens < before);
         assert_valid(&c);
     }
 
@@ -931,12 +963,36 @@ mod tests {
         assert!(c.estimated_tokens() >= before + 1_000);
 
         c.prepare_request();
-        let sent = c.chars_at_last_request;
         c.record_usage(Some(TokenUsage {
-            prompt_tokens: (sent / 4) as u64,
+            prompt_tokens: 1_234,
             completion_tokens: 1,
             total_tokens: 0,
         }));
-        assert_eq!(c.stats().estimate_source, "usage-calibrated");
+        // Exact: the reported usage for the request just sent.
+        assert_eq!(c.stats().tokens, 1_234);
+        assert_eq!(c.stats().token_source, "usage");
+        // New messages are the reported count plus an estimate of the delta.
+        c.add_message(Message::tool_result("w", &"y".repeat(400)));
+        assert!(c.stats().tokens > 1_234);
+        assert_eq!(c.stats().token_source, "usage+estimate");
+    }
+
+    #[test]
+    fn tokenize_count_is_exact_until_history_changes() {
+        let mut c = ctx();
+        c.begin_turn("task");
+        step(&mut c, &["a"], 900);
+        c.normalize();
+        c.record_counted(777);
+        assert_eq!(c.stats().tokens, 777);
+        assert_eq!(c.stats().token_source, "tokenize");
+        c.seal_request();
+        // The reported usage for the same request agrees, so the count stays exact.
+        c.record_usage(Some(TokenUsage {
+            prompt_tokens: 777,
+            completion_tokens: 5,
+            total_tokens: 782,
+        }));
+        assert_eq!(c.stats().tokens, 777);
     }
 }

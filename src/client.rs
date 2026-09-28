@@ -92,6 +92,86 @@ impl Error {
     }
 }
 
+/// The `tools` array sent with requests: present for native tool calling,
+/// absent in pure ReAct mode. Shared by completion and token counting so both
+/// describe the same request.
+fn request_tools(ctx: &AgentContext) -> Option<Value> {
+    let use_native = matches!(ctx.config.agent.tool_calling.as_str(), "native" | "auto");
+    use_native.then(|| schema::to_openai_tools(&ctx.tool_specs))
+}
+
+/// vLLM's tokenizer endpoint lives at the server root, not under `/v1`:
+/// `http://host:8000/v1` -> `http://host:8000/tokenize`.
+fn tokenize_url(base_url: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    let root = base.strip_suffix("/v1").unwrap_or(base);
+    format!("{root}/tokenize")
+}
+
+/// Posts a chat-shaped request to `/tokenize` and returns the prompt token
+/// count. The server applies the model's chat template and tool schemas, so
+/// the count equals the `prompt_tokens` the same completion would report.
+async fn tokenize(
+    cfg: &Config,
+    url: &str,
+    messages: &Value,
+    tools: Option<Value>,
+) -> Result<usize> {
+    let mut body = json!({
+        "model": cfg.provider.default_model,
+        "messages": messages,
+        "add_generation_prompt": true,
+    });
+    if let Some(tools) = tools {
+        body["tools"] = tools;
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .context(HttpSnafu)?;
+    let resp = client
+        .post(url)
+        .bearer_auth(&cfg.provider.api_key)
+        .json(&body)
+        .send()
+        .await
+        .context(HttpSnafu)?;
+    let status = resp.status().as_u16();
+    if !(200..300).contains(&status) {
+        let body = resp.text().await.unwrap_or_default();
+        return StatusSnafu { status, body }.fail();
+    }
+    let payload: Value = resp.json().await.context(DecodeSnafu)?;
+    payload
+        .get("count")
+        .and_then(Value::as_u64)
+        .map(|c| c as usize)
+        .context(ShapeSnafu {
+            reason: "tokenize response has no `count`".to_string(),
+        })
+}
+
+/// Checks once whether the server offers exact token counting (vLLM
+/// `/tokenize`). Returns the endpoint URL when it does. Uses only the
+/// configured server.
+pub async fn probe_tokenize(cfg: &Config) -> Option<String> {
+    let url = tokenize_url(&cfg.provider.base_url);
+    let probe = json!([{ "role": "user", "content": "ping" }]);
+    match tokenize(cfg, &url, &probe, None).await {
+        Ok(_) => Some(url),
+        Err(e) => {
+            tracing::debug!(error = %e, %url, "no usable /tokenize endpoint");
+            None
+        }
+    }
+}
+
+/// Exact prompt token count for the request `ctx` would send now.
+pub async fn count_prompt_tokens(ctx: &AgentContext, url: &str) -> Result<usize> {
+    let messages = serde_json::to_value(ctx.messages()).unwrap_or_default();
+    tokenize(&ctx.config, url, &messages, request_tools(ctx)).await
+}
+
 /// Asks the server for the model's context window. vLLM lists it as
 /// `max_model_len` in `GET {base_url}/models`; other servers may not report
 /// it, in which case this returns `None`. Uses only the configured endpoint.
@@ -188,9 +268,8 @@ pub async fn generate_completion(
         body["stream_options"] = json!({ "include_usage": true });
     }
 
-    let use_native = matches!(cfg.agent.tool_calling.as_str(), "native" | "auto");
-    if use_native {
-        body["tools"] = schema::to_openai_tools(&ctx.tool_specs);
+    if let Some(tools) = request_tools(ctx) {
+        body["tools"] = tools;
     }
 
     tracing::debug!(%url, stream = cfg.agent.stream, "sending completion request");
@@ -449,6 +528,13 @@ mod tests {
         assert!(!status(400, "invalid tool schema").is_context_overflow());
         assert!(!status(500, "maximum context length is 8192").is_context_overflow());
         assert_eq!(status(400, "bad request").reported_window(), None);
+    }
+
+    #[test]
+    fn tokenize_url_is_at_the_server_root() {
+        assert_eq!(tokenize_url("http://h:8000/v1"), "http://h:8000/tokenize");
+        assert_eq!(tokenize_url("http://h:8000/v1/"), "http://h:8000/tokenize");
+        assert_eq!(tokenize_url("http://h:8000"), "http://h:8000/tokenize");
     }
 
     #[test]

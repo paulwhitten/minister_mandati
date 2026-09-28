@@ -103,6 +103,9 @@ pub struct Context {
     pub mask_to: f64,
     /// Newest tool output (fraction of E) protected from masking.
     pub keep_recent: f64,
+    /// Count each request exactly with the server's `/tokenize` endpoint
+    /// (vLLM) when it has one; otherwise estimate from reported usage.
+    pub server_tokenize: bool,
 }
 
 /// Sessions and transcripts (see `docs/sessions.md`).
@@ -136,6 +139,7 @@ impl Default for Context {
             mask_at: 0.6,
             mask_to: 0.4,
             keep_recent: 0.25,
+            server_tokenize: true,
         }
     }
 }

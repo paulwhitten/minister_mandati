@@ -26,6 +26,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
 # rustls (not OpenSSL) keeps the binary self-contained and easy to audit / statically link.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rustyline = { version = "18.0.1", default-features = false }
 
 # Small, auditable release binary. For a static build see "Building" in README.md.
 [profile.release]
