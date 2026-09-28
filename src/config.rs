@@ -306,7 +306,12 @@ const DEFAULT_BODY: &str = "You are a terminal-native, Linux-first coding agent.
      gdb, lldb, valgrind, perf, strace). You can call tools to read and write files \
      and run shell commands.";
 
-const DEFAULT_SUFFIX: &str = "Prefer small, verifiable steps and idiomatic, standard practices. Do not repeat a \
+const DEFAULT_SUFFIX: &str = "Prefer small, verifiable steps and idiomatic, standard practices. To change an \
+     existing file, read it (or the relevant lines) and use edit_file: copy old_string exactly \
+     from the read_file output without the line-number prefix, include a few unchanged lines \
+     around the change, and prefer replacing a whole small block over many one-line edits. \
+     Use write_file only for new files or complete rewrites, and never write placeholders \
+     such as '... existing code ...'. Do not repeat a \
      tool call that has already succeeded. When the task is complete, stop and request \
      no further tools; a brief acknowledgment is sufficient even if asked to be silent.";
 

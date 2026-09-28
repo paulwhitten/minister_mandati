@@ -23,7 +23,7 @@ use loop_guard::{Intervention, LoopGuards};
 use presenter::{Approval, CliPresenter, Presenter};
 use serde_json::{Value, json};
 use std::time::Instant;
-use tools::{ToolRegistry, truncate_middle};
+use tools::{ToolEnv, ToolRegistry, truncate_middle};
 
 /// Retries after the server rejects a prompt as too long (see docs/context.md).
 const MAX_OVERFLOW_RETRIES: u32 = 2;
@@ -371,7 +371,7 @@ async fn run_repl(
         if let Some(cmd) = line.strip_prefix('/') {
             match cmd {
                 "exit" | "quit" => return Ok("exit"),
-                "new" | "reset" => new_session(ctx),
+                "new" | "reset" => new_session(ctx, registry),
                 "session" => print_session(ctx),
                 "enable_transcript" => {
                     if let Some(path) = ctx.session.transcript_path() {
@@ -398,10 +398,11 @@ async fn run_repl(
 /// `/new`: ends the current session and starts a fresh one (new id, empty
 /// context). Recording carries over: if the old session had a transcript,
 /// the new one gets its own.
-fn new_session(ctx: &mut AgentContext) {
+fn new_session(ctx: &mut AgentContext, registry: &ToolRegistry) {
     let recording = ctx.session.is_recording();
     end_session(ctx, "new", None);
     ctx.reset();
+    registry.reset_files();
     ctx.session = ctx.session.successor();
     if recording {
         enable_transcript(ctx, Mode::Interactive);
@@ -576,43 +577,66 @@ async fn run_turn(
             let started = Instant::now();
             let output = if let Some(skipped) = guards.skip_result(&call.name, policy, fp) {
                 tracing::info!(tool = %call.name, "duplicate call skipped");
-                record_approval(ctx, turn, &call.id, "skipped_duplicate");
+                record_approval(ctx, turn, &call.id, "skipped_duplicate", None);
                 skipped
             } else {
-                let decision = if needs_approval(&ctx.config, &call) {
-                    let decision = presenter
-                        .request_approval(&call)
-                        .whatever_context("approval prompt failed")?;
-                    if decision == Approval::Deny {
-                        record_approval(ctx, turn, &call.id, "denied");
-                        let denied = "Error: user denied permission for this action.";
-                        ctx.session.record(
-                            "tool_result",
-                            json!({ "turn": turn, "call_id": call.id, "tool": call.name,
-                                    "duration_ms": 0, "failed": true, "executed": false,
-                                    "bytes": denied.len(), "sent_bytes": denied.len(),
-                                    "output": denied }),
-                        );
-                        ctx.add_message(Message::tool_result(&call.id, denied));
-                        continue;
-                    }
-                    "approved"
-                } else if call.name == "execute_bash"
-                    && ctx.config.security.require_approval_for_bash
-                {
-                    "auto_approved"
+                let needs = needs_approval(&ctx.config, &call);
+                // Tools with a preview (edits, overwrites) validate first and
+                // show the operator exactly what will change.
+                let preview = if needs {
+                    registry
+                        .preview(&call.name, &call.args)
+                        .await
+                        .map_err(|e| format!("Error: {e}"))
                 } else {
-                    "not_required"
+                    Ok(None)
                 };
-                record_approval(ctx, turn, &call.id, decision);
-                match registry.execute(&call.name, &call.args).await {
-                    Ok(out) => {
-                        guards.record_success(policy, fp, &out);
-                        out
+                match preview {
+                    // The call cannot succeed as given: nothing to approve.
+                    Err(invalid) => {
+                        record_approval(ctx, turn, &call.id, "not_requested_invalid", None);
+                        invalid
                     }
-                    Err(e) => {
-                        tracing::warn!(tool = %call.name, error = %e, "tool failed");
-                        format!("Error: {e}")
+                    Ok(preview) => {
+                        let decision = if needs {
+                            let decision = presenter
+                                .request_approval(&call, preview.as_deref())
+                                .whatever_context("approval prompt failed")?;
+                            if decision == Approval::Deny {
+                                record_approval(ctx, turn, &call.id, "denied", preview.as_deref());
+                                let denied = "Error: user denied permission for this action.";
+                                ctx.session.record(
+                                    "tool_result",
+                                    json!({ "turn": turn, "call_id": call.id, "tool": call.name,
+                                            "duration_ms": 0, "failed": true, "executed": false,
+                                            "bytes": denied.len(), "sent_bytes": denied.len(),
+                                            "output": denied }),
+                                );
+                                ctx.add_message(Message::tool_result(&call.id, denied));
+                                continue;
+                            }
+                            "approved"
+                        } else if call.name == "execute_bash"
+                            && ctx.config.security.require_approval_for_bash
+                        {
+                            "auto_approved"
+                        } else {
+                            "not_required"
+                        };
+                        record_approval(ctx, turn, &call.id, decision, preview.as_deref());
+                        let env = ToolEnv {
+                            output_budget: ctx.output_cap_bytes(),
+                        };
+                        match registry.execute(&call.name, &call.args, &env).await {
+                            Ok(out) => {
+                                guards.record_success(policy, fp, &out);
+                                out
+                            }
+                            Err(e) => {
+                                tracing::warn!(tool = %call.name, error = %e, "tool failed");
+                                format!("Error: {e}")
+                            }
+                        }
                     }
                 }
             };
@@ -667,10 +691,16 @@ async fn run_turn(
     Ok(TurnOutcome::StepCap)
 }
 
-fn record_approval(ctx: &mut AgentContext, turn: u64, call_id: &str, decision: &str) {
+fn record_approval(
+    ctx: &mut AgentContext,
+    turn: u64,
+    call_id: &str,
+    decision: &str,
+    preview: Option<&str>,
+) {
     ctx.session.record(
         "approval",
-        json!({ "turn": turn, "call_id": call_id, "decision": decision }),
+        json!({ "turn": turn, "call_id": call_id, "decision": decision, "preview": preview }),
     );
 }
 

@@ -115,7 +115,7 @@ happens, so a crash loses at most the event in progress. Every line has
 | `turn_start` | an instruction arrives | `turn`, `instruction` |
 | `model_response` | a completion returns | `turn`, `step`, `duration_ms`, `content`, `tool_calls`, `usage` (server-reported), `counted_prompt_tokens` and `count_source` (the count before sending; see [context.md](context.md)) |
 | `model_error` | a completion fails | `turn`, `step`, `error`, `overflow` (bool), `retry` |
-| `approval` | before a tool runs | `call_id`, `decision`: `not_required`, `auto_approved`, `approved`, `denied`, `skipped_duplicate` |
+| `approval` | before a tool runs | `call_id`, `decision`: `not_required`, `auto_approved`, `approved`, `denied`, `skipped_duplicate`, `not_requested_invalid` (the call could not succeed, so nothing was asked); `preview` (the diff shown, for edits and overwrites) |
 | `tool_result` | a tool finishes | `call_id`, `tool`, `duration_ms`, `failed`, `bytes`, `sent_bytes` (after the stage 0 cap), `output` (full) |
 | `compaction` | a context stage acts | `stage` (`normalize`, `mask`, `evict`), `reason`, `call_ids`, `messages_removed`, token estimates before and after |
 | `loop_guard` | a nudge or stop | `action`, `repeats`, `tool` |
