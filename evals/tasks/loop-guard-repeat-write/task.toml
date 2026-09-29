@@ -1,0 +1,15 @@
+family = "regression-loop"
+kind = "regression"
+tags = ["regression", "loop-guard"]
+[limits]
+max_steps = 12
+[[check]]
+name = "file_written"
+type = "file_contains"
+path = "test.txt"
+text = "printf"
+[[check]]
+name = "no_loop"
+type = "agent"
+no_loop_guard = true
+max_steps = 8

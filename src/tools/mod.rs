@@ -99,6 +99,7 @@ impl ToolRegistry {
         let tools: Vec<Box<dyn BaseTool>> = vec![
             Box::new(BashExecutor {
                 timeout: Duration::from_secs(config.security.bash_timeout_secs),
+                wrapper: config.security.bash_wrapper.clone(),
             }),
             Box::new(fs::ReadFile::new(allowed.clone(), files.clone())),
             Box::new(edit::EditFile::new(allowed.clone(), files.clone())),
@@ -186,6 +187,8 @@ pub struct BashExecutor {
     /// Commands still running after this are killed (the `sh` process; children
     /// that detach from it may survive).
     timeout: Duration,
+    /// Optional command prefix (e.g. a `bwrap` sandbox); see `bash_wrapper`.
+    wrapper: Vec<String>,
 }
 
 #[async_trait]
@@ -210,11 +213,15 @@ impl BaseTool for BashExecutor {
             arg: "command".to_string(),
         })?;
 
-        let run = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(cmd)
-            .kill_on_drop(true)
-            .output();
+        let mut command = match self.wrapper.split_first() {
+            Some((program, prefix)) => {
+                let mut c = tokio::process::Command::new(program);
+                c.args(prefix).arg("sh");
+                c
+            }
+            None => tokio::process::Command::new("sh"),
+        };
+        let run = command.arg("-c").arg(cmd).kill_on_drop(true).output();
         // On timeout the future is dropped, and `kill_on_drop` kills the child.
         let output = tokio::time::timeout(self.timeout, run)
             .await
@@ -267,6 +274,7 @@ mod tests {
     async fn bash_runs_and_reports_exit_code() {
         let bash = BashExecutor {
             timeout: Duration::from_secs(10),
+            wrapper: Vec::new(),
         };
         let out = bash
             .execute(&json!({ "command": "echo hi; exit 3" }), &env())
@@ -276,9 +284,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bash_runs_through_the_wrapper() {
+        // `env` as a stand-in wrapper: it runs the rest of its arguments.
+        let bash = BashExecutor {
+            timeout: Duration::from_secs(10),
+            wrapper: vec!["env".into(), "MIMA_WRAPPED=1".into()],
+        };
+        let out = bash
+            .execute(&json!({ "command": "echo $MIMA_WRAPPED" }), &env())
+            .await
+            .unwrap();
+        assert!(out.contains("STDOUT:\n1\n"), "{out}");
+    }
+
+    #[tokio::test]
     async fn bash_times_out() {
         let bash = BashExecutor {
             timeout: Duration::from_millis(200),
+            wrapper: Vec::new(),
         };
         let start = std::time::Instant::now();
         let err = bash

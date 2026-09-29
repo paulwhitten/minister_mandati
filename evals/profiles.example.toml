@@ -1,0 +1,20 @@
+# Model profiles for `mima-eval run --profiles evals/profiles.toml`.
+# Copy to evals/profiles.toml (gitignored) and edit. Profiles run one after
+# another; `setup` switches the served model first (e.g. restart vLLM with
+# it), then mima-eval waits until the server is healthy, lists the model and
+# answers a completion.
+
+[profile.nemotron-super]
+base_url = "http://thor.local:8000/v1"
+model = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
+# api_key = "${MIMA_API_KEY}"
+# setup = "ssh user@thor.local ./serve.sh nemotron"
+ready_timeout_sec = 1800
+# Extra mima settings for this model, merged into the base config:
+# mima = { agent = { temperature = 0.6 } }
+
+[profile.qwen36]
+base_url = "http://thor.local:8000/v1"
+model = "nvidia/Qwen3.6-35B-A3B-NVFP4"
+# setup = "ssh user@thor.local ./serve.sh qwen36"
+ready_timeout_sec = 1800

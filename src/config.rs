@@ -155,6 +155,11 @@ pub struct Security {
     /// Wall-clock limit for one `execute_bash` command; it is killed on expiry.
     #[serde(default = "default_bash_timeout_secs")]
     pub bash_timeout_secs: u64,
+    /// Command prefix for every shell command, e.g. a sandbox:
+    /// `["bwrap", "--unshare-net", ..., "--"]`. The command runs as
+    /// `<prefix...> sh -c <command>`. Empty (default) runs `sh -c` directly.
+    #[serde(default)]
+    pub bash_wrapper: Vec<String>,
     /// Sandbox roots for the filesystem tools only (not a shell sandbox).
     pub allowed_paths: Vec<String>,
 }
@@ -185,6 +190,7 @@ impl Default for Security {
             require_approval_for_writes: true,
             auto_approve_bash: Vec::new(),
             bash_timeout_secs: default_bash_timeout_secs(),
+            bash_wrapper: Vec::new(),
             allowed_paths: vec!["./".to_string()],
         }
     }

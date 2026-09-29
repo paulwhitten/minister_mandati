@@ -1,0 +1,19 @@
+family = "regression-noop"
+kind = "regression"
+tags = ["regression", "should-not-change"]
+expect_fixture_passes = true
+[limits]
+max_steps = 15
+[[check]]
+name = "unchanged"
+type = "unchanged"
+paths = ["dates.py"]
+[[check]]
+name = "hidden_tests"
+type = "command"
+run = "python3 $CHECKS/test_dates.py"
+[[check]]
+name = "no_leftovers"
+type = "only_changed"
+paths = []
+required = false
