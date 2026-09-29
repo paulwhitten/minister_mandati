@@ -29,6 +29,8 @@ pub struct Session {
     turns: u64,
     /// Per-session record counter; continues across disable/enable.
     seq: u64,
+    /// Explicit transcript file (`--transcript-path`), instead of `<dir>/<id>.jsonl`.
+    path_override: Option<PathBuf>,
 }
 
 struct Transcript {
@@ -67,6 +69,7 @@ impl Session {
             transcript: None,
             turns: 0,
             seq: 0,
+            path_override: None,
         }
     }
 
@@ -74,6 +77,11 @@ impl Session {
     /// limits. The caller re-enables the transcript if it was on.
     pub fn successor(&self) -> Self {
         Self::with_label(self.dir.clone(), self.max_output_bytes, self.label.clone())
+    }
+
+    /// Writes the transcript to `path` instead of the transcript directory.
+    pub fn set_path(&mut self, path: PathBuf) {
+        self.path_override = Some(path);
     }
 
     pub fn id(&self) -> &str {
@@ -110,11 +118,16 @@ impl Session {
         if let Some(path) = self.transcript_path() {
             return Ok(path.to_path_buf());
         }
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&self.dir)?;
-        let path = self.dir.join(format!("{}.jsonl", self.id));
+        let path = match &self.path_override {
+            Some(p) => p.clone(),
+            None => self.dir.join(format!("{}.jsonl", self.id)),
+        };
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)?;
+        }
         let file = OpenOptions::new()
             .append(true)
             .create(true)

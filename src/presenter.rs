@@ -162,6 +162,8 @@ pub trait Presenter {
 /// stdout/stdin. Requires only the core dependencies.
 #[derive(Default)]
 pub struct CliPresenter {
+    /// Approve every request without asking (evaluation harness only).
+    pub approve_all: bool,
     /// A streamed line is open on stdout and needs a closing newline.
     line_open: bool,
     /// Content was streamed this step, so `final_answer` must not reprint it.
@@ -199,6 +201,9 @@ impl Presenter for CliPresenter {
     }
 
     fn request_approval(&mut self, call: &ToolCall, preview: Option<&str>) -> io::Result<Approval> {
+        if self.approve_all {
+            return Ok(Approval::Allow);
+        }
         let question = match preview {
             Some(p) => render_preview(p, io::stdout().is_terminal()),
             None => describe_action(call),

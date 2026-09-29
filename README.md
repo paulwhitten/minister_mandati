@@ -163,6 +163,22 @@ prune them as needed:
 `find ~/.mima/transcripts -name '*.jsonl' -mtime +30 -delete`. Format and
 record types: [docs/sessions.md](docs/sessions.md).
 
+## Evaluation
+
+`mima-eval` (built alongside `mima`) runs task suites against one or more
+models with the real `mima` binary, scores trials with deterministic checks
+(hidden tests, build results, file state), and reports pass rates with error
+bars and paired model comparisons. Shell commands and checks run in a
+network-less `bwrap` sandbox per trial.
+
+```bash
+./target/release/mima-eval validate evals/tasks
+./target/release/mima-eval run evals/suites/smoke.toml --profiles evals/profiles.toml
+```
+
+The 16 seed tasks cover editing, C, Rust, Python, shell, git, navigation and
+agent-behavior regressions. See [docs/eval.md](docs/eval.md).
+
 ## Context management
 
 `mima` sizes its working budget from the model's context window, which it

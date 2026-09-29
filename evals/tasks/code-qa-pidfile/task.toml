@@ -1,0 +1,12 @@
+family = "qa"
+tags = ["navigation", "question"]
+[limits]
+max_steps = 20
+[[check]]
+name = "answer"
+type = "final_answer"
+contains = "persist_runtime_state"
+[[check]]
+name = "no_changes"
+type = "only_changed"
+paths = []

@@ -1,0 +1,15 @@
+family = "data"
+tags = ["python", "shell", "data"]
+[limits]
+max_steps = 20
+[[check]]
+name = "csv_exact"
+type = "output_equals"
+run = "cat summary.csv"
+expected = """
+status,count
+200,4
+301,1
+404,2
+500,1
+"""

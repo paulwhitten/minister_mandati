@@ -1,0 +1,13 @@
+family = "py-bugfix"
+tags = ["python", "bugfix", "edit"]
+[limits]
+max_steps = 15
+[[check]]
+name = "hidden_tests"
+type = "command"
+run = "python3 $CHECKS/test_stats.py"
+[[check]]
+name = "scope"
+type = "only_changed"
+paths = ["stats.py"]
+required = false

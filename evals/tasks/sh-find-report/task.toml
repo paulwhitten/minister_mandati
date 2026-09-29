@@ -1,0 +1,13 @@
+family = "shell"
+tags = ["shell", "files"]
+[limits]
+max_steps = 15
+[[check]]
+name = "report_exact"
+type = "output_equals"
+run = "cat report.txt"
+expected = """
+img/d.png
+logs/b.log
+f.txt
+"""

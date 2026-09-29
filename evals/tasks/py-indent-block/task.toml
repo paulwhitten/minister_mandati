@@ -1,0 +1,8 @@
+family = "py-bugfix"
+tags = ["python", "bugfix", "edit", "indentation"]
+[limits]
+max_steps = 15
+[[check]]
+name = "hidden_tests"
+type = "command"
+run = "python3 $CHECKS/test_grades.py"
