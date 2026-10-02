@@ -83,6 +83,7 @@ pub async fn prepare_request(ctx: &mut AgentContext) {
     count_exactly(ctx).await;
     if ctx.compact() {
         count_exactly(ctx).await;
+        ctx.write_context("compaction");
     }
     ctx.seal_request();
 }
@@ -106,10 +107,16 @@ pub fn finish_turn(
 ) {
     let tokens = ledger_json(ctx);
     let turn = ctx.session.turn();
-    ctx.session.record(
+    let seq = ctx.session.record(
         "turn_end",
         json!({ "turn": turn, "outcome": outcome, "answer": answer, "error": error, "tokens": tokens }),
     );
+    if outcome == "answered" {
+        ctx.set_answer_origin(seq);
+    }
+    // After the turn (including a cancelled one, already rolled back), so a
+    // resume restores exactly what the model will see next.
+    ctx.write_context("turn_end");
 }
 
 pub fn record_outcome(ctx: &mut AgentContext, result: &Result<TurnOutcome, snafu::Whatever>) {
@@ -131,12 +138,12 @@ pub async fn run_turn(
 ) -> Result<TurnOutcome, snafu::Whatever> {
     tracing::info!(instruction = %instruction, "starting task");
     presenter.task_started(instruction);
-    ctx.begin_turn(instruction);
     let turn = ctx.session.next_turn();
-    ctx.session.record(
+    let origin = ctx.session.record(
         "turn_start",
         json!({ "turn": turn, "instruction": instruction }),
     );
+    ctx.begin_turn(instruction, origin);
 
     let max_steps = ctx.config.agent.max_steps;
     let mut guards = LoopGuards::new(
@@ -150,7 +157,7 @@ pub async fn run_turn(
         let _enter = span.enter();
 
         let mut overflow_retries = 0;
-        let response = loop {
+        let (response, response_seq) = loop {
             prepare_request(ctx).await;
             let counted = ctx.stats();
             let started = Instant::now();
@@ -171,14 +178,14 @@ pub async fn run_turn(
                     let usage = r.usage.map(
                         |u| json!({ "prompt": u.prompt_tokens, "completion": u.completion_tokens }),
                     );
-                    ctx.session.record(
+                    let seq = ctx.session.record(
                         "model_response",
                         json!({ "turn": turn, "step": step, "duration_ms": duration_ms,
                                 "content": r.content, "tool_calls": calls, "usage": usage,
                                 "counted_prompt_tokens": counted.tokens,
                                 "count_source": counted.token_source }),
                     );
-                    break r;
+                    break (r, seq);
                 }
                 Err(e) => {
                     let overflow = e.is_context_overflow();
@@ -228,11 +235,11 @@ pub async fn run_turn(
             }
         };
 
-        ctx.add_message(Message::assistant_tool_calls(&response));
+        ctx.add_message(Message::assistant_tool_calls(&response).with_origin(response_seq));
 
         // A nudge is a user message, so it must wait until every tool result
         // of this step is in; results have to follow their request directly.
-        let mut nudge = false;
+        let mut nudge: Option<Option<u64>> = None;
         for call in calls {
             tracing::info!(tool = %call.name, args = %call.args, "tool requested");
             presenter.tool_requested(&call);
@@ -272,14 +279,16 @@ pub async fn run_turn(
                             if decision == Approval::Deny {
                                 record_approval(ctx, turn, &call.id, "denied", preview.as_deref());
                                 let denied = "Error: user denied permission for this action.";
-                                ctx.session.record(
+                                let seq = ctx.session.record(
                                     "tool_result",
                                     json!({ "turn": turn, "call_id": call.id, "tool": call.name,
                                             "duration_ms": 0, "failed": true, "executed": false,
                                             "bytes": denied.len(), "sent_bytes": denied.len(),
                                             "output": denied }),
                                 );
-                                ctx.add_message(Message::tool_result(&call.id, denied));
+                                ctx.add_message(
+                                    Message::tool_result(&call.id, denied).with_origin(seq),
+                                );
                                 continue;
                             }
                             "approved"
@@ -309,27 +318,34 @@ pub async fn run_turn(
             };
             // Stage 0 (docs/context.md): the model sees a capped copy; the
             // transcript keeps the full output.
-            let sent = truncate_middle(output.clone(), ctx.output_cap_bytes());
+            let cap = ctx.output_cap_bytes();
+            let sent = truncate_middle(output.clone(), cap);
             let stored = ctx.session.stored_output(&output);
-            ctx.session.record(
-                "tool_result",
-                json!({ "turn": turn, "call_id": call.id, "tool": call.name,
-                        "duration_ms": started.elapsed().as_millis() as u64,
-                        "failed": context::is_failure(&output),
-                        "bytes": output.len(), "sent_bytes": sent.len(), "output": stored }),
-            );
+            let failed = context::is_failure(&output);
+            let mut fields = json!({ "turn": turn, "call_id": call.id, "tool": call.name,
+                    "duration_ms": started.elapsed().as_millis() as u64,
+                    "failed": failed, "bytes": output.len(), "sent_bytes": sent.len(),
+                    "output": stored, "cap_bytes": cap });
+            if !failed && let Some(file) = file_state(&call) {
+                fields["file"] = file;
+            }
+            let seq = ctx.session.record("tool_result", fields);
             presenter.tool_completed(&call.name, &sent);
-            ctx.add_message(Message::tool_result(&call.id, &sent));
+            let mut result = Message::tool_result(&call.id, &sent).with_origin(seq);
+            if sent.len() < output.len() {
+                result.cap_bytes = Some(cap as u64);
+            }
+            ctx.add_message(result);
 
             match guards.intervention(repeats) {
                 Intervention::None => {}
                 Intervention::Nudge => {
                     tracing::warn!(repeats, tool = %call.name, "loop guard: nudge injected");
-                    ctx.session.record(
+                    let seq = ctx.session.record(
                         "loop_guard",
                         json!({ "turn": turn, "action": "nudge", "repeats": repeats, "tool": call.name }),
                     );
-                    nudge = true;
+                    nudge = Some(seq);
                 }
                 Intervention::Terminate => {
                     tracing::warn!(repeats, tool = %call.name, "loop guard tripped: terminating turn");
@@ -344,11 +360,8 @@ pub async fn run_turn(
                 }
             }
         }
-        if nudge {
-            ctx.add_message(Message::user(
-                "A repeated identical action was detected that already succeeded. \
-                 If the task is complete, reply without further tool calls.",
-            ));
+        if let Some(seq) = nudge {
+            ctx.add_message(Message::user(context::NUDGE).with_origin(seq));
         }
     }
 
@@ -356,6 +369,18 @@ pub async fn run_turn(
     presenter.step_cap_reached(max_steps);
     log_token_summary(ctx);
     Ok(TurnOutcome::StepCap)
+}
+
+/// For file tools, the file's path and content hash after the call, so a
+/// resumed session can tell which files changed since (session-resume.md).
+fn file_state(call: &crate::tools::ToolCall) -> Option<Value> {
+    if !matches!(call.name.as_str(), "read_file" | "edit_file" | "write_file") {
+        return None;
+    }
+    let path = call.args.get("path")?.as_str()?;
+    let bytes = std::fs::read(path).ok()?;
+    let hash = crate::transcript::hex(crate::transcript::fnv1a64(&bytes));
+    Some(json!({ "path": path, "fnv1a64": hash }))
 }
 
 pub fn record_approval(

@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Transcript format version; bumped only for breaking changes.
-const SCHEMA: u32 = 1;
+pub const SCHEMA: u32 = 1;
 /// Longest project label in a session id.
 const MAX_LABEL: usize = 32;
 
@@ -31,6 +31,8 @@ pub struct Session {
     seq: u64,
     /// Explicit transcript file (`--transcript-path`), instead of `<dir>/<id>.jsonl`.
     path_override: Option<PathBuf>,
+    /// Start time of a resumed session, as recorded in its transcript.
+    started_text: Option<String>,
 }
 
 struct Transcript {
@@ -70,6 +72,7 @@ impl Session {
             turns: 0,
             seq: 0,
             path_override: None,
+            started_text: None,
         }
     }
 
@@ -89,7 +92,43 @@ impl Session {
     }
 
     pub fn started_utc(&self) -> String {
-        rfc3339_utc(self.started)
+        self.started_text
+            .clone()
+            .unwrap_or_else(|| rfc3339_utc(self.started))
+    }
+
+    /// Continues a recorded session: opens its transcript for appending
+    /// (under an exclusive lock), keeping its id, start time, record counter
+    /// and turn count. See docs/design/session-resume.md.
+    pub fn resume(
+        path: &Path,
+        max_output_bytes: usize,
+        started: String,
+        next_seq: u64,
+        turns: u64,
+    ) -> std::io::Result<Self> {
+        let id = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        let file = open_locked(path)?;
+        Ok(Self {
+            id,
+            label: None,
+            started: SystemTime::now(),
+            dir,
+            max_output_bytes,
+            transcript: Some(Transcript {
+                file,
+                path: path.to_path_buf(),
+                failed: false,
+            }),
+            turns,
+            seq: next_seq,
+            path_override: Some(path.to_path_buf()),
+            started_text: Some(started),
+        })
     }
 
     pub fn transcript_path(&self) -> Option<&Path> {
@@ -128,11 +167,7 @@ impl Session {
                 .mode(0o700)
                 .create(parent)?;
         }
-        let file = OpenOptions::new()
-            .append(true)
-            .create(true)
-            .mode(0o600)
-            .open(&path)?;
+        let file = open_locked(&path)?;
         self.transcript = Some(Transcript {
             file,
             path: path.clone(),
@@ -168,11 +203,11 @@ impl Session {
 
     /// Appends one event: `seq`, `ts` (UTC) and `type`, then `fields`. Each
     /// line is written and flushed immediately. A write failure is reported
-    /// once and never stops the agent. No-op when transcripts are off.
-    pub fn record(&mut self, kind: &str, fields: Value) {
-        let Some(t) = self.transcript.as_mut() else {
-            return;
-        };
+    /// once and never stops the agent. Returns the record's `seq`, or `None`
+    /// when transcripts are off.
+    pub fn record(&mut self, kind: &str, fields: Value) -> Option<u64> {
+        let t = self.transcript.as_mut()?;
+        let seq = self.seq;
         let mut line =
             json!({ "seq": self.seq, "ts": rfc3339_utc(SystemTime::now()), "type": kind });
         merge(&mut line, fields);
@@ -188,6 +223,7 @@ impl Session {
             t.failed = true;
             tracing::warn!(error = %e, path = %t.path.display(), "transcript write failed; continuing without it");
         }
+        Some(seq)
     }
 
     /// Tool output as stored in the transcript: full, up to the configured cap.
@@ -205,6 +241,25 @@ impl Session {
             end,
             output.len()
         ))
+    }
+}
+
+/// Opens a transcript for appending (mode 0600) and takes an exclusive
+/// advisory lock, held while the file is open, so two mima processes never
+/// append to one transcript.
+fn open_locked(path: &Path) -> std::io::Result<File> {
+    let file = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .open(path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(std::io::Error::other(format!(
+            "{} is in use by another mima process",
+            path.display()
+        ))),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
     }
 }
 
@@ -439,6 +494,22 @@ mod tests {
         );
         let seqs: Vec<u64> = recs.iter().map(|r| r["seq"].as_u64().unwrap()).collect();
         assert_eq!(seqs, [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn transcripts_are_locked_while_open() {
+        let dir = temp_dir("lock");
+        let mut a = Session::new(dir.clone(), 1024);
+        let path = a.enable(json!({})).unwrap();
+        let err = Session::resume(&path, 1024, "t".into(), 5, 1)
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("in use"), "{err}");
+        a.end("exit", json!({}));
+        let mut b = Session::resume(&path, 1024, "2026-09-30T00:00:00.000Z".into(), 5, 1).unwrap();
+        assert_eq!(b.record("turn_start", json!({ "turn": 2 })), Some(5));
+        assert_eq!(b.started_utc(), "2026-09-30T00:00:00.000Z");
+        assert_eq!(b.id(), a.id());
     }
 
     #[test]

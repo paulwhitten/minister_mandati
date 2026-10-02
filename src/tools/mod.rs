@@ -2,6 +2,7 @@
 
 pub mod edit;
 pub mod fs;
+pub mod search;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -104,7 +105,9 @@ impl ToolRegistry {
             Box::new(fs::ReadFile::new(allowed.clone(), files.clone())),
             Box::new(edit::EditFile::new(allowed.clone(), files.clone())),
             Box::new(fs::WriteFile::new(allowed.clone(), files.clone())),
-            Box::new(fs::ListDir::new(allowed)),
+            Box::new(fs::ListDir::new(allowed.clone())),
+            Box::new(search::FindFiles::new(allowed.clone())),
+            Box::new(search::SearchFiles::new(allowed)),
         ];
         let mut map: HashMap<String, Box<dyn BaseTool>> = HashMap::new();
         for tool in tools {

@@ -21,7 +21,7 @@ human-in-the-loop approval for state-changing actions by default.
 
 ## Quick start
 
-Requires Rust 1.88 or newer on Linux.
+Requires Rust 1.89 or newer on Linux.
 
 1. Serve a model locally. See [vLLM](https://docs.vllm.ai/en/latest/getting_started/quickstart/) or 
    [Ollama](https://docs.ollama.com/quickstart) quickstart guides for online serving.
@@ -71,6 +71,24 @@ Options:
       --transcript
           Write a transcript of this session to the transcript directory (default ~/.mima/transcripts). Off by default
 
+      --config <FILE>
+          Use this config file instead of discovering agent.toml
+
+      --transcript-path <FILE>
+          Write the transcript to FILE (implies --transcript)
+
+      --max-steps <N>
+          Override [agent].max_steps for this run
+
+      --sessions
+          List recorded sessions (newest first) and exit
+
+      --resume <ID>
+          Continue a recorded session: an id (a unique prefix is enough) or "last". Opens the interactive prompt; an INSTRUCTION runs first
+
+      --approve-all
+          Approve every tool call without asking. For the evaluation harness only: refused unless MIMA_EVAL_SANDBOX=1 is set (see docs/eval.md)
+
   -h, --help
           Print help (see a summary with '-h')
 
@@ -96,7 +114,7 @@ Modes:
 `-i` matters only when you also pass an instruction: plain `mima` on a
 terminal already starts the REPL, so `mima -i` on its own behaves the same.
 
-In the REPL, `/help` lists commands (`/tokens`, `/context`, `/session`, `/new`,
+In the REPL, `/help` lists commands (`/tokens`, `/context`, `/session`, `/sessions`, `/resume`, `/new`,
 `/enable_transcript`, `/disable_transcript`, `/exit`). Ctrl-C
 cancels the current turn and returns to the prompt; Ctrl-D exits. The prompt
 supports line editing (arrow keys, Home/End, Delete) and Up/Down history for
@@ -154,6 +172,11 @@ Each run of `mima` is a session; in the REPL, `/new` starts a fresh one. A
 session can be recorded to a **transcript**: a JSON Lines file of timestamped
 events (UTC) in `~/.mima/transcripts/`, covering instructions, model
 responses, approvals, full tool outputs, context compactions and token usage.
+
+A recorded session can be continued later: `mima --sessions` lists them and
+`mima --resume <id|last>` (or `/resume` in the REPL) rebuilds the context and
+appends to the same transcript
+([docs/design/session-resume.md](docs/design/session-resume.md)).
 
 Transcripts are **off by default**, and `mima` says so when it starts. Enable
 them with `/enable_transcript` (REPL), `--transcript` (one run), or
@@ -214,6 +237,9 @@ MIMA_LOG_FORMAT=json cargo run -- "..." # structured JSON logs for auditing
 - Shell commands are killed after `bash_timeout_secs` (default 300). Tool
   output is capped relative to the model's context window, keeping the head
   and tail.
+- `read_file`, `list_dir`, `find_files` and `search_files` are read-only and
+  never prompt; the search tools skip `.git`, build and dependency
+  directories and never follow symlinks.
 - `allowed_paths` sandboxes the **filesystem tools only**; it is not a shell
   sandbox — shell safety relies on the approval gate.
 
