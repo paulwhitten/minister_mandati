@@ -1,0 +1,75 @@
+{
+  "messages": [
+    {
+      "content": "Read the files and fix line 7 of a.txt.\n\n[Note: 4 earlier messages were removed to fit the context window.]",
+      "role": "user"
+    },
+    {
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "function": {
+            "arguments": "{\"path\":\"/tmp/mima-resume-exact-390132/work/c.txt\"}",
+            "name": "read_file"
+          },
+          "id": "r3",
+          "type": "function"
+        }
+      ]
+    },
+    {
+      "content": "[output elided to save context: read_file {\"path\":\"/tmp/mima-resume-exact-390132/work/c.txt\"}, 3677 bytes. Re-run the tool if you need it again.]",
+      "role": "tool",
+      "tool_call_id": "r3"
+    },
+    {
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "function": {
+            "arguments": "{\"new_string\":\"line seven\",\"old_string\":\"line 7 of a long file\",\"path\":\"/tmp/mima-resume-exact-390132/work/a.txt\"}",
+            "name": "edit_file"
+          },
+          "id": "e1",
+          "type": "function"
+        }
+      ]
+    },
+    {
+      "content": "Edited /tmp/mima-resume-exact-390132/work/a.txt: replaced lines 7-7 with 1 lines.\n     4\tline 4 of a long file\n     5\tline 5 of a long file\n     6\tline 6 of a long file\n     7\tline seven\n     8\tline 8 of a long file\n     9\tline 9 of a long file\n    10\tline 10 of a long file",
+      "role": "tool",
+      "tool_call_id": "e1"
+    },
+    {
+      "content": "Edited a.txt.",
+      "role": "assistant"
+    },
+    {
+      "content": "What does line 7 say now?",
+      "role": "user"
+    },
+    {
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "function": {
+            "arguments": "{\"limit\":5,\"offset\":5,\"path\":\"/tmp/mima-resume-exact-390132/work/a.txt\"}",
+            "name": "read_file"
+          },
+          "id": "r4",
+          "type": "function"
+        }
+      ]
+    },
+    {
+      "content": "[/tmp/mima-resume-exact-390132/work/a.txt lines 5-9 of 600]\n     5\tline 5 of a long file\n     6\tline 6 of a long file\n     7\tline seven\n     8\tline 8 of a long file\n     9\tline 9 of a long file\n[591 more lines; next: offset=10]",
+      "role": "tool",
+      "tool_call_id": "r4"
+    },
+    {
+      "content": "Line 7 now reads: line seven.",
+      "role": "assistant"
+    }
+  ],
+  "method": "context"
+}
