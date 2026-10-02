@@ -312,7 +312,8 @@ const DEFAULT_BODY: &str = "You are a terminal-native, Linux-first coding agent.
      gdb, lldb, valgrind, perf, strace). You can call tools to read and write files \
      and run shell commands.";
 
-const DEFAULT_SUFFIX: &str = "Prefer small, verifiable steps and idiomatic, standard practices. To change an \
+const DEFAULT_SUFFIX: &str = "Prefer small, verifiable steps and idiomatic, standard practices. Use find_files and \
+     search_files to locate code rather than shell commands. To change an \
      existing file, read it (or the relevant lines) and use edit_file: copy old_string exactly \
      from the read_file output without the line-number prefix, include a few unchanged lines \
      around the change, and prefer replacing a whole small block over many one-line edits. \

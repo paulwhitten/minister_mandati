@@ -1,6 +1,7 @@
 use clap::Parser;
 use snafu::prelude::*;
 use std::io::{self, IsTerminal, Read};
+use std::path::Path;
 
 mod agent;
 mod approval;
@@ -10,9 +11,16 @@ mod config;
 mod context;
 mod loop_guard;
 mod presenter;
+#[cfg(test)]
+mod resume_tests;
 mod schema;
+#[cfg(test)]
+mod schema_tests;
 mod session;
+#[cfg(test)]
+mod testutil;
 mod tools;
+mod transcript;
 
 use agent::{finish_turn, ledger_json, record_outcome, run_turn};
 use config::Config;
@@ -63,6 +71,15 @@ struct Cli {
     /// Override [agent].max_steps for this run.
     #[arg(long, value_name = "N")]
     max_steps: Option<usize>,
+
+    /// List recorded sessions (newest first) and exit.
+    #[arg(long)]
+    sessions: bool,
+
+    /// Continue a recorded session: an id (a unique prefix is enough) or
+    /// "last". Opens the interactive prompt; an INSTRUCTION runs first.
+    #[arg(long, value_name = "ID")]
+    resume: Option<String>,
 
     /// Approve every tool call without asking. For the evaluation harness
     /// only: refused unless MIMA_EVAL_SANDBOX=1 is set (see docs/eval.md).
@@ -130,9 +147,17 @@ async fn run(cli: Cli, presenter: &mut dyn Presenter) -> Result<(), snafu::Whate
     agent::configure_window(&mut ctx).await;
     agent::configure_token_counter(&mut ctx).await;
 
+    if cli.sessions {
+        print_sessions(&ctx);
+        return Ok(());
+    }
+
     let joined = cli.instruction.join(" ");
     let mut task = joined.trim().to_string();
-    let mode = if cli.interactive || (task.is_empty() && io::stdin().is_terminal()) {
+    let mode = if cli.resume.is_some()
+        || cli.interactive
+        || (task.is_empty() && io::stdin().is_terminal())
+    {
         Mode::Interactive
     } else if task.is_empty() {
         let mut piped = String::new();
@@ -151,7 +176,9 @@ async fn run(cli: Cli, presenter: &mut dyn Presenter) -> Result<(), snafu::Whate
     if let Some(path) = &cli.transcript_path {
         ctx.session.set_path(path.clone());
     }
-    if cli.transcript || cli.transcript_path.is_some() || ctx.config.session.transcripts {
+    if let Some(id) = &cli.resume {
+        resume_session(&mut ctx, id).whatever_context("cannot resume")?;
+    } else if cli.transcript || cli.transcript_path.is_some() || ctx.config.session.transcripts {
         enable_transcript(&mut ctx, mode);
     }
     if mode != Mode::Interactive {
@@ -304,6 +331,18 @@ async fn run_repl(
             match cmd {
                 "exit" | "quit" => return Ok("exit"),
                 "new" | "reset" => new_session(ctx, registry),
+                "sessions" => print_sessions(ctx),
+                c if c.starts_with("resume") => {
+                    let id = c.trim_start_matches("resume").trim();
+                    let id = if id.is_empty() { "last" } else { id };
+                    end_session(ctx, "resume", None);
+                    ctx.reset();
+                    registry.reset_files();
+                    ctx.session = ctx.session.successor();
+                    if let Err(e) = resume_session(ctx, id) {
+                        println!("cannot resume: {e}");
+                    }
+                }
                 "session" => print_session(ctx),
                 "enable_transcript" => {
                     if let Some(path) = ctx.session.transcript_path() {
@@ -341,6 +380,125 @@ fn new_session(ctx: &mut AgentContext, registry: &ToolRegistry) {
     }
     println!("New session {}.", ctx.session.id());
     announce_transcript(ctx, Mode::Interactive);
+}
+
+/// Prints recorded sessions, newest first (`--sessions`, `/sessions`).
+fn print_sessions(ctx: &AgentContext) {
+    let dir = session::expand_home(&ctx.config.session.transcript_dir);
+    let sessions = transcript::list_sessions(&dir);
+    if sessions.is_empty() {
+        println!("No recorded sessions in {}.", dir.display());
+        return;
+    }
+    for s in sessions.iter().take(30) {
+        let first: String = s.first_instruction.chars().take(60).collect();
+        let model = s.model.rsplit('/').next().unwrap_or(&s.model);
+        println!(
+            "{}  started {}  {} turns  {:<11}  {}  \"{}\"{}",
+            s.id,
+            s.started.get(..16).unwrap_or(&s.started).replace('T', " "),
+            s.turns,
+            s.ended,
+            model,
+            first.replace('\n', " "),
+            if s.resumable {
+                ""
+            } else {
+                "  (newer format; cannot resume)"
+            }
+        );
+    }
+    if sessions.len() > 30 {
+        println!(
+            "... {} older sessions in {}",
+            sessions.len() - 30,
+            dir.display()
+        );
+    }
+}
+
+/// Continues a recorded session in `ctx` (docs/design/session-resume.md):
+/// rebuilds the context from its latest `context` record or by replay,
+/// reopens its transcript for appending, and reports what changed since.
+fn resume_session(ctx: &mut AgentContext, id: &str) -> Result<(), String> {
+    let dir = session::expand_home(&ctx.config.session.transcript_dir);
+    let path = transcript::find(&dir, id)?;
+    let t = transcript::Transcript::load(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let start = t
+        .start()
+        .ok_or("not a transcript (no session_start)")?
+        .clone();
+    if start.schema > session::SCHEMA {
+        return Err(format!(
+            "{} was written by a newer mima (transcript schema {}); this mima reads up to {}",
+            path.display(),
+            start.schema,
+            session::SCHEMA
+        ));
+    }
+    let rebuilt = transcript::rebuild(&t, ctx.output_cap_bytes());
+    let resumed = session::Session::resume(
+        &path,
+        ctx.config.session.max_output_bytes,
+        start.session_started.clone(),
+        t.next_seq(),
+        t.turns(),
+    )
+    .map_err(|e| e.to_string())?;
+    ctx.session = resumed;
+    let count = rebuilt.messages.len();
+    ctx.restore(
+        rebuilt.messages,
+        rebuilt.first_instruction,
+        rebuilt.masked_total,
+        rebuilt.evicted_total,
+    );
+
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let changed = transcript::changed_files(&t, &cwd);
+    let model = ctx.config.provider.default_model.clone();
+    ctx.session.record(
+        "session_resumed",
+        json!({ "method": rebuilt.method, "reason": rebuilt.reason, "from_seq": rebuilt.from_seq,
+                "mima_version": env!("CARGO_PKG_VERSION"), "model": model,
+                "cwd": cwd.display().to_string(), "changed_files": changed }),
+    );
+
+    let how = match &rebuilt.reason {
+        None => "from its last context record".to_string(),
+        Some(r) => format!("by replaying the transcript ({r})"),
+    };
+    println!(
+        "Resumed session {} ({} turns, {count} messages), rebuilt {how}.",
+        ctx.session.id(),
+        t.turns()
+    );
+    if t.bad_lines > 0 {
+        println!(
+            "Note: {} unreadable transcript line(s) were skipped.",
+            t.bad_lines
+        );
+    }
+    if start.model.as_deref().is_some_and(|m| m != model) {
+        println!(
+            "Note: the session used {}; now using {model}.",
+            start.model.unwrap_or_default()
+        );
+    }
+    if start.cwd.as_deref().is_some_and(|c| Path::new(c) != cwd) {
+        println!(
+            "Note: the session ran in {}; now in {}.",
+            start.cwd.unwrap_or_default(),
+            cwd.display()
+        );
+    }
+    if !changed.is_empty() {
+        println!("Files changed on disk since the session last saw them (re-read before editing):");
+        for c in &changed {
+            println!("  {} ({})", c.path, c.status);
+        }
+    }
+    Ok(())
 }
 
 /// Prints the session id, start time and transcript state (REPL `/session`).
@@ -428,6 +586,8 @@ fn print_help() {
          /context             show context budget\n  \
          /session             show session id, start time and transcript\n  \
          /new                 start a new session (alias: /reset)\n  \
+         /sessions            list recorded sessions\n  \
+         /resume [id]         continue a recorded session (default: the last)\n  \
          /enable_transcript   record this session to a transcript\n  \
          /disable_transcript  stop recording\n  \
          /exit                quit (also Ctrl-D)"

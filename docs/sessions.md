@@ -1,8 +1,9 @@
 # Sessions and transcripts
 
 Status: implemented (sessions, transcripts, `/new`, `/session`,
-`/enable_transcript`, `/disable_transcript`, `--transcript`). Resume and
-recall are planned.
+`/enable_transcript`, `/disable_transcript`, `--transcript`, `--sessions`,
+`--resume`, `/sessions`, `/resume`). Resume is described in
+[design/session-resume.md](design/session-resume.md); recall is planned.
 
 A **session** is one continuous conversation between an operator and `mima`,
 with one context (history, token ledger, budget) and, when enabled, one
@@ -47,8 +48,11 @@ Transcripts serve three purposes:
 | Ctrl-C in one-shot mode, or a fatal error | the session ends; the last lines record why when possible |
 | `mima --resume <id\|last>` | later: rebuild the context from a transcript and continue in a new session linked to it |
 
-A session never spans processes. Two `mima` processes running at once have
-two sessions and two files; no locking is needed.
+A recorded session can continue in a later process with `--resume` (see
+[design/session-resume.md](design/session-resume.md)): the context is rebuilt
+from the transcript and the conversation is appended to the same file. Each
+transcript is locked while a process has it open, so two `mima` processes
+never write to one file; each running process has its own session.
 
 ## Session id and file name
 
@@ -116,16 +120,23 @@ happens, so a crash loses at most the event in progress. Every line has
 | `model_response` | a completion returns | `turn`, `step`, `duration_ms`, `content`, `tool_calls`, `usage` (server-reported), `counted_prompt_tokens` and `count_source` (the count before sending; see [context.md](context.md)) |
 | `model_error` | a completion fails | `turn`, `step`, `error`, `overflow` (bool), `retry` |
 | `approval` | before a tool runs | `call_id`, `decision`: `not_required`, `auto_approved`, `approved`, `denied`, `skipped_duplicate`, `not_requested_invalid` (the call could not succeed, so nothing was asked); `preview` (the diff shown, for edits and overwrites) |
-| `tool_result` | a tool finishes | `call_id`, `tool`, `duration_ms`, `failed`, `bytes`, `sent_bytes` (after the stage 0 cap), `output` (full) |
+| `tool_result` | a tool finishes | `call_id`, `tool`, `duration_ms`, `failed`, `bytes`, `sent_bytes` (after the stage 0 cap), `output` (full), `cap_bytes` (the cap in effect), `file` (`{path, fnv1a64}` after a read, edit or write) |
 | `compaction` | a context stage acts | `stage` (`normalize`, `mask`, `evict`), `reason`, `call_ids`, `messages_removed`, token estimates before and after |
 | `loop_guard` | a nudge or stop | `action`, `repeats`, `tool` |
 | `turn_end` | a turn finishes | `turn`, `outcome` (`answered`, `loop_guard`, `step_cap`, `cancelled`, `error`), `answer`, `tokens` |
 | `transcript_disabled` | `/disable_transcript` | `turns` |
-| `session_end` | session ends | `reason` (`exit`, `eof`, `new`, `task_done`, `interrupted`, `fatal`), `turns`, `tokens`, `error` |
+| `session_end` | session ends | `reason` (`exit`, `eof`, `new`, `resume`, `task_done`, `interrupted`, `fatal`), `turns`, `tokens`, `error` |
+| `context` | a turn ends, or compaction runs | what the model sees, by reference to earlier records (`entries`), with `context_schema` and a `check`; see [design/session-resume.md](design/session-resume.md) |
+| `session_resumed` | `--resume` or `/resume` | `method` (`context` or `replay`), `reason`, `from_seq`, `mima_version`, `model`, `cwd`, `changed_files` |
 
-Readers must ignore unknown fields and unknown types, so later schema
-versions stay backward compatible; `schema` increments only for breaking
-changes.
+The format is defined by `schemas/transcript.schema.json` (JSON Schema
+2020-12, generated from the Rust types in `src/transcript.rs`), and changes
+follow the evolution rules in
+[design/session-resume.md](design/session-resume.md): readers ignore unknown
+fields and record types, additions are optional, and `schema` (or
+`context_schema` for `context` records) increments only for breaking
+changes. `cargo test` checks the committed schema, validates everything mima
+writes against it, and compares it with the last released schema.
 
 ### What is recorded
 

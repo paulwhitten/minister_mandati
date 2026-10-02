@@ -35,6 +35,17 @@ pub struct Message {
     /// True once a tool result's body has been replaced by a placeholder.
     #[serde(skip)]
     pub masked: bool,
+    /// Transcript record (`seq`) this message was built from, if recorded.
+    /// Lets a `context` record refer to it instead of copying it
+    /// (docs/design/session-resume.md).
+    #[serde(skip)]
+    pub origin: Option<u64>,
+    /// Stage 0 cap applied to this tool output, when it was cut.
+    #[serde(skip)]
+    pub cap_bytes: Option<u64>,
+    /// Made up by mima rather than recorded (a "not executed" result).
+    #[serde(skip)]
+    pub synthetic: bool,
 }
 
 impl Message {
@@ -45,7 +56,16 @@ impl Message {
             tool_calls: None,
             tool_call_id: None,
             masked: false,
+            origin: None,
+            cap_bytes: None,
+            synthetic: false,
         }
+    }
+
+    /// Records which transcript line this message came from.
+    pub fn with_origin(mut self, seq: Option<u64>) -> Self {
+        self.origin = seq;
+        self
     }
 
     pub fn system(content: &str) -> Self {
@@ -66,28 +86,34 @@ impl Message {
     /// results: this covers the ReAct fallback (no native `tool_calls`) and
     /// native calls whose id was generated locally.
     pub fn assistant_tool_calls(response: &CompletionResponse) -> Self {
-        let mut m = Self::new(
-            "assistant",
-            response.content.clone().filter(|c| !c.is_empty()),
-        );
-        m.tool_calls = response
+        let calls: Vec<(&str, &str, &Value)> = response
             .tool_calls
-            .as_ref()
-            .filter(|calls| !calls.is_empty())
-            .map(|calls| {
-                Value::Array(
-                    calls
-                        .iter()
-                        .map(|c| {
-                            json!({
-                                "id": c.id,
-                                "type": "function",
-                                "function": { "name": c.name, "arguments": c.args.to_string() },
-                            })
+            .iter()
+            .flatten()
+            .map(|c| (c.id.as_str(), c.name.as_str(), &c.args))
+            .collect();
+        Self::assistant_calls(response.content.clone(), &calls)
+    }
+
+    /// An assistant message with tool calls given as (id, name, arguments).
+    /// Shared by the live loop and transcript rebuilding so both produce the
+    /// same message.
+    pub fn assistant_calls(content: Option<String>, calls: &[(&str, &str, &Value)]) -> Self {
+        let mut m = Self::new("assistant", content.filter(|c| !c.is_empty()));
+        if !calls.is_empty() {
+            m.tool_calls = Some(Value::Array(
+                calls
+                    .iter()
+                    .map(|(id, name, args)| {
+                        json!({
+                            "id": id,
+                            "type": "function",
+                            "function": { "name": name, "arguments": args.to_string() },
                         })
-                        .collect(),
-                )
-            });
+                    })
+                    .collect(),
+            ));
+        }
         m
     }
 
@@ -131,7 +157,10 @@ pub struct ContextStats {
 
 /// Result text for a requested tool call that never ran (turn aborted, loop
 /// guard stop, error). Keeps the request/result pairing the API requires.
-const NOT_EXECUTED: &str = "Not executed: the turn ended before this call ran.";
+pub const NOT_EXECUTED: &str = "Not executed: the turn ended before this call ran.";
+/// The loop guard's nudge (a user message after a step's tool results).
+pub const NUDGE: &str = "A repeated identical action was detected that already succeeded. \
+                         If the task is complete, reply without further tool calls.";
 /// Longest tool-call argument text quoted in a placeholder.
 const PLACEHOLDER_ARGS_CHARS: usize = 200;
 
@@ -283,10 +312,118 @@ impl AgentContext {
 
     /// Start a turn: repair any tool calls a previous turn left unanswered,
     /// then append the instruction and protect it from eviction for this turn.
-    pub fn begin_turn(&mut self, instruction: &str) {
+    pub fn begin_turn(&mut self, instruction: &str, origin: Option<u64>) {
         self.normalize();
         self.turn_start = Some(self.messages.len());
-        self.add_message(Message::user(instruction));
+        self.add_message(Message::user(instruction).with_origin(origin));
+    }
+
+    /// Links the turn's final answer (the last message) to its `turn_end`
+    /// record, which is written after the answer is added.
+    pub fn set_answer_origin(&mut self, seq: Option<u64>) {
+        if let Some(last) = self.messages.last_mut()
+            && last.role == "assistant"
+            && last.tool_calls.is_none()
+            && last.origin.is_none()
+        {
+            last.origin = seq;
+        }
+    }
+
+    /// What the model currently sees, by reference to transcript records
+    /// (docs/design/session-resume.md). `None` when a message has no record
+    /// to refer to (recording started mid-session); resume then replays.
+    pub fn context_record(&self, cause: &str) -> Option<crate::transcript::ContextRecord> {
+        use crate::transcript::{ContextRecord, Entry, View, check};
+        let body = self.messages.get(1..).unwrap_or_default();
+        let mut entries = Vec::with_capacity(body.len());
+        for (i, m) in body.iter().enumerate() {
+            let entry = if m.synthetic {
+                Entry {
+                    view: View::Synthetic,
+                    role: Some(m.role.clone()),
+                    text: m.content.clone(),
+                    call_id: m.tool_call_id.clone(),
+                    ..Entry::default()
+                }
+            } else {
+                let mut e = Entry {
+                    seq: Some(m.origin?),
+                    ..Entry::default()
+                };
+                let noted = (i == 0 && self.pinned == 2)
+                    .then(|| {
+                        let original = self.first_instruction.as_deref()?;
+                        let content = m.content.as_deref()?;
+                        content.strip_prefix(original).filter(|n| !n.is_empty())
+                    })
+                    .flatten();
+                if m.masked {
+                    e.view = View::Masked;
+                    e.text = m.content.clone();
+                } else if let Some(note) = noted {
+                    e.view = View::Noted;
+                    e.text = Some(note.to_string());
+                } else if let Some(cap) = m.cap_bytes {
+                    e.view = View::Capped;
+                    e.cap_bytes = Some(cap);
+                }
+                e
+            };
+            entries.push(entry);
+        }
+        let stats = self.stats();
+        Some(ContextRecord {
+            context_schema: crate::transcript::CONTEXT_SCHEMA,
+            turn: self.session.turn(),
+            cause: cause.to_string(),
+            window: stats.budget.window as u64,
+            budget: stats.budget.operating as u64,
+            tokens: stats.tokens as u64,
+            count_source: stats.token_source.to_string(),
+            masked_total: self.masked_total as u64,
+            evicted_total: self.evicted_total as u64,
+            entries,
+            check: check(body),
+        })
+    }
+
+    /// Writes a `context` record to the transcript (no-op when not recording
+    /// or when the context cannot be described by reference).
+    pub fn write_context(&mut self, cause: &str) {
+        if !self.session.is_recording() {
+            return;
+        }
+        match self.context_record(cause) {
+            Some(record) => {
+                let value = serde_json::to_value(&record).unwrap_or_default();
+                self.session.record("context", value);
+            }
+            None => tracing::debug!("context not written: a message has no transcript record"),
+        }
+    }
+
+    /// Replaces the conversation with one rebuilt from a transcript (resume).
+    /// The system prompt comes from the current configuration.
+    pub fn restore(
+        &mut self,
+        messages: Vec<Message>,
+        first_instruction: Option<String>,
+        masked_total: usize,
+        evicted_total: usize,
+    ) {
+        let system = self.messages[0].clone();
+        let first_is_user = messages.first().is_some_and(|m| m.role == "user");
+        self.messages = std::iter::once(system).chain(messages).collect();
+        self.pinned = if first_is_user { 2 } else { 1 };
+        self.first_instruction = if first_is_user {
+            first_instruction
+        } else {
+            None
+        };
+        self.turn_start = None;
+        self.masked_total = masked_total;
+        self.evicted_total = evicted_total;
     }
 
     pub fn add_message(&mut self, message: Message) {
@@ -442,7 +579,9 @@ impl AgentContext {
                 }
             }
             for id in ids.iter().filter(|id| !answered.contains(id)) {
-                out.push(Message::tool_result(id, NOT_EXECUTED));
+                let mut m = Message::tool_result(id, NOT_EXECUTED);
+                m.synthetic = true;
+                out.push(m);
                 added += 1;
             }
         }
@@ -771,7 +910,7 @@ mod tests {
     #[test]
     fn masking_comes_before_eviction() {
         let mut c = ctx();
-        c.begin_turn("task");
+        c.begin_turn("task", None);
         // ~500 tokens per result: crosses mask_at (60% of 3388) after a few steps.
         for n in 0..5 {
             step(&mut c, &[&format!("c{n}")], 1_500);
@@ -793,7 +932,7 @@ mod tests {
     #[test]
     fn placeholder_keeps_call_and_size() {
         let mut c = ctx();
-        c.begin_turn("task");
+        c.begin_turn("task", None);
         for n in 0..5 {
             step(&mut c, &[&format!("c{n}")], 1_500);
         }
@@ -811,7 +950,7 @@ mod tests {
     #[test]
     fn newest_output_and_latest_failure_are_protected() {
         let mut c = ctx();
-        c.begin_turn("task");
+        c.begin_turn("task", None);
         step(&mut c, &["old"], 1_500);
         c.add_message(Message::assistant_tool_calls(&response(vec![call("bad")])));
         c.add_message(Message::tool_result(
@@ -838,7 +977,7 @@ mod tests {
     #[test]
     fn masking_skipped_when_gain_is_small() {
         let mut c = ctx();
-        c.begin_turn(&"t".repeat(7_000)); // big instruction, not maskable
+        c.begin_turn(&"t".repeat(7_000), None); // big instruction, not maskable
         step(&mut c, &["a"], 200);
         step(&mut c, &["b"], 200);
         // Over mask_at, but masking small outputs cannot free 10% of E.
@@ -850,7 +989,7 @@ mod tests {
     fn eviction_never_orphans_tool_results() {
         for size in [400, 1_500, 3_000, 6_000] {
             let mut c = ctx();
-            c.begin_turn("task");
+            c.begin_turn("task", None);
             for n in 0..40 {
                 let (a, b) = (format!("a{n}"), format!("b{n}"));
                 step(&mut c, &[&a, &b], size);
@@ -866,10 +1005,10 @@ mod tests {
     #[test]
     fn eviction_keeps_instructions_and_newest_step_and_adds_note() {
         let mut c = ctx();
-        c.begin_turn("first task");
+        c.begin_turn("first task", None);
         step(&mut c, &["x"], 100);
         c.add_message(Message::assistant("done"));
-        c.begin_turn("second task");
+        c.begin_turn("second task", None);
         // Masked steps still cost ~85 tokens each, so enough of them push the
         // context past evict_at once masking has nothing left to free.
         for n in 0..60 {
@@ -894,7 +1033,7 @@ mod tests {
     #[test]
     fn normalize_repairs_pairing() {
         let mut c = ctx();
-        c.begin_turn("task");
+        c.begin_turn("task", None);
         c.add_message(Message::tool_result("stray", "orphan before any call"));
         c.add_message(Message::assistant_tool_calls(&response(vec![
             call("p"),
@@ -903,7 +1042,7 @@ mod tests {
         c.add_message(Message::tool_result("p", "ok"));
         c.add_message(Message::tool_result("p", "duplicate"));
         c.add_message(Message::tool_result("zzz", "unknown id"));
-        c.begin_turn("next");
+        c.begin_turn("next", None);
         assert_valid(&c);
         let t = texts(&c);
         assert!(
@@ -939,7 +1078,7 @@ mod tests {
     #[test]
     fn overflow_adopts_server_window_and_frees_space() {
         let mut c = ctx();
-        c.begin_turn("task");
+        c.begin_turn("task", None);
         for n in 0..3 {
             step(&mut c, &[&format!("c{n}")], 600);
         }
@@ -980,7 +1119,7 @@ mod tests {
     #[test]
     fn tokenize_count_is_exact_until_history_changes() {
         let mut c = ctx();
-        c.begin_turn("task");
+        c.begin_turn("task", None);
         step(&mut c, &["a"], 900);
         c.normalize();
         c.record_counted(777);

@@ -36,6 +36,10 @@ pub struct Profile {
     pub setup: Option<String>,
     #[serde(default = "default_ready_timeout")]
     pub ready_timeout_sec: u64,
+    /// Command whose output describes what is being served (image, flags),
+    /// run once the server is ready and stored in run.json.
+    #[serde(default)]
+    pub fingerprint: Option<String>,
     /// Extra mima configuration merged into the base config, e.g.
     /// `mima = { agent = { temperature = 0.6 } }`.
     #[serde(default)]
@@ -94,6 +98,7 @@ pub fn profile_from_config(base: &toml::Table) -> Profile {
             .map(String::from),
         setup: None,
         ready_timeout_sec: default_ready_timeout(),
+        fingerprint: None,
         mima: toml::Table::new(),
     }
 }
@@ -612,7 +617,20 @@ pub fn run_suite(
                 return Err(format!("setup for profile {} failed", p.name));
             }
         }
-        let ready = rt.block_on(wait_ready(p))?;
+        let mut ready = rt.block_on(wait_ready(p))?;
+        if let Some(cmd) = &p.fingerprint {
+            let out = std::process::Command::new("sh").arg("-c").arg(cmd).output();
+            let text = out
+                .map(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .trim()
+                        .chars()
+                        .take(4000)
+                        .collect::<String>()
+                })
+                .unwrap_or_else(|e| format!("fingerprint failed: {e}"));
+            ready["fingerprint"] = json!(text);
+        }
         meta["readiness"][&p.name] = ready;
         write_meta(&meta);
 
