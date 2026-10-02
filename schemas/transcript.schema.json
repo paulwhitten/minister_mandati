@@ -1,0 +1,1067 @@
+{
+  "$defs": {
+    "ApprovalRecord": {
+      "properties": {
+        "call_id": {
+          "type": "string"
+        },
+        "decision": {
+          "description": "Open enum: not_required, auto_approved, approved, denied,\nskipped_duplicate, not_requested_invalid.",
+          "type": "string"
+        },
+        "preview": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "turn": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "turn",
+        "call_id",
+        "decision"
+      ],
+      "type": "object"
+    },
+    "Approvals": {
+      "properties": {
+        "auto_approve_bash": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "bash": {
+          "type": "boolean"
+        },
+        "writes": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "bash",
+        "writes"
+      ],
+      "type": "object"
+    },
+    "CallRecord": {
+      "properties": {
+        "args": {
+          "description": "The call's arguments as the model gave them (a JSON object)."
+        },
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "args"
+      ],
+      "type": "object"
+    },
+    "Check": {
+      "description": "Drift detection over the rebuilt messages (not security).",
+      "properties": {
+        "chars": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "fnv1a64": {
+          "type": "string"
+        },
+        "messages": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "messages",
+        "chars",
+        "fnv1a64"
+      ],
+      "type": "object"
+    },
+    "Compaction": {
+      "properties": {
+        "added_results": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "call_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "dropped_results": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "est_tokens_after": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "est_tokens_before": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "messages_removed": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stage": {
+          "description": "Open enum: normalize, mask, evict.",
+          "type": "string"
+        },
+        "target": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "stage"
+      ],
+      "type": "object"
+    },
+    "ContextRecord": {
+      "description": "What the model sees, by reference to earlier records of this transcript.\nWritten at each turn end and after each compaction.",
+      "properties": {
+        "budget": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cause": {
+          "description": "Open enum: turn_end, compaction.",
+          "type": "string"
+        },
+        "check": {
+          "$ref": "#/$defs/Check"
+        },
+        "context_schema": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "count_source": {
+          "type": "string"
+        },
+        "entries": {
+          "description": "The request's messages after the system prompt, in order.",
+          "items": {
+            "$ref": "#/$defs/Entry"
+          },
+          "type": "array"
+        },
+        "evicted_total": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "masked_total": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "turn": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "window": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "context_schema",
+        "turn",
+        "cause",
+        "window",
+        "budget",
+        "tokens",
+        "count_source",
+        "masked_total",
+        "evicted_total",
+        "entries",
+        "check"
+      ],
+      "type": "object"
+    },
+    "Entry": {
+      "properties": {
+        "call_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cap_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "role": {
+          "description": "Synthetic messages only.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "seq": {
+          "description": "Record this message comes from; absent for synthetic messages.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "text": {
+          "description": "Placeholder (masked), appended note (noted), or the whole message\n(synthetic).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "view": {
+          "$ref": "#/$defs/View"
+        }
+      },
+      "type": "object"
+    },
+    "FileChange": {
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "status": {
+          "description": "\"changed\" or \"missing\".",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "status"
+      ],
+      "type": "object"
+    },
+    "FileState": {
+      "properties": {
+        "fnv1a64": {
+          "description": "FNV-1a 64 of the file's bytes, 16 hex digits.",
+          "type": "string"
+        },
+        "path": {
+          "description": "As given to the tool (relative paths are relative to the session cwd).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "fnv1a64"
+      ],
+      "type": "object"
+    },
+    "LoopGuard": {
+      "properties": {
+        "action": {
+          "description": "Open enum: nudge, terminate.",
+          "type": "string"
+        },
+        "repeats": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tool": {
+          "type": "string"
+        },
+        "turn": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "turn",
+        "action",
+        "repeats",
+        "tool"
+      ],
+      "type": "object"
+    },
+    "ModelError": {
+      "properties": {
+        "duration_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "error": {
+          "type": "string"
+        },
+        "overflow": {
+          "type": "boolean"
+        },
+        "retry": {
+          "type": "boolean"
+        },
+        "step": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "turn": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "turn",
+        "step",
+        "duration_ms",
+        "error",
+        "overflow",
+        "retry"
+      ],
+      "type": "object"
+    },
+    "ModelResponse": {
+      "properties": {
+        "content": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "count_source": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "counted_prompt_tokens": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "duration_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "finish_reason": {
+          "default": null,
+          "description": "\"length\" means the reply was cut off at `max_tokens`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "step": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tool_calls": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/CallRecord"
+          },
+          "type": "array"
+        },
+        "turn": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "usage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Usage"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "turn",
+        "step",
+        "duration_ms"
+      ],
+      "type": "object"
+    },
+    "SessionEnd": {
+      "properties": {
+        "error": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "description": "Open enum: exit, eof, new, task_done, interrupted, fatal, resume.",
+          "type": "string"
+        },
+        "tokens": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Tokens"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "turns": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "reason",
+        "turns"
+      ],
+      "type": "object"
+    },
+    "SessionResumed": {
+      "description": "Written when a session is continued (`--resume`).",
+      "properties": {
+        "changed_files": {
+          "default": [],
+          "description": "Files that differ on disk from what the session last saw.",
+          "items": {
+            "$ref": "#/$defs/FileChange"
+          },
+          "type": "array"
+        },
+        "cwd": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "from_seq": {
+          "default": null,
+          "description": "The context record used, when method is \"context\".",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "method": {
+          "description": "\"context\" (rebuilt from a context record) or \"replay\".",
+          "type": "string"
+        },
+        "mima_version": {
+          "type": "string"
+        },
+        "model": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "default": null,
+          "description": "Why replay was used, when it was.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "method",
+        "mima_version"
+      ],
+      "type": "object"
+    },
+    "SessionStart": {
+      "properties": {
+        "allowed_paths": {
+          "default": null,
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "approvals": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Approvals"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "base_url": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "budget": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "cwd": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mima_version": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mode": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "schema": {
+          "description": "Transcript major version (see `session::SCHEMA`).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "session": {
+          "type": "string"
+        },
+        "session_started": {
+          "type": "string"
+        },
+        "token_counting": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "turns_before": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "window": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "schema",
+        "session",
+        "session_started"
+      ],
+      "type": "object"
+    },
+    "Tokens": {
+      "properties": {
+        "completion": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "prompt": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "requests": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "unreported_requests": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "requests",
+        "prompt",
+        "completion",
+        "unreported_requests"
+      ],
+      "type": "object"
+    },
+    "ToolResult": {
+      "properties": {
+        "bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "call_id": {
+          "type": "string"
+        },
+        "cap_bytes": {
+          "description": "Stage 0 cap in effect: the model saw `output` cut to this size.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "duration_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "executed": {
+          "description": "False when the call never ran (denied).",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "failed": {
+          "type": "boolean"
+        },
+        "file": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FileState"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The file a read/edit/write left behind, to detect later changes."
+        },
+        "output": {
+          "description": "Full output (cut at `[session].max_output_bytes`).",
+          "type": "string"
+        },
+        "sent_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tool": {
+          "type": "string"
+        },
+        "turn": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "turn",
+        "call_id",
+        "tool",
+        "duration_ms",
+        "failed",
+        "bytes",
+        "sent_bytes",
+        "output"
+      ],
+      "type": "object"
+    },
+    "TranscriptDisabled": {
+      "properties": {
+        "turns": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "turns"
+      ],
+      "type": "object"
+    },
+    "TurnEnd": {
+      "properties": {
+        "answer": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "outcome": {
+          "description": "Open enum: answered, loop_guard, step_cap, error, cancelled.",
+          "type": "string"
+        },
+        "tokens": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Tokens"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "turn": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "turn",
+        "outcome"
+      ],
+      "type": "object"
+    },
+    "TurnStart": {
+      "properties": {
+        "instruction": {
+          "type": "string"
+        },
+        "turn": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "turn",
+        "instruction"
+      ],
+      "type": "object"
+    },
+    "Usage": {
+      "properties": {
+        "completion": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "prompt": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "prompt",
+        "completion"
+      ],
+      "type": "object"
+    },
+    "View": {
+      "description": "How the model's view of a message differs from its record. A closed enum\n(evolution rule 8): an unknown value makes the record unusable, and the\nreader replays instead of guessing.",
+      "enum": [
+        "full",
+        "capped",
+        "masked",
+        "noted",
+        "synthetic"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "One transcript line: the common header and a typed record.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/SessionStart",
+      "properties": {
+        "type": {
+          "const": "session_start",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "$ref": "#/$defs/SessionResumed",
+      "properties": {
+        "type": {
+          "const": "session_resumed",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "$ref": "#/$defs/TurnStart",
+      "properties": {
+        "type": {
+          "const": "turn_start",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "$ref": "#/$defs/ModelResponse",
+      "properties": {
+        "type": {
+          "const": "model_response",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "$ref": "#/$defs/ModelError",
+      "properties": {
+        "type": {
+          "const": "model_error",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "$ref": "#/$defs/ApprovalRecord",
+      "properties": {
+        "type": {
+          "const": "approval",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "$ref": "#/$defs/ToolResult",
+      "properties": {
+        "type": {
+          "const": "tool_result",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "$ref": "#/$defs/Compaction",
+      "properties": {
+        "type": {
+          "const": "compaction",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "$ref": "#/$defs/LoopGuard",
+      "properties": {
+        "type": {
+          "const": "loop_guard",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "$ref": "#/$defs/TurnEnd",
+      "properties": {
+        "type": {
+          "const": "turn_end",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "$ref": "#/$defs/ContextRecord",
+      "properties": {
+        "type": {
+          "const": "context",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "$ref": "#/$defs/TranscriptDisabled",
+      "properties": {
+        "type": {
+          "const": "transcript_disabled",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "$ref": "#/$defs/SessionEnd",
+      "properties": {
+        "type": {
+          "const": "session_end",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    }
+  ],
+  "properties": {
+    "seq": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "ts": {
+      "description": "UTC, RFC 3339 with milliseconds.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "seq",
+    "ts"
+  ],
+  "title": "Line",
+  "type": "object",
+  "x-mima-enum-kind": {
+    "View": "closed"
+  },
+  "x-mima-retired": [],
+  "x-mima-versions": {
+    "context_schema": 1,
+    "schema": 1
+  }
+}

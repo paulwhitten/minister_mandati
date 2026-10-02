@@ -845,6 +845,9 @@ mod tests {
         let mut config = Config::default();
         config.context.window = Some(4_000);
         config.agent.max_tokens = 100;
+        // A fixed prompt keeps these budget tests independent of the
+        // default prompt's length.
+        config.agent.system_prompt_override = "You are a coding agent under test.".into();
         AgentContext::new(config, Vec::new())
     }
 
