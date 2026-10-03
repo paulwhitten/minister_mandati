@@ -17,7 +17,7 @@ const BASE_BACKOFF_MS: u64 = 400;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("request to model endpoint failed"))]
+    #[snafu(display("request to model endpoint failed: {source}"))]
     Http { source: reqwest::Error },
     #[snafu(display("model endpoint returned HTTP {status}: {body}"))]
     Status { status: u16, body: String },
@@ -243,6 +243,9 @@ pub struct CompletionResponse {
     pub tool_calls: Option<Vec<ToolCall>>,
     /// Server-reported token usage for this request, when available.
     pub usage: Option<TokenUsage>,
+    /// Why generation stopped ("stop", "tool_calls", "length" when the reply
+    /// hit `max_tokens`), when the server says.
+    pub finish_reason: Option<String>,
 }
 
 #[tracing::instrument(skip(ctx, on_delta), fields(model = %ctx.config.provider.default_model))]
@@ -263,6 +266,18 @@ pub async fn generate_completion(
         "max_tokens": cfg.agent.max_tokens,
         "stream": cfg.agent.stream,
     });
+    if let Some(p) = cfg.agent.top_p {
+        body["top_p"] = json!(p);
+    }
+    if let Some(k) = cfg.agent.top_k {
+        body["top_k"] = json!(k);
+    }
+    if let Some(m) = cfg.agent.min_p {
+        body["min_p"] = json!(m);
+    }
+    for (k, v) in cfg.agent.extra_body.iter().flatten() {
+        body[k] = v.clone();
+    }
     if cfg.agent.stream {
         // Ask the server to emit a final usage chunk so token tracking survives streaming.
         body["stream_options"] = json!({ "include_usage": true });
@@ -344,14 +359,18 @@ async fn parse_json_response(
 ) -> Result<CompletionResponse> {
     let payload: Value = response.json().await.context(DecodeSnafu)?;
     let usage = TokenUsage::from_payload(&payload);
-    let message = payload
+    let mut message = payload
         .get("choices")
         .and_then(|c| c.get(0))
         .and_then(|c| c.get("message"))
         .context(ShapeSnafu {
             reason: "missing choices[0].message".to_string(),
-        })?;
-    Ok(build_response(message, usage, cfg))
+        })?
+        .clone();
+    if let Some(f) = payload.pointer("/choices/0/finish_reason").cloned() {
+        message["finish_reason"] = f;
+    }
+    Ok(build_response(&message, usage, cfg))
 }
 
 /// Partial tool call accumulated across streamed deltas, keyed by array index.
@@ -372,6 +391,7 @@ async fn read_stream(
     let mut content = String::new();
     let mut partials: Vec<PartialToolCall> = Vec::new();
     let mut usage = None;
+    let mut finish_reason: Option<String> = None;
     let mut buf: Vec<u8> = Vec::new();
 
     while let Some(chunk) = response.chunk().await.context(HttpSnafu)? {
@@ -392,6 +412,12 @@ async fn read_stream(
             };
             if let Some(u) = TokenUsage::from_payload(&json) {
                 usage = Some(u);
+            }
+            if let Some(f) = json
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str)
+            {
+                finish_reason = Some(f.to_string());
             }
             let Some(delta) = json.pointer("/choices/0/delta") else {
                 continue;
@@ -424,6 +450,9 @@ async fn read_stream(
             })
             .collect();
         message["tool_calls"] = Value::Array(arr);
+    }
+    if let Some(f) = finish_reason {
+        message["finish_reason"] = json!(f);
     }
     Ok((message, usage))
 }
@@ -490,6 +519,10 @@ fn build_response(message: &Value, usage: Option<TokenUsage>, cfg: &Config) -> C
         content,
         tool_calls,
         usage,
+        finish_reason: message
+            .get("finish_reason")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     }
 }
 

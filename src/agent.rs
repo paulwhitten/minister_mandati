@@ -16,10 +16,14 @@ use crate::loop_guard::{Intervention, LoopGuards};
 use crate::presenter::{Approval, Presenter};
 use crate::tools::{ToolEnv, ToolRegistry, truncate_middle};
 
+/// Times per turn an empty or truncated reply is answered with a request to
+/// continue before it is accepted as the (empty) answer.
+const MAX_CONTINUES: usize = 2;
 /// Retries after the server rejects a prompt as too long (see docs/context.md).
 pub const MAX_OVERFLOW_RETRIES: u32 = 2;
 
 /// How a turn ended.
+#[derive(Debug)]
 pub enum TurnOutcome {
     Answered(String),
     LoopGuard,
@@ -152,6 +156,7 @@ pub async fn run_turn(
         ctx.config.agent.loop_guard_repeat_threshold,
     );
 
+    let mut continues = 0;
     for step in 0..max_steps {
         let span = tracing::info_span!("step", n = step);
         let _enter = span.enter();
@@ -183,7 +188,8 @@ pub async fn run_turn(
                         json!({ "turn": turn, "step": step, "duration_ms": duration_ms,
                                 "content": r.content, "tool_calls": calls, "usage": usage,
                                 "counted_prompt_tokens": counted.tokens,
-                                "count_source": counted.token_source }),
+                                "count_source": counted.token_source,
+                                "finish_reason": r.finish_reason }),
                     );
                     break (r, seq);
                 }
@@ -222,6 +228,27 @@ pub async fn run_turn(
 
         let calls = match response.tool_calls.clone() {
             Some(c) if !c.is_empty() => c,
+            // An empty or truncated reply is not an answer: the model ran out
+            // of output tokens (often while reasoning) or said nothing. Ask
+            // it to continue, a limited number of times per turn.
+            _ if continues < MAX_CONTINUES
+                && (response.content.as_deref().unwrap_or("").trim().is_empty()
+                    || response.finish_reason.as_deref() == Some("length")) =>
+            {
+                continues += 1;
+                tracing::warn!(
+                    finish_reason = ?response.finish_reason,
+                    attempt = continues,
+                    "empty or truncated reply; asking the model to continue"
+                );
+                let seq = ctx.session.record(
+                    "loop_guard",
+                    json!({ "turn": turn, "action": "continue", "repeats": continues,
+                            "tool": "" }),
+                );
+                ctx.add_message(Message::user(context::CONTINUE).with_origin(seq));
+                continue;
+            }
             _ => {
                 let final_msg = response.content.clone().unwrap_or_default();
                 presenter.final_answer(&final_msg);

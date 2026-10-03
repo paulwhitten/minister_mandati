@@ -131,7 +131,11 @@ pub fn clustered_mean(values: &[f64], families: &[String]) -> Estimate {
 pub fn suite(tasks: &[TaskResult]) -> Estimate {
     let values: Vec<f64> = tasks.iter().map(TaskResult::mean).collect();
     let families: Vec<String> = tasks.iter().map(|t| t.family.clone()).collect();
-    clustered_mean(&values, &families)
+    let mut e = clustered_mean(&values, &families);
+    // A pass rate cannot leave [0, 1]; the t interval can, so clip it.
+    e.lo = e.lo.max(0.0);
+    e.hi = e.hi.min(1.0);
+    e
 }
 
 /// Paired comparison of model A against model B on the tasks both ran.
@@ -223,6 +227,27 @@ mod tests {
         // Values quoted in the research note (3/5 and 5/5).
         let (lo, hi) = wilson(3, 5);
         assert!(close(lo, 0.231) && close(hi, 0.882), "{lo} {hi}");
+        let e = suite(&[
+            TaskResult {
+                task: "a".into(),
+                family: "a".into(),
+                c: 3,
+                k: 3,
+            },
+            TaskResult {
+                task: "b".into(),
+                family: "b".into(),
+                c: 3,
+                k: 3,
+            },
+            TaskResult {
+                task: "c".into(),
+                family: "c".into(),
+                c: 2,
+                k: 3,
+            },
+        ]);
+        assert!(e.hi <= 1.0 && e.lo >= 0.0, "{} {}", e.lo, e.hi);
         let (lo, hi) = wilson(5, 5);
         assert!(close(lo, 0.566) && close(hi, 1.0), "{lo} {hi}");
     }

@@ -117,6 +117,19 @@ fn summary(
         },
         meta["sandbox"].as_str().unwrap_or("?"),
     );
+    if let Some(c) = meta["tasks"]["git"]["commit"].as_str() {
+        let _ = writeln!(
+            s,
+            "Tasks: {} at commit {}{}.\n",
+            meta["tasks"]["root"].as_str().unwrap_or("?"),
+            &c[..c.len().min(8)],
+            if meta["tasks"]["git"]["dirty"].as_bool() == Some(true) {
+                ", uncommitted changes"
+            } else {
+                ""
+            }
+        );
+    }
     if infra > 0 {
         let _ = writeln!(
             s,
@@ -220,6 +233,11 @@ fn summary(
         );
     }
 
+    groups_section(&mut s, profiles, by_profile);
+    cost_section(&mut s, profiles, by_profile);
+    settings_section(&mut s, meta, profiles);
+    never_passed_section(&mut s, by_profile);
+
     let _ = writeln!(s, "\n## Per task\n");
     let _ = writeln!(
         s,
@@ -305,4 +323,254 @@ fn compare(profiles: &[&str], results: &BTreeMap<&str, Vec<TaskResult>>) -> Stri
         }
     }
     s
+}
+
+/// Pass rate per task group (seed, repo, mutation, hard...), so that an easy
+/// or possibly memorized group cannot hide inside the overall rate.
+fn groups_section(
+    s: &mut String,
+    profiles: &[&str],
+    by_profile: &BTreeMap<&str, Vec<&TrialRecord>>,
+) {
+    let mut groups: Vec<&str> = by_profile
+        .values()
+        .flatten()
+        .map(|r| r.group.as_str())
+        .filter(|g| !g.is_empty())
+        .collect();
+    groups.sort();
+    groups.dedup();
+    if groups.len() < 2 {
+        return;
+    }
+    let _ = writeln!(s, "\n## By task group\n");
+    let _ = writeln!(
+        s,
+        "Mean of per-task pass rates within each group, with its 95% interval (clustered by family). Groups differ in difficulty and in how likely models are to have seen the code (repo tasks come from public projects), so read them separately.\n"
+    );
+    let _ = write!(s, "| Model |");
+    for g in &groups {
+        let _ = write!(s, " {g} |");
+    }
+    let _ = writeln!(s);
+    let _ = writeln!(s, "|---|{}", "---|".repeat(groups.len()));
+    for p in profiles {
+        let Some(rs) = by_profile.get(p) else {
+            continue;
+        };
+        let _ = write!(s, "| {p} |");
+        for g in &groups {
+            let in_group: Vec<&TrialRecord> =
+                rs.iter().copied().filter(|r| r.group == *g).collect();
+            let tr = task_results(&in_group);
+            if tr.is_empty() {
+                let _ = write!(s, " - |");
+                continue;
+            }
+            let e = stats::suite(&tr);
+            let _ = write!(
+                s,
+                " {} ({}–{}, n={}) |",
+                pct(e.mean),
+                pct(e.lo),
+                pct(e.hi),
+                tr.len()
+            );
+        }
+        let _ = writeln!(s);
+    }
+}
+
+/// Time, throughput and energy: what a solved task costs on this hardware.
+fn cost_section(s: &mut String, profiles: &[&str], by_profile: &BTreeMap<&str, Vec<&TrialRecord>>) {
+    let _ = writeln!(s, "\n## Cost\n");
+    let _ = writeln!(
+        s,
+        "Agent time is wall-clock per trial. Output speed is completion tokens per second of agent time (it includes prompt processing and tool time, so it understates decode speed). Energy is whole-device energy during trials (agent and checks) from the profile's power command. Timeouts and truncated replies (cut off at max_tokens) are often harness settings rather than model failures.\n"
+    );
+    let _ = writeln!(
+        s,
+        "| Model | Solved | Agent time total | Time per solved | Output tok/s (median) | Mean power | Energy per solved | Timeouts | Truncated replies |"
+    );
+    let _ = writeln!(s, "|---|---|---|---|---|---|---|---|---|");
+    for p in profiles {
+        let Some(rs) = by_profile.get(p) else {
+            continue;
+        };
+        let solved = rs.iter().filter(|r| r.passed).count();
+        let secs: f64 = rs.iter().map(|r| r.agent_ms as f64 / 1000.0).sum();
+        let tps: Vec<f64> = rs
+            .iter()
+            .filter(|r| r.agent_ms > 0)
+            .map(|r| {
+                r.metrics["completion_tokens"].as_f64().unwrap_or(0.0)
+                    / (r.agent_ms as f64 / 1000.0)
+            })
+            .collect();
+        let energy: Vec<f64> = rs.iter().filter_map(|r| r.energy_j).collect();
+        let power: Vec<f64> = rs.iter().filter_map(|r| r.mean_power_w).collect();
+        let timeouts = rs
+            .iter()
+            .filter(|r| r.exit_reason == "agent_timeout")
+            .count();
+        let truncated: u64 = rs
+            .iter()
+            .map(|r| r.metrics["truncated"].as_u64().unwrap_or(0))
+            .sum();
+        let per_solved = |total: f64, unit: &str| {
+            if solved == 0 {
+                "n/a".to_string()
+            } else {
+                format!("{:.0}{unit}", total / solved as f64)
+            }
+        };
+        let (energy_cell, power_cell) = if energy.len() == rs.len() && !energy.is_empty() {
+            (
+                per_solved(energy.iter().sum::<f64>(), " J"),
+                format!("{:.0} W", power.iter().sum::<f64>() / power.len() as f64),
+            )
+        } else {
+            ("-".to_string(), "-".to_string())
+        };
+        let _ = writeln!(
+            s,
+            "| {p} | {solved}/{} | {:.0} min | {} | {:.1} | {power_cell} | {energy_cell} | {timeouts} | {truncated} |",
+            rs.len(),
+            secs / 60.0,
+            per_solved(secs, " s"),
+            stats::median(&tps),
+        );
+    }
+}
+
+/// The settings each model ran with; differences make comparisons unfair.
+fn settings_section(s: &mut String, meta: &Value, profiles: &[&str]) {
+    let settings = &meta["settings"];
+    if !settings.is_object() {
+        return;
+    }
+    let _ = writeln!(s, "\n## Settings\n");
+    let _ = writeln!(
+        s,
+        "| Model | Window | Temperature | top_p | top_k | max_tokens | Tool-call preflight | Served by |"
+    );
+    let _ = writeln!(s, "|---|---|---|---|---|---|---|---|");
+    let show = |v: &Value| {
+        if v.is_null() {
+            "default".to_string()
+        } else {
+            v.to_string().trim_matches('"').to_string()
+        }
+    };
+    for p in profiles {
+        let st = &settings[*p];
+        let ready = &meta["readiness"][*p];
+        let window = if st["window"].is_null() {
+            show(&ready["max_model_len"])
+        } else {
+            show(&st["window"])
+        };
+        let tools = &ready["tool_calls"];
+        let preflight = if tools.is_object() {
+            format!(
+                "{} valid, round trip {}",
+                tools["valid_calls"].as_str().unwrap_or("?"),
+                if tools["roundtrip"].as_bool() == Some(true) {
+                    "ok"
+                } else {
+                    "FAILED"
+                }
+            )
+        } else {
+            show(tools)
+        };
+        let served: String = ready["fingerprint"]
+            .as_str()
+            .map(|f| {
+                // The image, and engine flags that change results, with values.
+                let words: Vec<&str> = f.split_whitespace().collect();
+                let mut keep = Vec::new();
+                for (i, w) in words.iter().enumerate() {
+                    if w.starts_with("image=") {
+                        keep.push(w.to_string());
+                    } else if ["--quantization", "--kv-cache-dtype", "--max-model-len"].contains(w)
+                    {
+                        keep.push(format!("{w} {}", words.get(i + 1).unwrap_or(&"")));
+                    }
+                }
+                keep.join(" ")
+            })
+            .filter(|f| !f.is_empty())
+            .unwrap_or_else(|| "not recorded".into());
+        let _ = writeln!(
+            s,
+            "| {p} | {window} | {} | {} | {} | {} | {preflight} | {served} |",
+            show(&st["temperature"]),
+            show(&st["top_p"]),
+            show(&st["top_k"]),
+            show(&st["max_tokens"]),
+        );
+    }
+    // The window in effect: configured, else what the server reported.
+    let value = |p: &str, k: &str| {
+        let v = &settings[p][k];
+        if k == "window" && v.is_null() {
+            meta["readiness"][p]["max_model_len"].to_string()
+        } else {
+            v.to_string()
+        }
+    };
+    let distinct = |k: &str| {
+        let mut v: Vec<String> = profiles.iter().map(|p| value(p, k)).collect();
+        v.sort();
+        v.dedup();
+        v.len() > 1
+    };
+    let differ: Vec<&str> = ["window", "max_tokens", "tool_calling"]
+        .into_iter()
+        .filter(|k| distinct(k))
+        .collect();
+    if !differ.is_empty() {
+        let _ = writeln!(
+            s,
+            "\nNote: models ran with different {} settings; differences in results may come from the settings, not the models.",
+            differ.join(", ")
+        );
+    }
+}
+
+/// Checks that no trial of any model passed: often a task or check problem
+/// (Terminal-Bench's heuristic), sometimes a genuinely hard task. Review.
+fn never_passed_section(s: &mut String, by_profile: &BTreeMap<&str, Vec<&TrialRecord>>) {
+    let mut counts: BTreeMap<(&str, &str, bool), (usize, usize)> = BTreeMap::new();
+    for r in by_profile.values().flatten() {
+        for c in &r.checks {
+            let e = counts
+                .entry((r.task.as_str(), c.name.as_str(), c.required))
+                .or_default();
+            e.0 += c.passed as usize;
+            e.1 += 1;
+        }
+    }
+    let never: Vec<String> = counts
+        .iter()
+        .filter(|(_, (passed, n))| *passed == 0 && *n >= 3)
+        .map(|((t, c, req), (_, n))| {
+            format!(
+                "{t} / {c}{} (0 of {n})",
+                if *req { "" } else { ", optional" }
+            )
+        })
+        .collect();
+    if never.is_empty() {
+        return;
+    }
+    let _ = writeln!(s, "\n## Checks no trial passed\n");
+    let _ = writeln!(
+        s,
+        "Every trial of every model failed these checks. That can mean a hard task, but it often means the check or the instruction is wrong. Review them before trusting the scores.\n"
+    );
+    for n in never {
+        let _ = writeln!(s, "- {n}");
+    }
 }

@@ -1,9 +1,0 @@
-family = "c-build"
-tags = ["make", "build"]
-[limits]
-max_steps = 15
-[[check]]
-name = "builds_and_runs"
-type = "output_equals"
-run = "make -s >/dev/null && ./hello"
-expected = "hello, make"

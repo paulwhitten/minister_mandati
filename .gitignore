@@ -3,5 +3,6 @@
 agent.toml
 # Evaluation runs and local model profiles (see docs/eval.md)
 /evals/runs/
-/evals/profiles.toml
 /evals/cache/
+/profiles.toml
+/evals/profiles.toml

@@ -55,6 +55,7 @@ pub struct Provider {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(default)]
 pub struct Agent {
     pub temperature: f32,
     /// Reply limit per request; also reserved out of the context window.
@@ -63,6 +64,21 @@ pub struct Agent {
     pub tool_calling: String,
     /// Stream tokens live over SSE when true. Override via `[agent].stream`.
     pub stream: bool,
+    /// Nucleus sampling; sent only when set (model vendors publish
+    /// recommended values, e.g. for their reasoning modes).
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    /// Top-k sampling (a vLLM and llama.cpp extension); sent only when set.
+    #[serde(default)]
+    pub top_k: Option<u32>,
+    /// Min-p sampling (vLLM and llama.cpp); sent only when set. llama.cpp's
+    /// own default is 0.05, not off.
+    #[serde(default)]
+    pub min_p: Option<f32>,
+    /// Extra request fields passed through as-is, e.g.
+    /// `extra_body = { chat_template_kwargs = { force_nonempty_content = true } }`.
+    #[serde(default)]
+    pub extra_body: Option<serde_json::Map<String, serde_json::Value>>,
     /// Full-replacement system prompt; when non-empty it bypasses composition.
     #[serde(default)]
     pub system_prompt_override: String,
@@ -145,6 +161,7 @@ impl Default for Context {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(default)]
 pub struct Security {
     pub require_approval_for_bash: bool,
     pub require_approval_for_writes: bool,
@@ -171,6 +188,10 @@ impl Default for Agent {
             max_tokens: 4096,
             tool_calling: "auto".to_string(),
             stream: true,
+            top_p: None,
+            top_k: None,
+            min_p: None,
+            extra_body: None,
             system_prompt_override: String::new(),
             system_prompt_prefix: None,
             system_prompt_body: None,
@@ -413,6 +434,20 @@ fn expand_env(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{Config, expand_env};
+
+    #[test]
+    fn partial_sections_keep_defaults() {
+        let c: Config = toml::from_str(
+            "[agent]\ntemperature = 0.6\ntop_p = 0.95\n[security]\nrequire_approval_for_bash = false\n",
+        )
+        .unwrap();
+        assert_eq!(c.agent.temperature, 0.6);
+        assert_eq!(c.agent.top_p, Some(0.95));
+        assert_eq!(c.agent.tool_calling, "auto");
+        assert_eq!(c.agent.max_tokens, 4096);
+        assert!(!c.security.require_approval_for_bash);
+        assert!(c.security.require_approval_for_writes);
+    }
 
     #[test]
     fn expands_known_var() {

@@ -13,7 +13,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::context::{Message, NOT_EXECUTED, NUDGE};
+use crate::context::{CONTINUE, Message, NOT_EXECUTED, NUDGE};
 use crate::tools::truncate_middle;
 
 /// Layout version of `context` records. Bump only for breaking changes
@@ -658,6 +658,7 @@ fn from_context(t: &Transcript) -> Result<Rebuilt, String> {
                 tool_message(r, e.cap_bytes.filter(|_| e.view == View::Capped))
             }
             Record::TurnEnd(r) => Message::assistant(r.answer.as_deref().unwrap_or_default()),
+            Record::LoopGuard(g) if g.action == "continue" => Message::user(CONTINUE),
             Record::LoopGuard(_) => Message::user(NUDGE),
             _ => return Err(format!("seq {s} is not a message record")),
         };
@@ -739,6 +740,9 @@ pub fn replay(t: &Transcript, default_cap: usize) -> Rebuilt {
                 messages.push(tool_message(r, cap).with_origin(Some(l.seq)));
             }
             Record::LoopGuard(g) if g.action == "nudge" => pending_nudge = Some(l.seq),
+            Record::LoopGuard(g) if g.action == "continue" => {
+                messages.push(Message::user(CONTINUE).with_origin(Some(l.seq)));
+            }
             Record::TurnEnd(r) => {
                 pending_nudge = None;
                 let begin = turn_begin.take();
