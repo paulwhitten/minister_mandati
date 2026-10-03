@@ -5,6 +5,9 @@ edition = "2024"
 license = "MIT"
 description = "Auditable, single-binary, edge-native, Linux-first coding agent"
 rust-version = "1.89"
+# Two binaries: `cargo run` runs the agent; the evaluation tool needs
+# `cargo run --bin mima-eval`.
+default-run = "mima"
 repository = "https://github.com/paulwhitten/minister_mandati"
 readme = "README.md"
 keywords = ["agent", "llm", "cli", "coding-agent", "edge"]

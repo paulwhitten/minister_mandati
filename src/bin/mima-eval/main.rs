@@ -2,14 +2,19 @@
 //! real `mima` binary, scores them with deterministic checks, and reports
 //! honest statistics. See docs/eval.md.
 
+mod calibrate;
 mod checks;
 mod exec;
+mod exploit;
 mod metrics;
+mod power;
+mod probe;
 mod report;
 mod run;
 #[allow(dead_code)]
 #[path = "../../session.rs"]
 mod session;
+mod source;
 mod stats;
 mod task;
 
@@ -41,8 +46,10 @@ enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
         /// Where runs are written.
-        #[arg(long, default_value = "evals/runs")]
-        out: PathBuf,
+        /// Where runs are written (default: `runs/` in the suite's
+        /// evaluation tree, next to `tasks/`).
+        #[arg(long)]
+        out: Option<PathBuf>,
         /// Continue an existing run directory, skipping recorded trials.
         #[arg(long)]
         resume: Option<PathBuf>,
@@ -56,14 +63,54 @@ enum Command {
         #[arg(long)]
         no_sandbox: bool,
     },
-    /// Check that each task's solution passes and its fixture fails.
+    /// Check that each task's solution passes, its fixture fails, and the
+    /// cheating baselines (delete tests, exit 0 early, list everything) fail.
     Validate {
         suite: PathBuf,
         #[arg(long)]
         no_sandbox: bool,
+        /// Run each reference solution this many times (flakiness check).
+        #[arg(long, default_value_t = 1)]
+        repeat: usize,
+        /// Skip the cheating baselines.
+        #[arg(long)]
+        no_cheats: bool,
     },
+    /// Clone the pinned commits that source tasks use into the local cache,
+    /// checking their licenses (runs also fetch on demand).
+    Fetch { suite: PathBuf },
     /// Rewrite summary.md and compare.md for a run directory.
     Report { run_dir: PathBuf },
+    /// Measure how strong each task's checks are: apply the reference
+    /// solution plus one small code mutation at a time and count how many
+    /// mutants the checks reject.
+    Strength {
+        suite: PathBuf,
+        /// Mutants per task.
+        #[arg(long, default_value_t = 12)]
+        max_mutants: usize,
+        #[arg(long)]
+        no_sandbox: bool,
+    },
+    /// Ask a model, without code or tools, which file holds each repo
+    /// task's bug and what the original code is (memorization check).
+    Probe {
+        suite: PathBuf,
+        #[arg(long)]
+        profiles: PathBuf,
+        /// The profile to probe (its server must already be serving it).
+        #[arg(long)]
+        profile: String,
+    },
+    /// Task difficulty across runs: never solved, always solved, and the
+    /// discriminating 30-70% band (optionally written as a suite).
+    Calibrate {
+        #[arg(required = true)]
+        run_dirs: Vec<PathBuf>,
+        /// Write the discriminating tasks to this suite file.
+        #[arg(long)]
+        suite_out: Option<PathBuf>,
+    },
 }
 
 fn main() {
@@ -73,15 +120,18 @@ fn main() {
     }
 }
 
-fn sandbox_setting(no_sandbox: bool) -> bool {
+/// Sandboxing is required unless explicitly turned off: without it the
+/// agent's commands could read solutions and hidden checks.
+fn sandbox_setting(no_sandbox: bool) -> Result<bool, String> {
     if no_sandbox {
-        return false;
+        eprintln!("warning: --no-sandbox: shell commands and checks run unconfined");
+        return Ok(false);
     }
-    let ok = exec::bwrap_available();
-    if !ok {
-        eprintln!("warning: bwrap not usable; shell commands and checks run without a sandbox");
+    if exec::bwrap_available() {
+        Ok(true)
+    } else {
+        Err("bwrap is not usable; install bubblewrap or pass --no-sandbox".into())
     }
-    ok
 }
 
 fn default_mima() -> PathBuf {
@@ -128,10 +178,12 @@ fn real_main() -> Result<(), String> {
                 mima: std::fs::canonicalize(&mima).unwrap_or(mima),
                 base_config: base,
                 trials: trials.or(suite.trials).unwrap_or(3),
-                sandbox: sandbox_setting(no_sandbox),
+                sandbox: sandbox_setting(no_sandbox)?,
                 keep,
             };
-            let run_dir = resume.unwrap_or_else(|| run::default_run_dir(&out, &suite.name));
+            let run_dir = resume.unwrap_or_else(|| {
+                run::default_run_dir(&out.unwrap_or_else(|| suite.root.join("runs")), &suite.name)
+            });
             eprintln!(
                 "Running {} task(s) x {} trial(s) x {} model(s) into {}",
                 suite.tasks.len(),
@@ -154,16 +206,72 @@ fn real_main() -> Result<(), String> {
             eprintln!("Reports: {}", run_dir.display());
             Ok(())
         }
-        Command::Validate { suite, no_sandbox } => {
+        Command::Validate {
+            suite,
+            no_sandbox,
+            repeat,
+            no_cheats,
+        } => {
             let suite = task::load_suite(&suite)?;
             let root =
                 std::env::temp_dir().join(format!("mima-eval-validate-{}", std::process::id()));
-            let bad = run::validate(&suite, &root, sandbox_setting(no_sandbox));
+            let opts = run::ValidateOpts {
+                sandbox: sandbox_setting(no_sandbox)?,
+                repeat,
+                exploits: !no_cheats,
+            };
+            let bad = run::validate(&suite, &root, &opts);
             let _ = std::fs::remove_dir_all(&root);
             if bad > 0 {
                 return Err(format!("{bad} of {} task(s) invalid", suite.tasks.len()));
             }
             println!("all {} task(s) valid", suite.tasks.len());
+            Ok(())
+        }
+        Command::Strength {
+            suite,
+            max_mutants,
+            no_sandbox,
+        } => {
+            let suite = task::load_suite(&suite)?;
+            let root =
+                std::env::temp_dir().join(format!("mima-eval-strength-{}", std::process::id()));
+            let table = run::strength(&suite, &root, sandbox_setting(no_sandbox)?, max_mutants);
+            let _ = std::fs::remove_dir_all(&root);
+            println!("{table}");
+            Ok(())
+        }
+        Command::Probe {
+            suite,
+            profiles,
+            profile,
+        } => {
+            let suite = task::load_suite(&suite)?;
+            let p = run::load_profiles(&profiles, std::slice::from_ref(&profile))?
+                .into_iter()
+                .next()
+                .ok_or("no such profile")?;
+            println!("{}", probe::run(&suite, &p)?);
+            Ok(())
+        }
+        Command::Calibrate {
+            run_dirs,
+            suite_out,
+        } => {
+            println!("{}", calibrate::run(&run_dirs, suite_out.as_deref())?);
+            Ok(())
+        }
+        Command::Fetch { suite } => {
+            let suite = task::load_suite(&suite)?;
+            let mut n = 0;
+            for t in &suite.tasks {
+                if let Some(src) = &t.source {
+                    source::fetch(src, &source::cache_root(&t.dir))
+                        .map_err(|e| format!("{}: {e}", t.id))?;
+                    n += 1;
+                }
+            }
+            println!("{n} source task(s) ready");
             Ok(())
         }
         Command::Report { run_dir } => {

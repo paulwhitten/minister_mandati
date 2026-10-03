@@ -18,6 +18,11 @@ struct TaskFile {
     /// Tasks sharing a family are related (same fixture or bug pattern); the
     /// suite standard error is clustered by family. Defaults to the task id.
     family: Option<String>,
+    /// Where the task comes from ("seed", "repo", "mutation", "hard"...);
+    /// reports break results down by group so an easy or possibly memorized
+    /// group cannot hide in the overall rate.
+    #[serde(default = "default_group")]
+    group: String,
     #[serde(default)]
     tags: Vec<String>,
     /// "capability" (expected to be hard) or "regression" (expected to pass).
@@ -33,6 +38,12 @@ struct TaskFile {
     expect_fixture_passes: bool,
     #[serde(rename = "check", default)]
     checks: Vec<Check>,
+    /// Build the starting files from a pinned third-party commit.
+    source: Option<crate::source::Source>,
+    /// mima settings for this task's trials, merged over the profile's
+    /// (e.g. `mima = { context = { window = 8192 } }` for a compaction test).
+    #[serde(default)]
+    mima: toml::Table,
 }
 
 fn default_kind() -> String {
@@ -69,6 +80,10 @@ pub struct Check {
     pub kind: CheckKind,
 }
 
+fn default_group() -> String {
+    "other".into()
+}
+
 fn yes() -> bool {
     true
 }
@@ -76,9 +91,13 @@ fn yes() -> bool {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CheckKind {
-    /// Shell command must exit 0 (sandboxed, network off, with timeout).
+    /// Shell command must exit 0 (sandboxed, network off, with timeout)
+    /// and, if `stdout_line` is set, print that exact line (trimmed). The
+    /// line guards against code that exits 0 before the tests run.
     Command {
         run: String,
+        #[serde(default)]
+        stdout_line: Option<String>,
     },
     /// Command stdout, whitespace-normalized, must equal `expected`.
     OutputEquals {
@@ -114,6 +133,11 @@ pub enum CheckKind {
     FinalAnswer {
         contains: String,
     },
+    /// The final answer must not contain `text` (case-insensitive,
+    /// whitespace-normalized): rejects answers that list every candidate.
+    FinalAnswerLacks {
+        text: String,
+    },
     /// Limits on the agent's behavior, from its transcript.
     Agent {
         max_steps: Option<usize>,
@@ -127,6 +151,7 @@ pub struct Task {
     pub id: String,
     pub dir: PathBuf,
     pub family: String,
+    pub group: String,
     pub tags: Vec<String>,
     pub kind: String,
     pub limits: Limits,
@@ -134,6 +159,8 @@ pub struct Task {
     pub expect_fixture_passes: bool,
     pub instruction: String,
     pub checks: Vec<Check>,
+    pub source: Option<crate::source::Source>,
+    pub mima: toml::Table,
 }
 
 impl Task {
@@ -167,6 +194,7 @@ impl Task {
         }
         Ok(Self {
             family: file.family.unwrap_or_else(|| id.clone()),
+            group: file.group,
             id,
             dir: dir.to_path_buf(),
             tags: file.tags,
@@ -176,6 +204,8 @@ impl Task {
             expect_fixture_passes: file.expect_fixture_passes,
             instruction,
             checks: file.checks,
+            source: file.source,
+            mima: file.mima,
         })
     }
 }
@@ -188,12 +218,21 @@ struct SuiteFile {
     description: String,
     /// Task ids; `"*"` means every task in the directory.
     tasks: Vec<String>,
+    /// Keep only tasks in these groups (e.g. ["hard"]); empty keeps all.
+    #[serde(default)]
+    groups: Vec<String>,
+    /// Keep only tasks of these kinds ("capability", "regression").
+    #[serde(default)]
+    kinds: Vec<String>,
     /// Default trials per task.
     trials: Option<usize>,
 }
 
 pub struct Suite {
     pub name: String,
+    /// The evaluation tree the tasks live in (holding `tasks/`, `suites/`,
+    /// and by default `runs/` and `cache/`); may be a separate repository.
+    pub root: PathBuf,
     pub description: String,
     pub tasks: Vec<Task>,
     pub trials: Option<usize>,
@@ -202,6 +241,11 @@ pub struct Suite {
 /// Loads a suite file (`evals/suites/<name>.toml`, tasks resolved from the
 /// sibling `tasks/` directory), a directory of tasks, or a single task.
 pub fn load_suite(path: &Path) -> Result<Suite, String> {
+    // Absolute, so the evaluation tree's root (and its git commit) is known
+    // whatever the path was relative to.
+    let path = &path
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
     if path.is_file() {
         let raw = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let file: SuiteFile =
@@ -212,7 +256,7 @@ pub fn load_suite(path: &Path) -> Result<Suite, String> {
             .map(|p| p.join("tasks"))
             .ok_or("suite file must be in <evals>/suites/")?;
         let all = file.tasks.iter().any(|t| t == "*");
-        let tasks = if all {
+        let tasks: Vec<Task> = if all {
             load_dir(&tasks_dir)?
         } else {
             file.tasks
@@ -220,11 +264,17 @@ pub fn load_suite(path: &Path) -> Result<Suite, String> {
                 .map(|id| Task::load(&tasks_dir.join(id)))
                 .collect::<Result<_, _>>()?
         };
+        let tasks = tasks
+            .into_iter()
+            .filter(|t| file.groups.is_empty() || file.groups.contains(&t.group))
+            .filter(|t| file.kinds.is_empty() || file.kinds.contains(&t.kind))
+            .collect();
         let name = path
             .file_stem()
             .map_or("suite".into(), |s| s.to_string_lossy().into_owned());
         return Ok(Suite {
             name,
+            root: tasks_dir.parent().unwrap_or(Path::new(".")).to_path_buf(),
             description: file.description,
             tasks,
             trials: file.trials,
@@ -233,6 +283,11 @@ pub fn load_suite(path: &Path) -> Result<Suite, String> {
     if path.join("task.toml").is_file() {
         let task = Task::load(path)?;
         return Ok(Suite {
+            root: path
+                .parent()
+                .and_then(Path::parent)
+                .unwrap_or(Path::new("."))
+                .to_path_buf(),
             name: task.id.clone(),
             description: String::new(),
             tasks: vec![task],
@@ -244,6 +299,7 @@ pub fn load_suite(path: &Path) -> Result<Suite, String> {
         .map_or("tasks".into(), |s| s.to_string_lossy().into_owned());
     Ok(Suite {
         name,
+        root: path.parent().unwrap_or(Path::new(".")).to_path_buf(),
         description: String::new(),
         tasks: load_dir(path)?,
         trials: None,

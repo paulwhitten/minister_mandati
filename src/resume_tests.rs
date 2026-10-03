@@ -225,3 +225,45 @@ async fn resumed_session_continues_in_the_same_file() {
     assert_eq!(t.turns(), 2);
     crate::schema_tests::validate_transcript(&path);
 }
+
+#[tokio::test]
+async fn empty_reply_gets_a_continue_prompt_and_resumes_exactly() {
+    let d = tmp("empty-reply");
+    let base = mock_model(vec![answer(""), answer("Done.")]).await;
+    let cfg = config(base, &d);
+    let registry = ToolRegistry::init_default(&cfg);
+    let mut ctx = AgentContext::new(cfg, registry.specs());
+    ctx.session.enable(json!({ "mode": "test" })).unwrap();
+    let mut presenter = CliPresenter::default();
+    let result = run_turn(&mut ctx, &registry, &mut presenter, "Say done.").await;
+    assert!(
+        matches!(&result, Ok(crate::agent::TurnOutcome::Answered(a)) if a == "Done."),
+        "an empty reply must not end the turn: {result:?}"
+    );
+    record_outcome(&mut ctx, &result);
+    let expected = messages_json(&ctx);
+    assert!(
+        expected
+            .iter()
+            .any(|m| m["content"] == crate::context::CONTINUE),
+        "the continue prompt is in the conversation"
+    );
+    let path = ctx.session.transcript_path().unwrap().to_path_buf();
+    drop(ctx);
+    crate::schema_tests::validate_transcript(&path);
+    let t = Transcript::load(&path).unwrap();
+    let r = rebuild(&t, 4096);
+    let got: Vec<Value> = r
+        .messages
+        .iter()
+        .map(|m| serde_json::to_value(m).unwrap())
+        .collect();
+    assert_eq!(got, expected);
+    let replayed = replay(&t, 4096);
+    assert!(
+        replayed
+            .messages
+            .iter()
+            .any(|m| m.content.as_deref() == Some(crate::context::CONTINUE))
+    );
+}

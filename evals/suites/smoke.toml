@@ -1,3 +1,3 @@
-description = "All seed tasks; directional only (16 tasks cannot separate models closer than ~20 points)."
+description = "Harness smoke test: six small self-contained seed tasks (C with AddressSanitizer, Python, Rust, shell, git, one regression). Checks that mima-eval works; too small to compare models. The full task set lives in a separate repository (see evals/README.md)."
 tasks = ["*"]
-trials = 3
+trials = 1

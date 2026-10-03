@@ -48,7 +48,10 @@ Requires Rust 1.89 or newer on Linux.
    ```
 
    The binary is `target/release/mima`; `cargo run --release -- <args>` also
-   works. See [Usage](#usage) for the modes of operation.
+   works. The build also produces `target/release/mima-eval`, the evaluation
+   tool (see [Evaluation](docs/eval.md)); run it with
+   `cargo run --release --bin mima-eval -- <args>`. Plain `cargo run` always
+   runs `mima`. See [Usage](#usage) for the modes of operation.
 
 ## Usage
 
@@ -195,12 +198,14 @@ bars and paired model comparisons. Shell commands and checks run in a
 network-less `bwrap` sandbox per trial.
 
 ```bash
-./target/release/mima-eval validate evals/tasks
-./target/release/mima-eval run evals/suites/smoke.toml --profiles evals/profiles.toml
+./target/release/mima-eval validate evals/suites/smoke.toml
+./target/release/mima-eval run evals/suites/smoke.toml --profiles profiles.toml
 ```
 
-The 16 seed tasks cover editing, C, Rust, Python, shell, git, navigation and
-agent-behavior regressions. See [docs/eval.md](docs/eval.md).
+`evals/` holds a six-task smoke test of the harness. The full task set is
+kept in a separate repository so that its solutions and hidden checks are not
+published (they would leak into model training data); `mima-eval` runs it by
+path. See [docs/eval.md](docs/eval.md).
 
 ## Context management
 

@@ -77,9 +77,11 @@ pub fn sandbox_prefix(dirs: &TrialDirs, enabled: bool) -> Vec<String> {
     }
     let root = dirs.root.display().to_string();
     let work = dirs.work.display().to_string();
-    [
-        // Order matters: later mounts cover earlier ones, so the private /tmp
-        // comes before the trial directory (which may itself be under /tmp).
+    let path = std::env::var("PATH").unwrap_or_default();
+    let rustup = std::env::var("RUSTUP_HOME")
+        .unwrap_or_else(|_| format!("{}/.rustup", std::env::var("HOME").unwrap_or_default()));
+    let hidden = hidden_dirs();
+    let mut args: Vec<String> = [
         "bwrap",
         "--unshare-net",
         "--die-with-parent",
@@ -90,18 +92,81 @@ pub fn sandbox_prefix(dirs: &TrialDirs, enabled: bool) -> Vec<String> {
         "/dev",
         "--proc",
         "/proc",
-        "--tmpfs",
-        "/tmp",
-        "--bind",
-        &root,
-        &root,
-        "--chdir",
-        &work,
-        "--",
     ]
     .iter()
     .map(|s| s.to_string())
-    .collect()
+    .collect();
+    // Order matters: later mounts cover earlier ones. First hide everything
+    // that is not system software (homes, where this repository with its
+    // solutions, hidden checks and cached repositories lives, other trials,
+    // toolchain package caches), then bring back only the toolchains on PATH
+    // and this trial's own directory.
+    for h in &hidden {
+        args.extend(["--tmpfs".into(), h.display().to_string()]);
+    }
+    for dir in reexposed(&hidden, path.split(':').chain([rustup.as_str()])) {
+        let d = dir.display().to_string();
+        args.extend(["--ro-bind".into(), d.clone(), d]);
+    }
+    args.extend(
+        ["--bind", &root, &root, "--chdir", &work, "--"]
+            .iter()
+            .map(|s| s.to_string()),
+    );
+    args
+}
+
+/// Directories covered by an empty tmpfs in the sandbox: user data and
+/// scratch space, plus the evaluation tree itself wherever it lives.
+fn hidden_dirs() -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = [
+        "/home",
+        "/root",
+        "/mnt",
+        "/media",
+        "/srv",
+        "/opt",
+        "/var/tmp",
+        "/run/user",
+        "/tmp",
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .collect();
+    for extra in [
+        std::env::var("HOME").ok(),
+        std::env::current_dir()
+            .ok()
+            .map(|d| d.display().to_string()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let p = PathBuf::from(extra);
+        if !v.iter().any(|h| p.starts_with(h)) && p != Path::new("/") {
+            v.push(p);
+        }
+    }
+    v.retain(|p| p.is_dir());
+    v
+}
+
+/// Toolchain directories (PATH entries, RUSTUP_HOME) that a hidden directory
+/// would otherwise cover. Package caches such as `~/.cargo/registry` stay
+/// hidden: only `bin` directories and the rustup toolchains come back.
+fn reexposed<'a>(hidden: &[PathBuf], dirs: impl Iterator<Item = &'a str>) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for d in dirs {
+        let p = PathBuf::from(d);
+        if d.is_empty() || !p.is_absolute() || !p.is_dir() {
+            continue;
+        }
+        let Ok(p) = p.canonicalize() else { continue };
+        if hidden.iter().any(|h| p.starts_with(h)) && !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out
 }
 
 pub fn bwrap_available() -> bool {
@@ -134,6 +199,9 @@ pub fn trial_env(dirs: &TrialDirs, extra: &[(&str, String)]) -> BTreeMap<String,
         dirs.home.join(".cargo").display().to_string(),
     );
     env.insert("WORK".into(), dirs.work.display().to_string());
+    // No bytecode files to trip scope checks; editors never block a trial.
+    env.insert("PYTHONDONTWRITEBYTECODE".into(), "1".into());
+    env.insert("GIT_EDITOR".into(), "true".into());
     for (k, v) in extra {
         env.insert(k.to_string(), v.clone());
     }
@@ -341,6 +409,20 @@ pub fn git_changes(work: &Path, baseline: &str, scratch: &Path) -> (Vec<String>,
     (names, added, removed, patch)
 }
 
+/// Files that builds and test runs leave behind; scope checks ignore them.
+pub fn is_build_artifact(rel: &str) -> bool {
+    let parts: Vec<&str> = rel.split('/').collect();
+    let name = parts.last().copied().unwrap_or("");
+    parts[..parts.len().saturating_sub(1)].iter().any(|d| {
+        matches!(
+            *d,
+            "__pycache__" | ".pytest_cache" | "target" | ".mypy_cache"
+        )
+    }) || name.ends_with(".pyc")
+        || name.ends_with(".o")
+        || name == "a.out"
+}
+
 /// Whether `rel` is byte-identical in `fixture` and `work` (recursively for
 /// directories; files present in only one side count as changes).
 pub fn unchanged(fixture: &Path, work: &Path, rel: &str) -> Result<(), String> {
@@ -348,7 +430,14 @@ pub fn unchanged(fixture: &Path, work: &Path, rel: &str) -> Result<(), String> {
     if a.is_dir() {
         let list = |d: &Path| -> Vec<std::ffi::OsString> {
             let mut v: Vec<_> = std::fs::read_dir(d)
-                .map(|r| r.filter_map(|e| e.ok().map(|e| e.file_name())).collect())
+                .map(|r| {
+                    r.filter_map(|e| e.ok().map(|e| e.file_name()))
+                        .filter(|n| {
+                            !is_build_artifact(&format!("{rel}/{}/x", n.to_string_lossy()))
+                                && !is_build_artifact(&n.to_string_lossy())
+                        })
+                        .collect()
+                })
                 .unwrap_or_default();
             v.sort();
             v
@@ -408,6 +497,61 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_hides_host_files_but_keeps_trial_and_tools() {
+        if !bwrap_available() {
+            eprintln!("bwrap not usable; skipping");
+            return;
+        }
+        // A trial under the repository (like evals/runs), next to a secret.
+        let base = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("sbx-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("secret.txt"), "solution\n").unwrap();
+        let dirs = TrialDirs::create(&base.join("t1")).unwrap();
+        std::fs::write(dirs.work.join("mine.txt"), "ok\n").unwrap();
+        let prefix = sandbox_prefix(&dirs, true);
+        let env = trial_env(&dirs, &[]);
+        let sh_in = |script: &str| {
+            run(
+                &sh(script),
+                &prefix,
+                &dirs.work,
+                &env,
+                Duration::from_secs(30),
+            )
+        };
+        let secret = base.join("secret.txt").display().to_string();
+        assert!(
+            !sh_in(&format!("cat {secret}")).success(),
+            "sibling file visible"
+        );
+        let home = std::env::var("HOME").unwrap();
+        assert!(
+            !sh_in(&format!("ls {home}/.ssh")).success()
+                || !Path::new(&format!("{home}/.ssh")).exists()
+        );
+        assert!(
+            !sh_in(&format!("ls {home}/.cargo/registry")).success(),
+            "cargo registry visible"
+        );
+        assert_eq!(sh_in("cat mine.txt").stdout, "ok\n");
+        assert!(sh_in("echo x > new.txt").success());
+        assert!(sh_in("command -v sh").success());
+        if Command::new("cargo")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            let o = sh_in("cargo --version");
+            assert!(o.success(), "cargo not usable in sandbox: {}", o.stderr);
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn git_baseline_and_changes() {
         let d = tmp("git");
         let work = d.join("work");
@@ -423,6 +567,22 @@ mod tests {
     }
 
     #[test]
+    fn build_artifacts() {
+        for a in [
+            "__pycache__/m.cpython-313.pyc",
+            "src/__pycache__/x",
+            "table.o",
+            "a.out",
+            "target/debug/x",
+        ] {
+            assert!(is_build_artifact(a), "{a}");
+        }
+        for f in ["main.c", "src/lib.rs", "notes.o.txt", "targets.txt"] {
+            assert!(!is_build_artifact(f), "{f}");
+        }
+    }
+
+    #[test]
     fn unchanged_detects_edits_and_deletions() {
         let d = tmp("unch");
         let (fx, wk) = (d.join("fx"), d.join("wk"));
@@ -430,6 +590,11 @@ mod tests {
         std::fs::write(fx.join("tests/t.py"), "assert 1\n").unwrap();
         copy_tree(&fx, &wk).unwrap();
         assert!(unchanged(&fx, &wk, "tests").is_ok());
+        std::fs::create_dir_all(wk.join("tests/__pycache__")).unwrap();
+        assert!(
+            unchanged(&fx, &wk, "tests").is_ok(),
+            "bytecode cache counts as a change"
+        );
         std::fs::write(wk.join("tests/t.py"), "pass\n").unwrap();
         assert!(
             unchanged(&fx, &wk, "tests")

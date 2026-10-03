@@ -13,5 +13,7 @@ fn mean_of_values() {
 #[test]
 fn above_average_still_works() {
     assert_eq!(above_average(&[1.0, 2.0, 6.0]), vec![6.0]);
+    assert_eq!(above_average(&[1.0, 2.0, 3.0]), vec![3.0]);
+    assert_eq!(above_average(&[4.0, 4.0]), Vec::<f64>::new());
     assert!(above_average(&[]).is_empty());
 }

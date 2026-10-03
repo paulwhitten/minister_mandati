@@ -48,6 +48,19 @@ fn norm(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Answer text for matching: whitespace-normalized, lower case, and with
+/// Unicode hyphens and dashes (common in model output) read as "-".
+fn answer_norm(s: &str) -> String {
+    norm(s)
+        .to_lowercase()
+        .chars()
+        .map(|c| match c {
+            '\u{2010}'..='\u{2015}' | '\u{2212}' | '\u{FE63}' | '\u{FF0D}' => '-',
+            c => c,
+        })
+        .collect()
+}
+
 fn tail(s: &str, lines: usize) -> String {
     let v: Vec<&str> = s.trim_end().lines().collect();
     v[v.len().saturating_sub(lines)..].join("\n")
@@ -77,10 +90,22 @@ fn evaluate(kind: &CheckKind, ev: &Evidence, log: &mut String, name: &str) -> (b
     let work = &ev.dirs.work;
     let read = |p: &str| std::fs::read_to_string(work.join(p));
     match kind {
-        CheckKind::Command { run } => {
+        CheckKind::Command { run, stdout_line } => {
             let o = command(run, ev, log, name);
-            if o.success() {
+            let line_ok = stdout_line
+                .as_ref()
+                .is_none_or(|want| o.stdout.lines().any(|l| l.trim() == want.trim()));
+            if o.success() && line_ok {
                 (true, String::new())
+            } else if o.success() {
+                (
+                    false,
+                    format!(
+                        "exited 0 but never printed {:?}: {}",
+                        stdout_line.as_deref().unwrap_or_default(),
+                        tail(&o.stdout, 2)
+                    ),
+                )
             } else if o.timed_out {
                 (false, "timed out".into())
             } else {
@@ -135,6 +160,7 @@ fn evaluate(kind: &CheckKind, ev: &Evidence, log: &mut String, name: &str) -> (b
             let outside: Vec<&String> = ev
                 .changed
                 .iter()
+                .filter(|f| !exec::is_build_artifact(f) && !is_new_executable(ev, f))
                 .filter(|f| !paths.iter().any(|p| glob_match(p, f)))
                 .collect();
             if outside.is_empty() {
@@ -154,11 +180,19 @@ fn evaluate(kind: &CheckKind, ev: &Evidence, log: &mut String, name: &str) -> (b
             }
         }
         CheckKind::FinalAnswer { contains } => {
-            let answer = norm(&ev.metrics.final_answer).to_lowercase();
-            let want = norm(contains).to_lowercase();
+            let answer = answer_norm(&ev.metrics.final_answer);
+            let want = answer_norm(contains);
             (
                 answer.contains(&want),
                 format!("final answer lacks {contains:?}"),
+            )
+        }
+        CheckKind::FinalAnswerLacks { text } => {
+            let answer = answer_norm(&ev.metrics.final_answer);
+            let bad = answer_norm(text);
+            (
+                !answer.contains(&bad),
+                format!("final answer mentions {text:?}"),
             )
         }
         CheckKind::Agent {
@@ -177,6 +211,18 @@ fn evaluate(kind: &CheckKind, ev: &Evidence, log: &mut String, name: &str) -> (b
             (true, String::new())
         }
     }
+}
+
+/// A compiled program the agent built that was not in the fixture (e.g.
+/// `gcc -o count count.c`): a build artifact whatever its name.
+fn is_new_executable(ev: &Evidence, rel: &str) -> bool {
+    if ev.task.fixture().join(rel).exists() {
+        return false;
+    }
+    let mut head = [0u8; 4];
+    std::fs::File::open(ev.dirs.work.join(rel))
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut head))
+        .is_ok_and(|_| &head == b"\x7fELF")
 }
 
 /// A trial passes when every required check passed.

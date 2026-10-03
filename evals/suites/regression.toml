@@ -1,3 +1,0 @@
-description = "Agent-behavior regressions; expected to pass nearly always."
-tasks = ["loop-guard-repeat-write", "dont-edit-tests", "noop-already-correct"]
-trials = 3

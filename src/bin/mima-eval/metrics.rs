@@ -27,6 +27,12 @@ pub struct Metrics {
     pub compactions: u64,
     pub loop_guard_trips: u64,
     pub model_errors: u64,
+    /// Replies cut off at `max_tokens` (finish_reason "length"): often a
+    /// harness setting, not a model failure.
+    pub truncated: u64,
+    /// The last model error's text, if any (to tell an unreachable server
+    /// from a model failure).
+    pub last_model_error: String,
 }
 
 /// Parses a transcript file. Missing or unreadable files give default
@@ -46,6 +52,9 @@ pub fn from_transcript(path: &Path) -> Metrics {
             "session_start" => m.window = u("window"),
             "model_response" => {
                 m.steps += 1;
+                if r["finish_reason"].as_str() == Some("length") {
+                    m.truncated += 1;
+                }
                 m.prompt_tokens += r["usage"]["prompt"].as_u64().unwrap_or(0);
                 m.completion_tokens += r["usage"]["completion"].as_u64().unwrap_or(0);
                 let sent = r["usage"]["prompt"]
@@ -60,7 +69,10 @@ pub fn from_transcript(path: &Path) -> Metrics {
                     }
                 }
             }
-            "model_error" => m.model_errors += 1,
+            "model_error" => {
+                m.model_errors += 1;
+                m.last_model_error = r["error"].as_str().unwrap_or_default().to_string();
+            }
             "tool_result" => {
                 let tool = r["tool"].as_str().unwrap_or("?");
                 let out = r["output"].as_str().unwrap_or_default();

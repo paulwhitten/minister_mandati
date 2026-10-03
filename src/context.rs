@@ -161,6 +161,11 @@ pub const NOT_EXECUTED: &str = "Not executed: the turn ended before this call ra
 /// The loop guard's nudge (a user message after a step's tool results).
 pub const NUDGE: &str = "A repeated identical action was detected that already succeeded. \
                          If the task is complete, reply without further tool calls.";
+/// Sent when a reply has no tool call and no usable answer: empty, or cut
+/// off at `max_tokens` (typically mid-reasoning).
+pub const CONTINUE: &str = "Your last reply was empty or was cut off before it finished. \
+                            Do not repeat long reasoning: call a tool to make progress, or \
+                            give your final answer briefly.";
 /// Longest tool-call argument text quoted in a placeholder.
 const PLACEHOLDER_ARGS_CHARS: usize = 200;
 
@@ -864,6 +869,7 @@ mod tests {
             content: None,
             tool_calls: Some(calls),
             usage: None,
+            finish_reason: None,
         }
     }
 
@@ -1070,6 +1076,7 @@ mod tests {
             content: Some("```action\n{}\n```".into()),
             tool_calls: Some(vec![call("local-1")]),
             usage: None,
+            finish_reason: None,
         };
         let m = Message::assistant_tool_calls(&r);
         assert_eq!(
