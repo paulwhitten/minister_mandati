@@ -177,6 +177,11 @@ pub struct Security {
     /// `<prefix...> sh -c <command>`. Empty (default) runs `sh -c` directly.
     #[serde(default)]
     pub bash_wrapper: Vec<String>,
+    /// Extra environment variable names passed to shell commands. Commands
+    /// otherwise get only a fixed allowlist (PATH, HOME, locale, toolchain
+    /// locations; see `src/tools/shell.rs`), never mima's own secrets.
+    #[serde(default)]
+    pub env_passthrough: Vec<String>,
     /// Sandbox roots for the filesystem tools only (not a shell sandbox).
     pub allowed_paths: Vec<String>,
 }
@@ -212,6 +217,7 @@ impl Default for Security {
             auto_approve_bash: Vec::new(),
             bash_timeout_secs: default_bash_timeout_secs(),
             bash_wrapper: Vec::new(),
+            env_passthrough: Vec::new(),
             allowed_paths: vec!["./".to_string()],
         }
     }

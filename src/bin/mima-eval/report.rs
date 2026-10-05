@@ -130,6 +130,19 @@ fn summary(
             }
         );
     }
+    if let Some(r) = meta["server_restarts"].as_object() {
+        let parts: Vec<String> = r
+            .iter()
+            .map(|(k, v)| format!("{k} {}", v.as_array().map_or(0, Vec::len)))
+            .collect();
+        if !parts.is_empty() {
+            let _ = writeln!(
+                s,
+                "The model server crashed and was restarted during this run ({}). Trials it interrupted were retried.\n",
+                parts.join(", ")
+            );
+        }
+    }
     if infra > 0 {
         let _ = writeln!(
             s,

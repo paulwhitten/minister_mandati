@@ -36,6 +36,12 @@ pub struct Profile {
     pub setup: Option<String>,
     #[serde(default = "default_ready_timeout")]
     pub ready_timeout_sec: u64,
+    /// Command that restarts the server when it dies mid-run (for example
+    /// `ssh host MIMA_FORCE=1 ./serve.sh model`). Defaults to `setup`. Run
+    /// when the server stays unreachable after an infrastructure failure;
+    /// each restart is recorded in run.json.
+    #[serde(default)]
+    pub restart: Option<String>,
     /// Command whose output describes what is being served (image, flags),
     /// run once the server is ready and stored in run.json.
     #[serde(default)]
@@ -102,6 +108,7 @@ pub fn profile_from_config(base: &toml::Table) -> Profile {
             .map(String::from),
         setup: None,
         ready_timeout_sec: default_ready_timeout(),
+        restart: None,
         fingerprint: None,
         power: None,
         mima: toml::Table::new(),
@@ -191,6 +198,18 @@ fn trial_config(
         &mut c,
         &["session", "transcripts"],
         toml::Value::Boolean(false),
+    );
+    // mima gives shell commands only an allowlisted environment; pass on the
+    // trial settings that commands must see.
+    set(
+        &mut c,
+        &["security", "env_passthrough"],
+        toml::Value::Array(
+            ["PYTHONDONTWRITEBYTECODE", "GIT_EDITOR"]
+                .iter()
+                .map(|v| s(v))
+                .collect(),
+        ),
     );
     toml::to_string(&c).unwrap_or_default()
 }
@@ -501,6 +520,15 @@ fn run_trial(
         .map(expand_env)
         .or_else(|| std::env::var("MIMA_API_KEY").ok());
     extra.push(("MIMA_API_KEY", key.unwrap_or_else(|| "none".into())));
+    // Debugging model servers: with MIMA_DUMP_REQUESTS set for the harness,
+    // each trial keeps every request mima sent in `requests/`, so a request
+    // that crashes the server can be replayed exactly.
+    if std::env::var_os("MIMA_DUMP_REQUESTS").is_some() {
+        extra.push((
+            "MIMA_DUMP_REQUESTS",
+            dirs.root.join("requests").display().to_string(),
+        ));
+    }
     let env = exec::trial_env(&dirs, &extra);
     let argv: Vec<String> = vec![
         opts.mima.display().to_string(),
@@ -755,6 +783,31 @@ pub fn run_suite(
                             "  infra failure on {}#{trial}; waiting for the server",
                             task.id
                         );
+                        // A server that does not come back by itself within
+                        // a few minutes has crashed: restart it.
+                        let quick = Profile {
+                            ready_timeout_sec: 180,
+                            ..p.clone()
+                        };
+                        if rt.block_on(wait_ready(&quick)).is_err()
+                            && let Some(cmd) = p.restart.as_ref().or(p.setup.as_ref())
+                        {
+                            eprintln!("  server still down; restarting: {cmd}");
+                            let ok = std::process::Command::new("sh")
+                                .arg("-c")
+                                .arg(cmd)
+                                .status()
+                                .is_ok_and(|s| s.success());
+                            let entry = json!({
+                                "at": rfc3339_utc(std::time::SystemTime::now()),
+                                "task": task.id, "trial": trial, "command_ok": ok,
+                            });
+                            match meta["server_restarts"][&p.name].as_array_mut() {
+                                Some(a) => a.push(entry),
+                                None => meta["server_restarts"][&p.name] = json!([entry]),
+                            }
+                            write_meta(&meta);
+                        }
                         rt.block_on(wait_ready(p))?;
                         continue;
                     }

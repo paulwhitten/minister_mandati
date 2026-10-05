@@ -242,6 +242,13 @@ MIMA_LOG_FORMAT=json cargo run -- "..." # structured JSON logs for auditing
 - Shell commands are killed after `bash_timeout_secs` (default 300). Tool
   output is capped relative to the model's context window, keeping the head
   and tail.
+- Each shell command gets only an allowlisted environment (PATH, HOME,
+  locale, toolchain locations such as `CARGO_HOME`), never mima's API key or
+  other credentials; `env_passthrough` adds names. It runs in its own session
+  with no controlling terminal, its `TMPDIR` is a private directory removed
+  when mima exits, and background processes it starts are stopped when it
+  returns or times out. File and network access are not restricted yet; see
+  [docs/design/design-shell-sandboxing.md](docs/design/design-shell-sandboxing.md).
 - `read_file`, `list_dir`, `find_files` and `search_files` are read-only and
   never prompt; the search tools skip `.git`, build and dependency
   directories and never follow symlinks.
