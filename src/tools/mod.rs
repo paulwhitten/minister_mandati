@@ -3,6 +3,7 @@
 pub mod edit;
 pub mod fs;
 pub mod search;
+pub mod shell;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -98,10 +99,11 @@ impl ToolRegistry {
         let allowed = config.security.allowed_paths.clone();
         let files = edit::FileTracker::shared();
         let tools: Vec<Box<dyn BaseTool>> = vec![
-            Box::new(BashExecutor {
-                timeout: Duration::from_secs(config.security.bash_timeout_secs),
-                wrapper: config.security.bash_wrapper.clone(),
-            }),
+            Box::new(BashExecutor::new(
+                Duration::from_secs(config.security.bash_timeout_secs),
+                config.security.bash_wrapper.clone(),
+                &config.security.env_passthrough,
+            )),
             Box::new(fs::ReadFile::new(allowed.clone(), files.clone())),
             Box::new(edit::EditFile::new(allowed.clone(), files.clone())),
             Box::new(fs::WriteFile::new(allowed.clone(), files.clone())),
@@ -185,13 +187,42 @@ pub fn truncate_middle(s: String, max: usize) -> String {
     )
 }
 
-/// Standard command runner. NOT sandboxed by `allowed_paths` — gated by human approval.
+/// Standard command runner. NOT sandboxed by `allowed_paths` — gated by human
+/// approval. Each command gets an allowlisted environment and a private
+/// `TMPDIR`, runs in its own session, and its whole process group is killed
+/// when it returns or times out (see `shell.rs`).
 pub struct BashExecutor {
-    /// Commands still running after this are killed (the `sh` process; children
-    /// that detach from it may survive).
+    /// Commands still running after this are killed with their whole group.
     timeout: Duration,
     /// Optional command prefix (e.g. a `bwrap` sandbox); see `bash_wrapper`.
     wrapper: Vec<String>,
+    /// The complete environment commands run with.
+    env: Vec<(String, String)>,
+    /// Kept for its lifetime: the directory is removed when this is dropped.
+    _tmp: Option<shell::SessionTmp>,
+}
+
+impl BashExecutor {
+    pub fn new(timeout: Duration, wrapper: Vec<String>, env_passthrough: &[String]) -> Self {
+        let mut env = shell::child_env(std::env::vars(), env_passthrough);
+        let tmp = match shell::SessionTmp::create() {
+            Ok(t) => {
+                env.retain(|(k, _)| k != "TMPDIR");
+                env.push(("TMPDIR".into(), t.path().display().to_string()));
+                Some(t)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "no private temp directory for shell commands");
+                None
+            }
+        };
+        Self {
+            timeout,
+            wrapper,
+            env,
+            _tmp: tmp,
+        }
+    }
 }
 
 #[async_trait]
@@ -199,7 +230,9 @@ impl BaseTool for BashExecutor {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "execute_bash".into(),
-            description: "Execute a single shell command and return stdout/stderr.".into(),
+            description: "Execute a single shell command and return stdout/stderr. \
+                          Background processes it starts are stopped when it returns."
+                .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -216,28 +249,24 @@ impl BaseTool for BashExecutor {
             arg: "command".to_string(),
         })?;
 
-        let mut command = match self.wrapper.split_first() {
-            Some((program, prefix)) => {
-                let mut c = tokio::process::Command::new(program);
-                c.args(prefix).arg("sh");
-                c
-            }
-            None => tokio::process::Command::new("sh"),
-        };
-        let run = command.arg("-c").arg(cmd).kill_on_drop(true).output();
-        // On timeout the future is dropped, and `kill_on_drop` kills the child.
-        let output = tokio::time::timeout(self.timeout, run)
+        let argv: Vec<String> = self
+            .wrapper
+            .iter()
+            .cloned()
+            .chain(["sh".to_string(), "-c".to_string(), cmd.to_string()])
+            .collect();
+        let output = shell::run(&argv, &self.env, self.timeout)
             .await
+            .context(SpawnSnafu)?
             .map_err(|_| Error::Timeout {
                 secs: self.timeout.as_secs(),
-            })?
-            .context(SpawnSnafu)?;
+            })?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         Ok(format!(
             "exit: {}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}",
-            output.status.code().unwrap_or(-1)
+            output.code.unwrap_or(-1)
         ))
     }
 }
@@ -275,10 +304,7 @@ mod tests {
 
     #[tokio::test]
     async fn bash_runs_and_reports_exit_code() {
-        let bash = BashExecutor {
-            timeout: Duration::from_secs(10),
-            wrapper: Vec::new(),
-        };
+        let bash = BashExecutor::new(Duration::from_secs(10), Vec::new(), &[]);
         let out = bash
             .execute(&json!({ "command": "echo hi; exit 3" }), &env())
             .await
@@ -289,10 +315,11 @@ mod tests {
     #[tokio::test]
     async fn bash_runs_through_the_wrapper() {
         // `env` as a stand-in wrapper: it runs the rest of its arguments.
-        let bash = BashExecutor {
-            timeout: Duration::from_secs(10),
-            wrapper: vec!["env".into(), "MIMA_WRAPPED=1".into()],
-        };
+        let bash = BashExecutor::new(
+            Duration::from_secs(10),
+            vec!["env".into(), "MIMA_WRAPPED=1".into()],
+            &[],
+        );
         let out = bash
             .execute(&json!({ "command": "echo $MIMA_WRAPPED" }), &env())
             .await
@@ -302,10 +329,7 @@ mod tests {
 
     #[tokio::test]
     async fn bash_times_out() {
-        let bash = BashExecutor {
-            timeout: Duration::from_millis(200),
-            wrapper: Vec::new(),
-        };
+        let bash = BashExecutor::new(Duration::from_millis(200), Vec::new(), &[]);
         let start = std::time::Instant::now();
         let err = bash
             .execute(&json!({ "command": "sleep 5" }), &env())
@@ -313,5 +337,27 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::Timeout { .. }));
         assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn bash_gets_a_clean_environment_and_private_tmpdir() {
+        let bash = BashExecutor::new(Duration::from_secs(10), Vec::new(), &[]);
+        assert!(bash.env.iter().all(|(k, _)| !k.starts_with("MIMA_")));
+        let out = bash
+            .execute(
+                &json!({ "command": "env | cut -d= -f1 | sort; test -d \"$TMPDIR\" && stat -c %a \"$TMPDIR\"" }),
+                &env(),
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("TMPDIR"), "{out}");
+        assert!(
+            out.contains("\n700\n"),
+            "TMPDIR exists with mode 700: {out}"
+        );
+        assert!(!out.contains("MIMA_"), "{out}");
+        let tmp = bash._tmp.as_ref().map(|t| t.path().to_path_buf()).unwrap();
+        drop(bash);
+        assert!(!tmp.exists(), "private TMPDIR removed with the executor");
     }
 }

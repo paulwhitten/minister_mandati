@@ -811,6 +811,7 @@ dependencies = [
  "async-trait",
  "clap",
  "jsonschema",
+ "libc",
  "regex",
  "reqwest",
  "rustyline",

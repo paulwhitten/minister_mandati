@@ -25,7 +25,7 @@ fn config(base_url: String, dir: &std::path::Path) -> Config {
     c.provider.default_model = "mock".into();
     c.agent.stream = false;
     c.agent.max_tokens = 100;
-    c.context.window = Some(5_000); // small, so outputs are capped and masked
+    c.context.window = Some(4_800); // small, so outputs are capped and masked
     c.context.server_tokenize = false;
     c.security.allowed_paths = vec![dir.join("work").display().to_string()];
     c.session.transcript_dir = dir.join("tx").display().to_string();

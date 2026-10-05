@@ -288,6 +288,7 @@ pub async fn generate_completion(
     }
 
     tracing::debug!(%url, stream = cfg.agent.stream, "sending completion request");
+    dump_request(&body);
     let client = reqwest::Client::new();
     let response = send_with_retry(&client, &url, cfg, &body).await?;
 
@@ -523,6 +524,29 @@ fn build_response(message: &Value, usage: Option<TokenUsage>, cfg: &Config) -> C
             .get("finish_reason")
             .and_then(Value::as_str)
             .map(str::to_string),
+    }
+}
+
+/// Debugging aid: with `MIMA_DUMP_REQUESTS=<dir>`, every request body is
+/// written to `<dir>/<unix-ms>-<n>.json` before it is sent, so a request that
+/// crashes a model server can be replayed exactly. Off unless the variable
+/// is set; failures to write are logged and otherwise ignored.
+fn dump_request(body: &Value) {
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let Some(dir) = std::env::var_os("MIMA_DUMP_REQUESTS") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = dir.join(format!("{ms}-{n:04}.json"));
+    let written = std::fs::create_dir_all(&dir)
+        .and_then(|_| std::fs::write(&path, serde_json::to_vec_pretty(body).unwrap_or_default()));
+    if let Err(e) = written {
+        tracing::warn!(path = %path.display(), error = %e, "could not dump request");
     }
 }
 

@@ -31,6 +31,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"]
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rustyline = { version = "18.0.1", default-features = false }
 regex = "1.13.1"
+# setsid/killpg for shell commands (already a dependency of tokio).
+libc = "0.2"
 
 # Small, auditable release binary. For a static build see "Building" in README.md.
 [profile.release]
