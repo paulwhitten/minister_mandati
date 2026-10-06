@@ -676,7 +676,7 @@ pub fn whole_file_blocks(old: &str, new: &str) -> Vec<Block> {
 /// blocks share a hunk. Returns the text and the added/removed line counts.
 pub fn unified_diff(shown: &str, old: &str, new: &str, blocks: &[Block]) -> (String, usize, usize) {
     let (a, b) = (lines(old), lines(new));
-    let refined = refine(&a, &b, blocks);
+    let refined = refine(&a, &b, &merge_overlapping(blocks));
     let blocks = refined.as_slice();
     let mut out = vec![format!("--- a/{shown}"), format!("+++ b/{shown}")];
     let (mut added, mut removed) = (0, 0);
@@ -737,6 +737,28 @@ pub fn unified_diff(shown: &str, old: &str, new: &str, blocks: &[Block]) -> (Str
 
 /// Shrinks each block past lines that are identical at its start and end
 /// (a replacement often repeats unchanged lines), dropping empty blocks.
+/// Sorts blocks and merges those whose old line ranges overlap or touch.
+/// `replace_all` with several matches on one line yields one block per match,
+/// all for the same line; the diff needs disjoint blocks.
+fn merge_overlapping(blocks: &[Block]) -> Vec<Block> {
+    let mut sorted = blocks.to_vec();
+    sorted.sort_by_key(|b| (b.old_start, b.new_start));
+    let mut out: Vec<Block> = Vec::new();
+    for b in sorted {
+        match out.last_mut() {
+            Some(prev) if b.old_start <= prev.old_start + prev.old_len => {
+                let old_end = (prev.old_start + prev.old_len).max(b.old_start + b.old_len);
+                let new_end = (prev.new_start + prev.new_len).max(b.new_start + b.new_len);
+                prev.new_start = prev.new_start.min(b.new_start);
+                prev.old_len = old_end - prev.old_start;
+                prev.new_len = new_end - prev.new_start;
+            }
+            _ => out.push(b),
+        }
+    }
+    out
+}
+
 fn refine(a: &[&str], b: &[&str], blocks: &[Block]) -> Vec<Block> {
     blocks
         .iter()
@@ -990,6 +1012,21 @@ mod tests {
         assert_eq!(p.new_content, "def f():\n    if x:\n        return 2\n");
         // Inconsistent offsets are not guessed at.
         assert!(plan("a:\n    b\n", "  a:\n  b", "x").is_err());
+    }
+
+    #[test]
+    fn replace_all_with_two_matches_on_one_line_diffs_cleanly() {
+        // Regression: two matches on the same line gave two blocks for that
+        // line, and the diff sliced backwards and panicked.
+        let old = "# Guide\n\nClients recieve a token. Then they recieve updates.\nend\n";
+        let p = plan_edit(old, "recieve", "receive", true, "docs/guide.md").unwrap();
+        assert_eq!(p.count, 2);
+        let (diff, added, removed) = unified_diff("docs/guide.md", old, &p.new_content, &p.blocks);
+        assert_eq!((added, removed), (1, 1), "{diff}");
+        assert!(
+            diff.contains("+Clients receive a token. Then they receive updates."),
+            "{diff}"
+        );
     }
 
     #[test]
