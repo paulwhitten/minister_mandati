@@ -13,6 +13,7 @@ mod loop_guard;
 mod presenter;
 #[cfg(test)]
 mod resume_tests;
+mod sandbox;
 mod schema;
 #[cfg(test)]
 mod schema_tests;
@@ -105,8 +106,22 @@ impl Mode {
     }
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // The shell sandbox helper (`mima __sandbox-exec`) must run before the
+    // async runtime starts any threads: Landlock and seccomp are applied to a
+    // single-threaded process that then execs the command.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("__sandbox-exec") {
+        sandbox::exec_main(&args);
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    runtime.block_on(async_main());
+}
+
+async fn async_main() {
     init_tracing();
     let cli = Cli::parse();
     let mut presenter = CliPresenter::default();

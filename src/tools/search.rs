@@ -103,20 +103,50 @@ pub fn glob_regex(glob: &str) -> std::result::Result<Regex, regex::Error> {
     Regex::new(&re)
 }
 
-/// The search root (default `.`) checked against the sandbox, and how to
-/// show paths under it.
-fn root(args: &Value, allowed: &[String]) -> Result<(PathBuf, String)> {
+/// The search root (default `.`) checked against the sandbox, how to show
+/// paths under it, and, when `path` names a file and `allow_file` is set,
+/// that single file (relative to the returned root).
+fn root(
+    args: &Value,
+    allowed: &[String],
+    allow_file: bool,
+) -> Result<(PathBuf, String, Option<String>)> {
     let shown = args.get("path").and_then(Value::as_str).unwrap_or(".");
     let safe = ensure_allowed(Path::new(shown), allowed)?;
-    if !safe.is_dir() {
-        return refuse(format!("{shown} is not a directory."));
+    if !safe.exists() {
+        return refuse(format!(
+            "{shown} does not exist. Paths are relative to the working directory; \
+             use find_files or list_dir to locate it."
+        ));
+    }
+    if safe.is_file() {
+        if !allow_file {
+            return refuse(format!(
+                "{shown} is a file, not a directory; give its directory, or read it with read_file."
+            ));
+        }
+        let parent = safe.parent().map(Path::to_path_buf).unwrap_or_default();
+        let name = safe
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let dir_shown = Path::new(shown)
+            .parent()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let prefix = if dir_shown.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", dir_shown.trim_end_matches('/'))
+        };
+        return Ok((parent, prefix, Some(name)));
     }
     let prefix = if shown == "." || shown.is_empty() {
         String::new()
     } else {
         format!("{}/", shown.trim_end_matches('/'))
     };
-    Ok((safe, prefix))
+    Ok((safe, prefix, None))
 }
 
 fn limit(args: &Value, default: usize) -> usize {
@@ -166,7 +196,7 @@ impl BaseTool for FindFiles {
             Ok(r) => r,
             Err(e) => return refuse(format!("find_files failed: bad pattern {pattern:?}: {e}")),
         };
-        let (root, prefix) = root(args, &self.allowed)?;
+        let (root, prefix, _) = root(args, &self.allowed, false)?;
         let max = limit(args, 200);
         let hits: Vec<String> = walk(&root).into_iter().filter(|p| re.is_match(p)).collect();
         if hits.is_empty() {
@@ -254,12 +284,16 @@ impl BaseTool for SearchFiles {
             },
             None => None,
         };
-        let (root, prefix) = root(args, &self.allowed)?;
+        let (root, prefix, single) = root(args, &self.allowed, true)?;
         let max = limit(args, 100);
 
         let mut lines_out = Vec::new();
         let (mut total, mut files_with) = (0usize, 0usize);
-        for rel in walk(&root) {
+        let files = match single {
+            Some(f) => vec![f],
+            None => walk(&root),
+        };
+        for rel in files {
             if filter.as_ref().is_some_and(|f| !f.is_match(&rel)) {
                 continue;
             }
@@ -351,6 +385,26 @@ mod tests {
         assert!(!m("src/*.c", "src/deep/x.c"));
         assert!(m("src/ma?n.rs", "src/main.rs"));
         assert!(m("**", "any/thing"));
+    }
+
+    #[tokio::test]
+    async fn search_files_accepts_a_file_and_explains_missing_paths() {
+        let d = tree("one-file");
+        let t = SearchFiles::new(vec![d.display().to_string()]);
+        let file = d.join("src/args.rs").display().to_string();
+        let out = t
+            .execute(&json!({ "pattern": "TODO", "path": file }), &env())
+            .await
+            .unwrap();
+        assert!(out.contains("src/args.rs:2: // TODO: flags"), "{out}");
+        assert!(!out.contains("main.rs"), "{out}");
+        let missing = d.join("nope").display().to_string();
+        let err = t
+            .execute(&json!({ "pattern": "x", "path": missing }), &env())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not exist"), "{err}");
     }
 
     #[tokio::test]

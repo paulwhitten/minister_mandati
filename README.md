@@ -238,7 +238,11 @@ MIMA_LOG_FORMAT=json cargo run -- "..." # structured JSON logs for auditing
 - `auto_approve_bash` lists shell command prefixes that skip the prompt, e.g.
   `["cargo test", "git status"]`. Matching is whole-word, and any command with
   shell operators (`;`, `&`, `|`, `$`, backticks, parentheses, redirects,
-  backslashes, newlines) still prompts. Auto-approvals are logged.
+  backslashes, newlines) still prompts. It applies only while shell commands
+  are sandboxed (below); without the sandbox every command prompts.
+  `auto_approve_sandboxed = true` approves every sandboxed command (off by
+  default: the sandbox does not protect the workspace itself). Auto-approvals
+  are logged.
 - Shell commands are killed after `bash_timeout_secs` (default 300). Tool
   output is capped relative to the model's context window, keeping the head
   and tail.
@@ -247,13 +251,20 @@ MIMA_LOG_FORMAT=json cargo run -- "..." # structured JSON logs for auditing
   other credentials; `env_passthrough` adds names. It runs in its own session
   with no controlling terminal, its `TMPDIR` is a private directory removed
   when mima exits, and background processes it starts are stopped when it
-  returns or times out. File and network access are not restricted yet; see
+  returns or times out.
+- Shell commands are sandboxed with Landlock and seccomp when the kernel
+  supports them (`[security].sandbox = "auto"`, the default): they can read
+  system directories, toolchains (`sandbox_read_paths`) and the workspace,
+  write only the workspace and their temp directory, and have no network.
+  Keys and credentials in your home directory are unreadable to them.
+  `sandbox = "required"` refuses to run commands without the sandbox;
+  `sandbox_network = true` and `sandbox_writable_paths` widen it. See
   [docs/design/design-shell-sandboxing.md](docs/design/design-shell-sandboxing.md).
 - `read_file`, `list_dir`, `find_files` and `search_files` are read-only and
   never prompt; the search tools skip `.git`, build and dependency
   directories and never follow symlinks.
-- `allowed_paths` sandboxes the **filesystem tools only**; it is not a shell
-  sandbox — shell safety relies on the approval gate.
+- `allowed_paths` confines mima's file tools, and is also the writable
+  workspace for sandboxed shell commands.
 
 ## Status
 

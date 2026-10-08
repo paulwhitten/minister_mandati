@@ -12,13 +12,23 @@ const SHELL_METACHARS: &[char] = &[
 ];
 
 /// Core policy: whether a tool call is state-changing and must be approved.
-pub fn needs_approval(cfg: &Config, call: &ToolCall) -> bool {
+/// `sandboxed` says whether shell commands run inside the Tier 1 sandbox:
+/// automatic approval (the allowlist, or `auto_approve_sandboxed`) applies
+/// only then, because an allowlist alone is easy to get around.
+pub fn needs_approval(cfg: &Config, call: &ToolCall, sandboxed: bool) -> bool {
     match call.name.as_str() {
         "execute_bash" => {
             if !cfg.security.require_approval_for_bash {
                 return false;
             }
+            if !sandboxed {
+                return true;
+            }
             let cmd = call.args["command"].as_str().unwrap_or("");
+            if cfg.security.auto_approve_sandboxed {
+                tracing::info!(command = %cmd, "sandboxed bash command auto-approved");
+                return false;
+            }
             if bash_auto_approved(cmd, &cfg.security.auto_approve_bash) {
                 tracing::info!(command = %cmd, "bash command auto-approved by allowlist");
                 return false;
@@ -105,10 +115,22 @@ mod tests {
     fn policy_respects_flags_and_allowlist() {
         let mut cfg = Config::default();
         cfg.security.auto_approve_bash = list(&["cargo test"]);
-        assert!(!needs_approval(&cfg, &bash("cargo test")));
-        assert!(needs_approval(&cfg, &bash("cargo build")));
+        assert!(!needs_approval(&cfg, &bash("cargo test"), true));
+        assert!(needs_approval(&cfg, &bash("cargo build"), true));
 
         cfg.security.require_approval_for_bash = false;
-        assert!(!needs_approval(&cfg, &bash("cargo build")));
+        assert!(!needs_approval(&cfg, &bash("cargo build"), true));
+        assert!(!needs_approval(&cfg, &bash("cargo build"), false));
+    }
+
+    #[test]
+    fn automatic_approval_needs_the_sandbox() {
+        let mut cfg = Config::default();
+        cfg.security.auto_approve_bash = list(&["cargo test"]);
+        // Without the sandbox the allowlist does not apply.
+        assert!(needs_approval(&cfg, &bash("cargo test"), false));
+        cfg.security.auto_approve_sandboxed = true;
+        assert!(needs_approval(&cfg, &bash("rm -rf /"), false));
+        assert!(!needs_approval(&cfg, &bash("make && ./run_tests"), true));
     }
 }

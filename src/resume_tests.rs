@@ -25,7 +25,10 @@ fn config(base_url: String, dir: &std::path::Path) -> Config {
     c.provider.default_model = "mock".into();
     c.agent.stream = false;
     c.agent.max_tokens = 100;
-    c.context.window = Some(4_800); // small, so outputs are capped and masked
+    // A fixed prompt keeps the budget, and so whether masking happens,
+    // independent of the default prompt's length.
+    c.agent.system_prompt_override = "You are a coding agent under test.".into();
+    c.context.window = Some(4_400); // small, so outputs are capped and masked
     c.context.server_tokenize = false;
     c.security.allowed_paths = vec![dir.join("work").display().to_string()];
     c.session.transcript_dir = dir.join("tx").display().to_string();
@@ -266,4 +269,52 @@ async fn empty_reply_gets_a_continue_prompt_and_resumes_exactly() {
             .iter()
             .any(|m| m.content.as_deref() == Some(crate::context::CONTINUE))
     );
+}
+
+#[tokio::test]
+async fn step_limit_warns_then_asks_for_a_summary() {
+    let d = tmp("step-cap");
+    let work = d.join("work");
+    std::fs::write(work.join("a.txt"), "1\n2\n3\n4\n5\n6\n7\n8\n9\n").unwrap();
+    let p = work.join("a.txt").display().to_string();
+    let mut script: Vec<Value> = (1..=8)
+        .map(|i| {
+            call(
+                &format!("r{i}"),
+                "read_file",
+                json!({ "path": p, "offset": i, "limit": 1 }),
+            )
+        })
+        .collect();
+    script.push(answer("Summary: read the file; nothing changed."));
+    let base = mock_model(script).await;
+    let mut cfg = config(base, &d);
+    cfg.agent.max_steps = 8;
+    let registry = ToolRegistry::init_default(&cfg);
+    let mut ctx = AgentContext::new(cfg, registry.specs());
+    ctx.session.enable(json!({ "mode": "test" })).unwrap();
+    let mut presenter = CliPresenter::default();
+    let result = run_turn(&mut ctx, &registry, &mut presenter, "Look around.").await;
+    match &result {
+        Ok(crate::agent::TurnOutcome::StepCap(Some(s))) => assert!(s.starts_with("Summary:")),
+        other => panic!("expected a step cap with a summary: {other:?}"),
+    }
+    record_outcome(&mut ctx, &result);
+    let expected = messages_json(&ctx);
+    let texts: Vec<&str> = expected
+        .iter()
+        .filter_map(|m| m["content"].as_str())
+        .collect();
+    assert!(texts.contains(&crate::context::STEPS_LEFT));
+    assert!(texts.contains(&crate::context::FINAL_SUMMARY));
+    let path = ctx.session.transcript_path().unwrap().to_path_buf();
+    drop(ctx);
+    crate::schema_tests::validate_transcript(&path);
+    let t = Transcript::load(&path).unwrap();
+    let got: Vec<Value> = rebuild(&t, 4096)
+        .messages
+        .iter()
+        .map(|m| serde_json::to_value(m).unwrap())
+        .collect();
+    assert_eq!(got, expected);
 }

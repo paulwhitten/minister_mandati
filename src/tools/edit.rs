@@ -570,12 +570,15 @@ fn not_found_message(text: &str, old: &str, new: &str, shown: &str, had_prefixes
             .map(|i| format!("{:>6}\t{}", i + 1, file_lines[i]))
             .collect();
         msg.push_str(&format!(
-            "\nClosest match (lines {}-{}, {:.0}% similar):\n{}",
+            "\nClosest match (lines {}-{}, {} similar):\n{}",
             start + 1,
             end,
-            score * 100.0,
+            similarity_text(score),
             shown_lines.join("\n")
         ));
+        if let Some(diff) = first_difference(&old_lines, &file_lines[start..end], start) {
+            msg.push_str(&format!("\n{diff}"));
+        }
         let offset = start.saturating_sub(3) + 1;
         msg.push_str(&format!(
             "\nRe-read that region (read_file path={shown} offset={offset} limit={}) and copy \
@@ -589,6 +592,54 @@ fn not_found_message(text: &str, old: &str, new: &str, shown: &str, had_prefixes
     }
     msg.push_str(" Do not resend the same call.");
     msg
+}
+
+/// A similarity as a percentage, never rounded up to 100% unless identical.
+fn similarity_text(score: f64) -> String {
+    let pct = score * 100.0;
+    if score < 1.0 && pct >= 99.95 {
+        ">99.9%".into()
+    } else if pct >= 99.0 {
+        format!("{pct:.1}%")
+    } else {
+        format!("{pct:.0}%")
+    }
+}
+
+/// Where `old_lines` first differs from the file window starting at line
+/// `start` (0-based): line, column, and both versions around the spot, with
+/// invisible and non-ASCII characters escaped so a one-character difference
+/// (`';'` vs `";"`, a stray Unicode escape) is visible.
+fn first_difference(old_lines: &[&str], window: &[&str], start: usize) -> Option<String> {
+    for (i, (o, f)) in old_lines.iter().zip(window.iter()).enumerate() {
+        if o == f {
+            continue;
+        }
+        let (oc, fc): (Vec<char>, Vec<char>) = (o.chars().collect(), f.chars().collect());
+        let col = oc.iter().zip(fc.iter()).take_while(|(a, b)| a == b).count();
+        let around = |cs: &[char]| -> String {
+            let from = col.saturating_sub(12);
+            let to = (col + 12).min(cs.len());
+            cs[from.min(cs.len())..to]
+                .iter()
+                .map(|c| {
+                    if c.is_ascii_graphic() || *c == ' ' {
+                        c.to_string()
+                    } else {
+                        c.escape_unicode().to_string()
+                    }
+                })
+                .collect()
+        };
+        return Some(format!(
+            "First difference: line {}, column {}. old_string has `{}` where the file has `{}`.",
+            start + i + 1,
+            col + 1,
+            around(&oc),
+            around(&fc)
+        ));
+    }
+    None
 }
 
 /// The window of the file most similar to `old_lines` (average per-line
@@ -1027,6 +1078,21 @@ mod tests {
             diff.contains("+Clients receive a token. Then they receive updates."),
             "{diff}"
         );
+    }
+
+    #[test]
+    fn near_miss_names_the_first_difference() {
+        let content = "fn f() {\n    let s = \";\";\n    g(s);\n}\n";
+        let err = plan(content, "    let s = ';';\n    g(s);\n", "x").unwrap_err();
+        assert!(err.contains("First difference: line 2, column 13"), "{err}");
+        assert!(
+            err.contains("`    let s = ';';`") && err.contains("`    let s = \";\";`"),
+            "{err}"
+        );
+        assert!(!err.contains("100% similar"), "{err}");
+        assert_eq!(similarity_text(0.9996), ">99.9%");
+        assert_eq!(similarity_text(1.0), "100.0%");
+        assert_eq!(similarity_text(0.873), "87%");
     }
 
     #[test]

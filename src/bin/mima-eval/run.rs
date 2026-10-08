@@ -496,7 +496,13 @@ fn run_trial(
             return record;
         }
     };
-    let sandbox = exec::sandbox_prefix(&dirs, opts.sandbox);
+    let mut sandbox = exec::sandbox_prefix(&dirs, opts.sandbox);
+    // mima runs its shell commands through its own binary (`mima
+    // __sandbox-exec`, Landlock + seccomp inside this bubblewrap), so the
+    // binary must be visible in the sandbox, which hides the home directory.
+    if let Ok(exe) = opts.mima.canonicalize() {
+        exec::add_ro_bind(&mut sandbox, &exe);
+    }
     let config_path = dirs.root.join("mima.toml");
     let _ = std::fs::write(
         &config_path,
@@ -779,6 +785,13 @@ pub fn run_suite(
                     rec.infra_retries = retries;
                     if rec.exit_reason == "infra" && retries < INFRA_RETRIES {
                         retries += 1;
+                        // Keep the interrupted attempt (transcript, request
+                        // dumps) for diagnosis; the retry gets a fresh dir.
+                        let kept = root.with_file_name(format!("t{trial}-infra{retries}"));
+                        let _ = std::fs::remove_dir_all(&kept);
+                        if let Err(e) = std::fs::rename(&root, &kept) {
+                            eprintln!("  could not keep the interrupted attempt: {e}");
+                        }
                         eprintln!(
                             "  infra failure on {}#{trial}; waiting for the server",
                             task.id

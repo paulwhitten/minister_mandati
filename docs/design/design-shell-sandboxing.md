@@ -1,6 +1,33 @@
 # Design: Sandboxing Shell Commands
 
-Status: proposal; Tier 0 implemented (`src/tools/shell.rs`)
+Status: Tier 0 implemented (`src/tools/shell.rs`); Tier 1 implemented
+(`src/sandbox.rs`, tests in `itests/sandbox.rs`), tested on the dev host
+(x86_64, Landlock ABI 6), not yet on the Thor; approval integration (S2)
+partly done (failure notes); Tiers 2-3 not started.
+
+Implementation notes for Tier 1 (differences from the proposal below):
+
+- Settings are in `[security]`: `sandbox` ("auto" | "required" | "off"),
+  `sandbox_network`, `sandbox_read_paths` (default `~/.cargo`, `~/.rustup`,
+  `~/.local/bin`, `~/.local/lib`, `~/.gitconfig`, `~/.config/git`),
+  `sandbox_writable_paths`. Git needs `~/.config/git` readable: it treats an
+  unreadable `ignore` file there as fatal.
+- `/run` is readable (resolver and runtime files); `/dev` is writable (DAC
+  still applies).
+- `sendto`/`recvmmsg`/`sendmmsg` stay allowed: with non-Unix sockets denied
+  they only reach Unix socket pairs, which Python and others use internally.
+- Landlock scopes: signals always, abstract Unix sockets when the network is
+  off (ABI 6 and later).
+- On x86_64 a second filter denies all x32-ABI system calls.
+- In the eval harness the helper runs inside the trial's bubblewrap; the
+  harness bind-mounts the mima binary so it is visible there.
+- Approvals (S2, partly): `auto_approve_bash` applies only while commands are
+  sandboxed (with a startup warning otherwise); `auto_approve_sandboxed`
+  approves all sandboxed commands but defaults to **off**, not on as proposed
+  below, because the sandbox does not protect the workspace itself. Not done
+  yet: the escalation argument, trusted-source-only widening (a workspace
+  `./agent.toml` can still set sandbox options), the `.git/hooks` integrity
+  check, and `mima sandbox --status`.
 Scope: `src/tools/mod.rs` (`execute_bash`), `src/approval.rs`, `src/config.rs`,
 `src/main.rs`; shares code with `src/bin/mima-eval/exec.rs`
 Related: `docs/design/design-eval-harness.md` (the harness already sandboxes

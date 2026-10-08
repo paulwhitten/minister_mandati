@@ -182,6 +182,28 @@ pub struct Security {
     /// locations; see `src/tools/shell.rs`), never mima's own secrets.
     #[serde(default)]
     pub env_passthrough: Vec<String>,
+    /// Shell sandbox (Landlock + seccomp; docs/design/design-shell-sandboxing.md):
+    /// "auto" (default) uses it when the kernel supports it and warns
+    /// otherwise, "required" refuses to run shell commands without it, "off"
+    /// disables it.
+    #[serde(default = "default_sandbox_mode")]
+    pub sandbox: String,
+    /// Let sandboxed commands use the network (off by default).
+    #[serde(default)]
+    pub sandbox_network: bool,
+    /// Extra read-only locations for sandboxed commands (`~/` is expanded),
+    /// beyond system directories and the workspace.
+    #[serde(default = "default_sandbox_read_paths")]
+    pub sandbox_read_paths: Vec<String>,
+    /// Extra writable locations for sandboxed commands, beyond the workspace
+    /// (`allowed_paths`) and the session's private temp directory.
+    #[serde(default)]
+    pub sandbox_writable_paths: Vec<String>,
+    /// Approve every shell command that runs inside the sandbox without a
+    /// prompt. Off by default: the sandbox protects everything outside the
+    /// workspace, not the workspace itself.
+    #[serde(default)]
+    pub auto_approve_sandboxed: bool,
     /// Sandbox roots for the filesystem tools only (not a shell sandbox).
     pub allowed_paths: Vec<String>,
 }
@@ -209,6 +231,98 @@ impl Default for Agent {
     }
 }
 
+impl Security {
+    /// Resets every setting that would widen what tools and shell commands
+    /// may do beyond the defaults, for configuration from an untrusted place
+    /// (the workspace's own `agent.toml`). Narrowing settings are kept.
+    /// Returns one message per setting reset.
+    pub fn restrict_to_untrusted(&mut self) -> Vec<String> {
+        let d = Security::default();
+        let mut reset = Vec::new();
+        let mut note = |what: &str| reset.push(what.to_string());
+        if !self.require_approval_for_bash {
+            self.require_approval_for_bash = true;
+            note("require_approval_for_bash = false");
+        }
+        if !self.require_approval_for_writes {
+            self.require_approval_for_writes = true;
+            note("require_approval_for_writes = false");
+        }
+        if !self.auto_approve_bash.is_empty() {
+            self.auto_approve_bash.clear();
+            note("auto_approve_bash");
+        }
+        if self.auto_approve_sandboxed {
+            self.auto_approve_sandboxed = false;
+            note("auto_approve_sandboxed = true");
+        }
+        if self.sandbox != "auto" && self.sandbox != "required" {
+            self.sandbox = d.sandbox.clone();
+            note("sandbox = \"off\"");
+        }
+        if self.sandbox_network {
+            self.sandbox_network = false;
+            note("sandbox_network = true");
+        }
+        if self
+            .sandbox_read_paths
+            .iter()
+            .any(|p| !d.sandbox_read_paths.contains(p))
+        {
+            self.sandbox_read_paths = d.sandbox_read_paths.clone();
+            note("sandbox_read_paths beyond the defaults");
+        }
+        if !self.sandbox_writable_paths.is_empty() {
+            self.sandbox_writable_paths.clear();
+            note("sandbox_writable_paths");
+        }
+        if !self.bash_wrapper.is_empty() {
+            self.bash_wrapper.clear();
+            note("bash_wrapper (it would run outside the sandbox)");
+        }
+        if !self.env_passthrough.is_empty() {
+            self.env_passthrough.clear();
+            note("env_passthrough");
+        }
+        // Workspace roots may only lie inside the current directory.
+        let cwd = std::env::current_dir()
+            .ok()
+            .and_then(|c| c.canonicalize().ok());
+        let inside = |p: &String| {
+            let path = Path::new(p);
+            match (&cwd, path.canonicalize()) {
+                (Some(c), Ok(r)) => r.starts_with(c),
+                _ => !path.is_absolute() && !p.contains(".."),
+            }
+        };
+        if !self.allowed_paths.iter().all(inside) {
+            self.allowed_paths = d.allowed_paths.clone();
+            note("allowed_paths outside the current directory");
+        }
+        reset
+    }
+}
+
+fn default_sandbox_mode() -> String {
+    "auto".into()
+}
+
+/// Toolchains that live in the home directory; the rest of it (keys,
+/// credentials, browser profiles) stays unreadable to sandboxed commands.
+fn default_sandbox_read_paths() -> Vec<String> {
+    [
+        "~/.cargo",
+        "~/.rustup",
+        "~/.local/bin",
+        "~/.local/lib",
+        "~/.gitconfig",
+        "~/.config/git",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
 impl Default for Security {
     fn default() -> Self {
         Self {
@@ -218,6 +332,11 @@ impl Default for Security {
             bash_timeout_secs: default_bash_timeout_secs(),
             bash_wrapper: Vec::new(),
             env_passthrough: Vec::new(),
+            sandbox: default_sandbox_mode(),
+            sandbox_network: false,
+            sandbox_read_paths: default_sandbox_read_paths(),
+            sandbox_writable_paths: Vec::new(),
+            auto_approve_sandboxed: false,
             allowed_paths: vec!["./".to_string()],
         }
     }
@@ -278,7 +397,23 @@ impl Config {
     /// `MIMA_MODEL`, and `MIMA_API_KEY` env vars override afterward.
     pub fn load_or_discover() -> Result<Self> {
         let mut config = match discover_config_path() {
-            Some(path) => Self::load(&path)?,
+            Some(path) => {
+                let mut c = Self::load(&path)?;
+                // ./agent.toml lives in the workspace, which an untrusted
+                // repository controls; it may narrow security, never widen it.
+                if path == Path::new("agent.toml") {
+                    for msg in c.security.restrict_to_untrusted() {
+                        tracing::warn!("ignored in ./agent.toml (workspace config): {msg}");
+                    }
+                    if c.provider.base_url != default_base_url() {
+                        tracing::warn!(
+                            base_url = %c.provider.base_url,
+                            "./agent.toml sets the model endpoint; conversations go there"
+                        );
+                    }
+                }
+                c
+            }
             None => Self::default(),
         };
         config.apply_env_overrides();
@@ -315,6 +450,34 @@ impl Config {
     /// set. See `docs/design/design-composable-system-prompt.md`.
     pub fn system_prompt(&self) -> String {
         compose_system_prompt(&self.agent)
+    }
+
+    /// Facts about this session's environment appended to the system prompt
+    /// (not with a full override): the working directory, where scratch files
+    /// go, and what sandboxed shell commands can do. Eval transcripts showed
+    /// models guessing roots like /home/user or /workspace and losing files
+    /// written to /tmp.
+    pub fn environment_note(&self) -> Option<String> {
+        if std::env::var("MIMA_SYSTEM_PROMPT").is_ok_and(|v| !v.is_empty())
+            || !self.agent.system_prompt_override.is_empty()
+        {
+            return None;
+        }
+        let cwd = std::env::current_dir().ok()?;
+        let mut note = format!(
+            "Environment: the working directory is {}. Tools take paths relative to it; \
+             do not guess other roots such as /home/user, /workspace or /app. For scratch \
+             files use the directory in $TMPDIR, which is private to this session; /tmp \
+             may not be writable and may not persist between commands.",
+            cwd.display()
+        );
+        if self.security.sandbox != "off" {
+            note.push_str(
+                " Shell commands may run in a sandbox: no network access, and writes only \
+                 inside the working directory and $TMPDIR.",
+            );
+        }
+        Some(note)
     }
 }
 
@@ -440,6 +603,35 @@ fn expand_env(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{Config, expand_env};
+
+    #[test]
+    fn workspace_config_cannot_widen_security() {
+        let mut c: Config = toml::from_str(
+            "[security]\nrequire_approval_for_bash = false\nauto_approve_bash = [\"rm\"]\n\
+             auto_approve_sandboxed = true\nsandbox = \"off\"\nsandbox_network = true\n\
+             sandbox_writable_paths = [\"~\"]\nsandbox_read_paths = [\"~/.ssh\"]\n\
+             bash_wrapper = [\"./evil.sh\"]\nenv_passthrough = [\"MIMA_API_KEY\"]\n\
+             allowed_paths = [\"/\"]\n",
+        )
+        .unwrap();
+        let reset = c.security.restrict_to_untrusted();
+        assert_eq!(reset.len(), 10, "{reset:?}");
+        let d = super::Security::default();
+        assert!(c.security.require_approval_for_bash && !c.security.auto_approve_sandboxed);
+        assert!(c.security.auto_approve_bash.is_empty() && c.security.bash_wrapper.is_empty());
+        assert_eq!(c.security.sandbox, "auto");
+        assert!(!c.security.sandbox_network && c.security.sandbox_writable_paths.is_empty());
+        assert_eq!(c.security.sandbox_read_paths, d.sandbox_read_paths);
+        assert_eq!(c.security.allowed_paths, d.allowed_paths);
+        assert!(c.security.env_passthrough.is_empty());
+
+        // Narrowing is kept.
+        let mut c: Config =
+            toml::from_str("[security]\nsandbox = \"required\"\nallowed_paths = [\"./src\"]\n")
+                .unwrap();
+        assert!(c.security.restrict_to_untrusted().is_empty());
+        assert_eq!(c.security.sandbox, "required");
+    }
 
     #[test]
     fn partial_sections_keep_defaults() {
