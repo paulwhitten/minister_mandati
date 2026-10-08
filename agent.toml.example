@@ -4,13 +4,20 @@ type = "custom"
 # Expanded from the environment at load time; use any stub value for local vLLM/Ollama.
 api_key = "${MIMA_API_KEY}"
 # Point at the AGX Thor on the LAN (vLLM default port 8000), or a local Ollama, or a cloud API.
+# mima appends /chat/completions, so give the API root only, without query strings.
+# Azure OpenAI: "https://<resource>.openai.azure.com/openai/v1", with default_model
+# set to the deployment name (see docs/cloud-providers.md).
 base_url = "http://thor.local:8000/v1"
 default_model = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
 
 [agent]
+# A number, or "server" to send none (OpenAI reasoning models accept only their default).
 temperature = 0.2
 # Reply limit per request; also reserved out of the context window.
 max_tokens = 4096
+# Request field for max_tokens: "max_tokens" (vLLM, Ollama) or "max_completion_tokens"
+# (newer OpenAI and Azure OpenAI models, which reject "max_tokens").
+# max_tokens_param = "max_tokens"
 # "native" | "react" | "auto" (probe native, fall back to ReAct)
 tool_calling = "auto"
 stream = true

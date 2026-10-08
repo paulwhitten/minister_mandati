@@ -57,9 +57,16 @@ pub struct Provider {
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct Agent {
-    pub temperature: f32,
+    /// Sampling temperature, or `"server"` to leave it out of requests (some
+    /// OpenAI reasoning models reject any value but their default).
+    #[serde(deserialize_with = "temperature")]
+    pub temperature: Option<f32>,
     /// Reply limit per request; also reserved out of the context window.
     pub max_tokens: usize,
+    /// Request field that carries the reply limit: `"max_tokens"` (vLLM,
+    /// Ollama, llama.cpp) or `"max_completion_tokens"` (newer OpenAI and
+    /// Azure OpenAI models, which reject `max_tokens`; vLLM accepts both).
+    pub max_tokens_param: TokenParam,
     /// "native" | "react" | "auto"
     pub tool_calling: String,
     /// Stream tokens live over SSE when true. Override via `[agent].stream`.
@@ -211,8 +218,9 @@ pub struct Security {
 impl Default for Agent {
     fn default() -> Self {
         Self {
-            temperature: 0.2,
+            temperature: Some(0.2),
             max_tokens: 4096,
+            max_tokens_param: TokenParam::MaxTokens,
             tool_calling: "auto".to_string(),
             stream: true,
             top_p: None,
@@ -372,6 +380,43 @@ fn default_model() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+/// Name of the reply-limit field in chat completion requests.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenParam {
+    #[default]
+    MaxTokens,
+    MaxCompletionTokens,
+}
+
+impl TokenParam {
+    pub fn field(self) -> &'static str {
+        match self {
+            TokenParam::MaxTokens => "max_tokens",
+            TokenParam::MaxCompletionTokens => "max_completion_tokens",
+        }
+    }
+}
+
+/// `temperature`: a number, or `"server"` for the server's default (not sent).
+fn temperature<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Option<f32>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum T {
+        Number(f32),
+        Word(String),
+    }
+    match T::deserialize(d)? {
+        T::Number(t) => Ok(Some(t)),
+        T::Word(w) if w == "server" => Ok(None),
+        T::Word(w) => Err(serde::de::Error::custom(format!(
+            "temperature must be a number or \"server\", not \"{w}\""
+        ))),
+    }
 }
 
 fn default_loop_window() -> usize {
@@ -639,12 +684,31 @@ mod tests {
             "[agent]\ntemperature = 0.6\ntop_p = 0.95\n[security]\nrequire_approval_for_bash = false\n",
         )
         .unwrap();
-        assert_eq!(c.agent.temperature, 0.6);
+        assert_eq!(c.agent.temperature, Some(0.6));
         assert_eq!(c.agent.top_p, Some(0.95));
         assert_eq!(c.agent.tool_calling, "auto");
         assert_eq!(c.agent.max_tokens, 4096);
+        assert_eq!(c.agent.max_tokens_param, super::TokenParam::MaxTokens);
         assert!(!c.security.require_approval_for_bash);
         assert!(c.security.require_approval_for_writes);
+    }
+
+    #[test]
+    fn cloud_request_settings_parse() {
+        let c: Config = toml::from_str(
+            "[agent]\ntemperature = \"server\"\nmax_tokens_param = \"max_completion_tokens\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.agent.temperature, None);
+        assert_eq!(c.agent.max_tokens_param.field(), "max_completion_tokens");
+        // An integer temperature is a number too.
+        let c: Config = toml::from_str("[agent]\ntemperature = 1\n").unwrap();
+        assert_eq!(c.agent.temperature, Some(1.0));
+        // Typos fail at load time, not as an HTTP 400 mid-run.
+        let e = toml::from_str::<Config>("[agent]\nmax_tokens_param = \"max_token\"\n");
+        assert!(e.unwrap_err().to_string().contains("max_completion_tokens"));
+        let e = toml::from_str::<Config>("[agent]\ntemperature = \"default\"\n");
+        assert!(e.unwrap_err().to_string().contains("server"));
     }
 
     #[test]
