@@ -96,6 +96,9 @@ impl Error {
 /// absent in pure ReAct mode. Shared by completion and token counting so both
 /// describe the same request.
 fn request_tools(ctx: &AgentContext) -> Option<Value> {
+    if ctx.tools_disabled {
+        return None;
+    }
     let use_native = matches!(ctx.config.agent.tool_calling.as_str(), "native" | "auto");
     use_native.then(|| schema::to_openai_tools(&ctx.tool_specs))
 }
@@ -246,6 +249,10 @@ pub struct CompletionResponse {
     /// Why generation stopped ("stop", "tool_calls", "length" when the reply
     /// hit `max_tokens`), when the server says.
     pub finish_reason: Option<String>,
+    /// The model's reasoning text, when the server returns it separately
+    /// (vLLM `reasoning_content`, or `reasoning`). Recorded in transcripts;
+    /// not sent back to the model.
+    pub reasoning: Option<String>,
 }
 
 #[tracing::instrument(skip(ctx, on_delta), fields(model = %ctx.config.provider.default_model))]
@@ -263,7 +270,7 @@ pub async fn generate_completion(
         "model": cfg.provider.default_model,
         "messages": ctx.messages(),
         "temperature": cfg.agent.temperature,
-        "max_tokens": cfg.agent.max_tokens,
+        "max_tokens": ctx.reply_limit(),
         "stream": cfg.agent.stream,
     });
     if let Some(p) = cfg.agent.top_p {
@@ -393,6 +400,7 @@ async fn read_stream(
     let mut partials: Vec<PartialToolCall> = Vec::new();
     let mut usage = None;
     let mut finish_reason: Option<String> = None;
+    let mut reasoning = String::new();
     let mut buf: Vec<u8> = Vec::new();
 
     while let Some(chunk) = response.chunk().await.context(HttpSnafu)? {
@@ -429,6 +437,11 @@ async fn read_stream(
                 content.push_str(c);
                 on_delta(c);
             }
+            for key in ["reasoning_content", "reasoning"] {
+                if let Some(r) = delta.get(key).and_then(Value::as_str) {
+                    reasoning.push_str(r);
+                }
+            }
             if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
                 accumulate_tool_calls(tcs, &mut partials);
             }
@@ -454,6 +467,9 @@ async fn read_stream(
     }
     if let Some(f) = finish_reason {
         message["finish_reason"] = json!(f);
+    }
+    if !reasoning.is_empty() {
+        message["reasoning_content"] = json!(reasoning);
     }
     Ok((message, usage))
 }
@@ -524,6 +540,11 @@ fn build_response(message: &Value, usage: Option<TokenUsage>, cfg: &Config) -> C
             .get("finish_reason")
             .and_then(Value::as_str)
             .map(str::to_string),
+        reasoning: ["reasoning_content", "reasoning"]
+            .iter()
+            .find_map(|k| message.get(*k).and_then(Value::as_str))
+            .filter(|r| !r.is_empty())
+            .map(str::to_string),
     }
 }
 
@@ -559,6 +580,17 @@ mod tests {
             status: code,
             body: body.into(),
         }
+    }
+
+    #[test]
+    fn reasoning_is_captured_from_either_field() {
+        let cfg = Config::default();
+        let m = json!({ "role": "assistant", "content": "ok", "reasoning_content": "think" });
+        assert_eq!(build_response(&m, None, &cfg).reasoning.as_deref(), Some("think"));
+        let m = json!({ "role": "assistant", "content": "ok", "reasoning": "hmm" });
+        assert_eq!(build_response(&m, None, &cfg).reasoning.as_deref(), Some("hmm"));
+        let m = json!({ "role": "assistant", "content": "ok" });
+        assert_eq!(build_response(&m, None, &cfg).reasoning, None);
     }
 
     #[test]

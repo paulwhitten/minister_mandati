@@ -166,6 +166,15 @@ pub const NUDGE: &str = "A repeated identical action was detected that already s
 pub const CONTINUE: &str = "Your last reply was empty or was cut off before it finished. \
                             Do not repeat long reasoning: call a tool to make progress, or \
                             give your final answer briefly.";
+/// Sent a few steps before the step limit, so the model finishes instead of
+/// running out mid-investigation.
+pub const STEPS_LEFT: &str = "Only a few tool steps remain before the step limit. \
+                              Make your change now if you have not, verify it if you can, \
+                              and then reply with a short summary.";
+/// Sent at the step limit, with tools disabled, to get a final answer.
+pub const FINAL_SUMMARY: &str = "The step limit has been reached. Without calling any more \
+                                 tools, reply with a brief summary: what you changed, whether \
+                                 you verified it, and what remains to be done.";
 /// Longest tool-call argument text quoted in a placeholder.
 const PLACEHOLDER_ARGS_CHARS: usize = 200;
 
@@ -204,6 +213,9 @@ fn clip(s: &str, max: usize) -> &str {
 pub struct AgentContext {
     pub config: Config,
     pub tool_specs: Vec<ToolSpec>,
+    /// Send the next request without tools (the final summary at the step
+    /// limit asks for an answer, not more calls).
+    pub tools_disabled: bool,
     /// The current session and its (optional) transcript.
     pub session: Session,
     /// Server endpoint for exact token counts (vLLM `/tokenize`), when available.
@@ -228,7 +240,10 @@ pub struct AgentContext {
 
 impl AgentContext {
     pub fn new(config: Config, tool_specs: Vec<ToolSpec>) -> Self {
-        let system_prompt = config.system_prompt();
+        let mut system_prompt = config.system_prompt();
+        if let Some(note) = config.environment_note() {
+            system_prompt = format!("{system_prompt}\n\n{note}");
+        }
         tracing::debug!(%system_prompt, "composed system prompt");
         let window = config.context.window.unwrap_or(FALLBACK_WINDOW);
         let budget = Budget::new(window, &config);
@@ -253,6 +268,7 @@ impl AgentContext {
             chars_at_last_request: 0,
             masked_total: 0,
             evicted_total: 0,
+            tools_disabled: false,
         }
     }
 
@@ -280,6 +296,19 @@ impl AgentContext {
             masked_total: self.masked_total,
             evicted_total: self.evicted_total,
         }
+    }
+
+    /// `max_tokens` for the next request: the configured limit, but never more
+    /// than the room left in the window after the prompt (vLLM rejects a
+    /// request whose prompt plus max_tokens exceeds the window).
+    pub fn reply_limit(&self) -> usize {
+        const MIN_REPLY: usize = 256;
+        const SLACK: usize = 64;
+        let room = self
+            .budget
+            .window
+            .saturating_sub(self.estimated_tokens() + SLACK);
+        self.config.agent.max_tokens.min(room.max(MIN_REPLY))
     }
 
     /// Stage 0 limit: the largest tool output (in bytes) kept verbatim.
@@ -856,6 +885,17 @@ mod tests {
         AgentContext::new(config, Vec::new())
     }
 
+    #[test]
+    fn reply_limit_fits_the_window() {
+        let mut c = ctx();
+        // An empty conversation leaves room for the full configured limit.
+        assert_eq!(c.reply_limit(), 100);
+        c.config.agent.max_tokens = 10_000;
+        let limit = c.reply_limit();
+        assert!((256..4_000).contains(&limit), "{limit}");
+        assert!(limit + c.stats().tokens <= 4_000);
+    }
+
     fn call(id: &str) -> ToolCall {
         ToolCall {
             id: id.into(),
@@ -870,6 +910,7 @@ mod tests {
             tool_calls: Some(calls),
             usage: None,
             finish_reason: None,
+            reasoning: None,
         }
     }
 
@@ -1077,6 +1118,7 @@ mod tests {
             tool_calls: Some(vec![call("local-1")]),
             usage: None,
             finish_reason: None,
+            reasoning: None,
         };
         let m = Message::assistant_tool_calls(&r);
         assert_eq!(

@@ -19,6 +19,8 @@ use crate::tools::{ToolEnv, ToolRegistry, truncate_middle};
 /// Times per turn an empty or truncated reply is answered with a request to
 /// continue before it is accepted as the (empty) answer.
 const MAX_CONTINUES: usize = 2;
+/// Steps before the limit at which the model is told to finish.
+const STEPS_WARNING: usize = 3;
 /// Retries after the server rejects a prompt as too long (see docs/context.md).
 pub const MAX_OVERFLOW_RETRIES: u32 = 2;
 
@@ -27,7 +29,9 @@ pub const MAX_OVERFLOW_RETRIES: u32 = 2;
 pub enum TurnOutcome {
     Answered(String),
     LoopGuard,
-    StepCap,
+    /// The step limit was reached; the summary the model gave afterwards,
+    /// if any.
+    StepCap(Option<String>),
 }
 
 /// Sets the context window: `[context].window` if configured, else what the
@@ -127,7 +131,7 @@ pub fn record_outcome(ctx: &mut AgentContext, result: &Result<TurnOutcome, snafu
     match result {
         Ok(TurnOutcome::Answered(a)) => finish_turn(ctx, "answered", Some(a), None),
         Ok(TurnOutcome::LoopGuard) => finish_turn(ctx, "loop_guard", None, None),
-        Ok(TurnOutcome::StepCap) => finish_turn(ctx, "step_cap", None, None),
+        Ok(TurnOutcome::StepCap(summary)) => finish_turn(ctx, "step_cap", summary.as_deref(), None),
         Err(e) => finish_turn(ctx, "error", None, Some(e.to_string())),
     }
 }
@@ -189,7 +193,8 @@ pub async fn run_turn(
                                 "content": r.content, "tool_calls": calls, "usage": usage,
                                 "counted_prompt_tokens": counted.tokens,
                                 "count_source": counted.token_source,
-                                "finish_reason": r.finish_reason }),
+                                "finish_reason": r.finish_reason,
+                                "reasoning": r.reasoning }),
                     );
                     break (r, seq);
                 }
@@ -268,6 +273,9 @@ pub async fn run_turn(
         // of this step is in; results have to follow their request directly.
         let mut nudge: Option<Option<u64>> = None;
         for call in calls {
+            // Calls written for other agents' tools map onto mima's, before
+            // approval and loop checks see them.
+            let call = crate::tools::normalize_call(call);
             tracing::info!(tool = %call.name, args = %call.args, "tool requested");
             presenter.tool_requested(&call);
 
@@ -281,7 +289,7 @@ pub async fn run_turn(
                 record_approval(ctx, turn, &call.id, "skipped_duplicate", None);
                 skipped
             } else {
-                let needs = needs_approval(&ctx.config, &call);
+                let needs = needs_approval(&ctx.config, &call, registry.shell_sandboxed());
                 // Tools with a preview (edits, overwrites) validate first and
                 // show the operator exactly what will change.
                 let preview = if needs {
@@ -390,12 +398,64 @@ pub async fn run_turn(
         if let Some(seq) = nudge {
             ctx.add_message(Message::user(context::NUDGE).with_origin(seq));
         }
+        if max_steps > STEPS_WARNING * 2 && step + 1 == max_steps - STEPS_WARNING {
+            let seq = ctx.session.record(
+                "loop_guard",
+                json!({ "turn": turn, "action": "steps", "repeats": STEPS_WARNING, "tool": "" }),
+            );
+            ctx.add_message(Message::user(context::STEPS_LEFT).with_origin(seq));
+        }
     }
 
     tracing::warn!(max = max_steps, "reached step cap without completion");
     presenter.step_cap_reached(max_steps);
+    let summary = final_summary(ctx, presenter, turn).await;
     log_token_summary(ctx);
-    Ok(TurnOutcome::StepCap)
+    Ok(TurnOutcome::StepCap(summary))
+}
+
+/// At the step limit: one request without tools asking for a summary, so the
+/// turn ends with an answer. Errors and empty replies give `None`.
+async fn final_summary(
+    ctx: &mut AgentContext,
+    presenter: &mut dyn Presenter,
+    turn: u64,
+) -> Option<String> {
+    let seq = ctx.session.record(
+        "loop_guard",
+        json!({ "turn": turn, "action": "final", "repeats": 0, "tool": "" }),
+    );
+    ctx.add_message(Message::user(context::FINAL_SUMMARY).with_origin(seq));
+    prepare_request(ctx).await;
+    ctx.tools_disabled = true;
+    let started = Instant::now();
+    let result = client::generate_completion(ctx, &mut |d| presenter.stream_delta(d)).await;
+    ctx.tools_disabled = false;
+    presenter.stream_end();
+    let r = match result {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "no final summary at the step limit");
+            return None;
+        }
+    };
+    ctx.record_usage(r.usage);
+    let usage = r
+        .usage
+        .map(|u| json!({ "prompt": u.prompt_tokens, "completion": u.completion_tokens }));
+    ctx.session.record(
+        "model_response",
+        json!({ "turn": turn, "step": ctx.config.agent.max_steps, "duration_ms": started.elapsed().as_millis() as u64,
+                "content": r.content, "tool_calls": [], "usage": usage,
+                "finish_reason": r.finish_reason }),
+    );
+    let text = r.content.unwrap_or_default();
+    if text.trim().is_empty() {
+        return None;
+    }
+    presenter.final_answer(&text);
+    ctx.add_message(Message::assistant(&text));
+    Some(text)
 }
 
 /// For file tools, the file's path and content hash after the call, so a

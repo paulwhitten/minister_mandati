@@ -116,6 +116,15 @@ pub fn sandbox_prefix(dirs: &TrialDirs, enabled: bool) -> Vec<String> {
     args
 }
 
+/// Adds a read-only bind of `path` to a sandbox prefix, before the trial
+/// directory's bind (later mounts cover earlier ones). No-op without a sandbox.
+pub fn add_ro_bind(prefix: &mut Vec<String>, path: &Path) {
+    if let Some(i) = prefix.iter().rposition(|a| a == "--bind") {
+        let p = path.display().to_string();
+        prefix.splice(i..i, ["--ro-bind".to_string(), p.clone(), p]);
+    }
+}
+
 /// Directories covered by an empty tmpfs in the sandbox: user data and
 /// scratch space, plus the evaluation tree itself wherever it lives.
 fn hidden_dirs() -> Vec<PathBuf> {

@@ -33,6 +33,15 @@ rustyline = { version = "18.0.1", default-features = false }
 regex = "1.13.1"
 # setsid/killpg for shell commands (already a dependency of tokio).
 libc = "0.2"
+# Shell sandbox (docs/design/design-shell-sandboxing.md, Tier 1): pure Rust.
+landlock = "0.4"
+seccompiler = "0.5"
+
+# Integration tests that run the built binary (the repo's tests/ folder holds
+# development logs and is ignored).
+[[test]]
+name = "sandbox"
+path = "itests/sandbox.rs"
 
 # Small, auditable release binary. For a static build see "Building" in README.md.
 [profile.release]

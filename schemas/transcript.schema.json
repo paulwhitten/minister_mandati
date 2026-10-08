@@ -420,6 +420,14 @@
             "null"
           ]
         },
+        "reasoning": {
+          "default": null,
+          "description": "The model's separate reasoning text, when the server returned one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "step": {
           "format": "uint64",
           "minimum": 0,

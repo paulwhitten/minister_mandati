@@ -30,7 +30,20 @@ pub struct Budget {
 
 impl Budget {
     pub fn new(window: usize, cfg: &Config) -> Self {
-        let reserve = cfg.agent.max_tokens;
+        // The reply reserve may take at most half the window. Without this, a
+        // max_tokens close to the window leaves almost no room for context
+        // (an 8k window with max_tokens 8192 gave a budget of 1 token and
+        // every tool output was dropped at once). Requests then ask for less
+        // than max_tokens when the prompt is large (`reply_limit`).
+        let reserve = cfg.agent.max_tokens.min(window / 2);
+        if reserve < cfg.agent.max_tokens {
+            tracing::warn!(
+                window,
+                max_tokens = cfg.agent.max_tokens,
+                reserve,
+                "max_tokens is more than half the context window; reserving half the window for replies"
+            );
+        }
         let margin = 512.max(window * 3 / 100);
         let usable = window.saturating_sub(reserve + margin).max(1);
         let operating = cfg.context.budget.map_or(usable, |b| b.min(usable)).max(1);
@@ -157,6 +170,15 @@ mod tests {
         c.agent.max_tokens = max_tokens;
         c.context.budget = budget;
         c
+    }
+
+    #[test]
+    fn reply_reserve_is_at_most_half_the_window() {
+        // An 8k window with max_tokens 8192 used to leave a budget of 1.
+        let b = Budget::new(8_192, &cfg(8192, None));
+        assert_eq!(b.usable, 8_192 - 4_096 - 512);
+        let b = Budget::new(32_768, &cfg(8192, None));
+        assert_eq!(b.usable, 32_768 - 8_192 - 983);
     }
 
     #[test]

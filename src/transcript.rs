@@ -13,7 +13,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::context::{CONTINUE, Message, NOT_EXECUTED, NUDGE};
+use crate::context::{CONTINUE, FINAL_SUMMARY, Message, NOT_EXECUTED, NUDGE, STEPS_LEFT};
 use crate::tools::truncate_middle;
 
 /// Layout version of `context` records. Bump only for breaking changes
@@ -152,6 +152,9 @@ pub struct ModelResponse {
     /// "length" means the reply was cut off at `max_tokens`.
     #[serde(default)]
     pub finish_reason: Option<String>,
+    /// The model's separate reasoning text, when the server returned one.
+    #[serde(default)]
+    pub reasoning: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -659,6 +662,8 @@ fn from_context(t: &Transcript) -> Result<Rebuilt, String> {
             }
             Record::TurnEnd(r) => Message::assistant(r.answer.as_deref().unwrap_or_default()),
             Record::LoopGuard(g) if g.action == "continue" => Message::user(CONTINUE),
+            Record::LoopGuard(g) if g.action == "steps" => Message::user(STEPS_LEFT),
+            Record::LoopGuard(g) if g.action == "final" => Message::user(FINAL_SUMMARY),
             Record::LoopGuard(_) => Message::user(NUDGE),
             _ => return Err(format!("seq {s} is not a message record")),
         };
@@ -740,8 +745,13 @@ pub fn replay(t: &Transcript, default_cap: usize) -> Rebuilt {
                 messages.push(tool_message(r, cap).with_origin(Some(l.seq)));
             }
             Record::LoopGuard(g) if g.action == "nudge" => pending_nudge = Some(l.seq),
-            Record::LoopGuard(g) if g.action == "continue" => {
-                messages.push(Message::user(CONTINUE).with_origin(Some(l.seq)));
+            Record::LoopGuard(g) if matches!(g.action.as_str(), "continue" | "steps" | "final") => {
+                let text = match g.action.as_str() {
+                    "continue" => CONTINUE,
+                    "steps" => STEPS_LEFT,
+                    _ => FINAL_SUMMARY,
+                };
+                messages.push(Message::user(text).with_origin(Some(l.seq)));
             }
             Record::TurnEnd(r) => {
                 pending_nudge = None;
