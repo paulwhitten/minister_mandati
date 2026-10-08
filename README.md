@@ -258,7 +258,10 @@ MIMA_LOG_FORMAT=json cargo run -- "..." # structured JSON logs for auditing
   write only the workspace and their temp directory, and have no network.
   Keys and credentials in your home directory are unreadable to them.
   `sandbox = "required"` refuses to run commands without the sandbox;
-  `sandbox_network = true` and `sandbox_writable_paths` widen it. See
+  `sandbox_network = true` and `sandbox_writable_paths` widen it. The
+  sandbox needs Linux: on macOS and other systems it reports itself
+  unavailable, so with `auto` shell commands run unsandboxed (still behind
+  approval) and `required` refuses them. See
   [docs/design/design-shell-sandboxing.md](docs/design/design-shell-sandboxing.md).
 - `read_file`, `list_dir`, `find_files` and `search_files` are read-only and
   never prompt; the search tools skip `.git`, build and dependency
