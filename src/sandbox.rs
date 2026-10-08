@@ -60,7 +60,9 @@ impl Support {
     }
 
     pub fn describe(&self) -> String {
-        if self.usable() {
+        if !cfg!(target_os = "linux") {
+            "unavailable: Landlock and seccomp need Linux".into()
+        } else if self.usable() {
             format!("landlock abi={}, seccomp", self.landlock_abi)
         } else if self.landlock_abi < 1 {
             "unavailable: the kernel has no Landlock".into()
@@ -71,6 +73,16 @@ impl Support {
 }
 
 /// Probes the running kernel without changing anything.
+#[cfg(not(target_os = "linux"))]
+pub fn probe() -> Support {
+    Support {
+        landlock_abi: 0,
+        seccomp: false,
+    }
+}
+
+/// Probes the running kernel without changing anything.
+#[cfg(target_os = "linux")]
 pub fn probe() -> Support {
     // landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)
     // returns the ABI version.
@@ -144,6 +156,7 @@ fn parse_args(args: &[String]) -> Result<(Policy, Vec<String>), String> {
 
 /// Applies limits, Landlock and seccomp to the current (single-threaded)
 /// process.
+#[cfg(target_os = "linux")]
 pub fn apply(policy: &Policy) -> Result<(), String> {
     set_limits();
     apply_landlock(policy)?;
@@ -151,6 +164,12 @@ pub fn apply(policy: &Policy) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(not(target_os = "linux"))]
+pub fn apply(_policy: &Policy) -> Result<(), String> {
+    Err("the shell sandbox needs Linux (Landlock and seccomp)".into())
+}
+
+#[cfg(target_os = "linux")]
 fn set_limits() {
     // No core dumps (they could hold secrets read by the command); cap file
     // size and open files without raising anything already lower.
@@ -172,6 +191,7 @@ fn set_limits() {
     lower(libc::RLIMIT_NOFILE, 8192);
 }
 
+#[cfg(target_os = "linux")]
 fn apply_landlock(policy: &Policy) -> Result<(), String> {
     use landlock::{
         ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, Ruleset, RulesetAttr,
@@ -209,6 +229,7 @@ fn apply_landlock(policy: &Policy) -> Result<(), String> {
 }
 
 /// System calls denied with EPERM regardless of the policy.
+#[cfg(target_os = "linux")]
 fn always_denied() -> Vec<i64> {
     let mut v = vec![
         libc::SYS_io_uring_setup,
@@ -239,6 +260,7 @@ fn always_denied() -> Vec<i64> {
 }
 
 /// System calls denied when the network is off (besides non-Unix sockets).
+#[cfg(target_os = "linux")]
 fn network_denied() -> Vec<i64> {
     vec![
         libc::SYS_connect,
@@ -249,6 +271,7 @@ fn network_denied() -> Vec<i64> {
     ]
 }
 
+#[cfg(target_os = "linux")]
 fn target_arch() -> Result<seccompiler::TargetArch, String> {
     if cfg!(target_arch = "x86_64") {
         Ok(seccompiler::TargetArch::x86_64)
@@ -260,6 +283,7 @@ fn target_arch() -> Result<seccompiler::TargetArch, String> {
 }
 
 /// The seccomp program for `policy` (default allow, EPERM on a match).
+#[cfg(target_os = "linux")]
 pub fn seccomp_program(policy: &Policy) -> Result<seccompiler::BpfProgram, String> {
     use seccompiler::{
         SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter, SeccompRule,
@@ -318,6 +342,7 @@ pub fn seccomp_program(policy: &Policy) -> Result<seccompiler::BpfProgram, Strin
     filter.try_into().map_err(err)
 }
 
+#[cfg(target_os = "linux")]
 fn apply_seccomp(policy: &Policy) -> Result<(), String> {
     let program = seccomp_program(policy)?;
     seccompiler::apply_filter(&program).map_err(|e| format!("seccomp: {e}"))?;
@@ -326,7 +351,7 @@ fn apply_seccomp(policy: &Policy) -> Result<(), String> {
 
 /// On x86_64, system calls can also be made through the x32 ABI (numbers
 /// with bit 30 set), which the filter above does not match. Deny them all.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn deny_x32() -> Result<(), String> {
     use seccompiler::sock_filter;
     const BPF_LD_W_ABS: u16 = 0x20; // BPF_LD | BPF_W | BPF_ABS
@@ -348,7 +373,7 @@ fn deny_x32() -> Result<(), String> {
     seccompiler::apply_filter(&program).map_err(|e| format!("seccomp (x32): {e}"))
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(all(target_os = "linux", not(target_arch = "x86_64")))]
 fn deny_x32() -> Result<(), String> {
     Ok(())
 }
@@ -384,6 +409,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn seccomp_programs_build_for_both_network_settings() {
         for network in [false, true] {
             let p = Policy {

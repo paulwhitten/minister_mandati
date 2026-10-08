@@ -33,7 +33,10 @@ rustyline = { version = "18.0.1", default-features = false }
 regex = "1.13.1"
 # setsid/killpg for shell commands (already a dependency of tokio).
 libc = "0.2"
+
 # Shell sandbox (docs/design/design-shell-sandboxing.md, Tier 1): pure Rust.
+# Linux-only kernel features; on other platforms the sandbox reports unavailable.
+[target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
 seccompiler = "0.5"
 
