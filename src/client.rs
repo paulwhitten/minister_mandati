@@ -586,9 +586,15 @@ mod tests {
     fn reasoning_is_captured_from_either_field() {
         let cfg = Config::default();
         let m = json!({ "role": "assistant", "content": "ok", "reasoning_content": "think" });
-        assert_eq!(build_response(&m, None, &cfg).reasoning.as_deref(), Some("think"));
+        assert_eq!(
+            build_response(&m, None, &cfg).reasoning.as_deref(),
+            Some("think")
+        );
         let m = json!({ "role": "assistant", "content": "ok", "reasoning": "hmm" });
-        assert_eq!(build_response(&m, None, &cfg).reasoning.as_deref(), Some("hmm"));
+        assert_eq!(
+            build_response(&m, None, &cfg).reasoning.as_deref(),
+            Some("hmm")
+        );
         let m = json!({ "role": "assistant", "content": "ok" });
         assert_eq!(build_response(&m, None, &cfg).reasoning, None);
     }
