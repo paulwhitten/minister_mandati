@@ -300,15 +300,23 @@ impl AgentContext {
 
     /// `max_tokens` for the next request: the configured limit, but never more
     /// than the room left in the window after the prompt (vLLM rejects a
-    /// request whose prompt plus max_tokens exceeds the window).
+    /// request whose prompt plus max_tokens exceeds the window). The closing
+    /// summary request (tools disabled) is capped lower: a summary is short,
+    /// and a slow model reasoning up to `max_tokens` there took minutes.
     pub fn reply_limit(&self) -> usize {
         const MIN_REPLY: usize = 256;
         const SLACK: usize = 64;
+        const SUMMARY_REPLY: usize = 1024;
         let room = self
             .budget
             .window
             .saturating_sub(self.estimated_tokens() + SLACK);
-        self.config.agent.max_tokens.min(room.max(MIN_REPLY))
+        let limit = self.config.agent.max_tokens.min(room.max(MIN_REPLY));
+        if self.tools_disabled {
+            limit.min(SUMMARY_REPLY)
+        } else {
+            limit
+        }
     }
 
     /// Stage 0 limit: the largest tool output (in bytes) kept verbatim.
@@ -894,6 +902,8 @@ mod tests {
         let limit = c.reply_limit();
         assert!((256..4_000).contains(&limit), "{limit}");
         assert!(limit + c.stats().tokens <= 4_000);
+        c.tools_disabled = true;
+        assert_eq!(c.reply_limit(), limit.min(1024));
     }
 
     fn call(id: &str) -> ToolCall {
