@@ -115,7 +115,7 @@ pub fn profile_from_config(base: &toml::Table) -> Profile {
     }
 }
 
-fn expand_env(s: &str) -> String {
+pub fn expand_env(s: &str) -> String {
     let mut out = String::new();
     let mut rest = s;
     while let Some(i) = rest.find("${") {
@@ -144,6 +144,57 @@ fn merge(base: &mut toml::Table, over: &toml::Table) {
                 base.insert(k.clone(), v.clone());
             }
         }
+    }
+}
+
+/// Request settings the harness's own model requests (readiness, tool
+/// preflight, memorization probe) take from the profile's mima config, so
+/// they are accepted wherever mima's are: the reply-limit field name and
+/// whether temperature may be sent (see docs/cloud-providers.md).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RequestStyle {
+    /// "max_tokens" or "max_completion_tokens".
+    pub token_field: &'static str,
+    /// `[agent].temperature = "server"`: never send a temperature.
+    pub server_temperature: bool,
+}
+
+impl RequestStyle {
+    /// From the base config with the profile's `mima` table merged in.
+    pub fn of(base: &toml::Table, p: &Profile) -> Result<Self, String> {
+        let mut c = base.clone();
+        merge(&mut c, &p.mima);
+        let agent = |k: &str| c.get("agent").and_then(|a| a.get(k)).cloned();
+        let token_field = match agent("max_tokens_param").as_ref().map(|v| v.as_str()) {
+            None | Some(Some("max_tokens")) => "max_tokens",
+            Some(Some("max_completion_tokens")) => "max_completion_tokens",
+            Some(v) => {
+                return Err(format!(
+                    "profile {}: agent.max_tokens_param must be \"max_tokens\" or \"max_completion_tokens\", not {v:?}",
+                    p.name
+                ));
+            }
+        };
+        let server_temperature = agent("temperature").is_some_and(|v| v.as_str() == Some("server"));
+        Ok(Self {
+            token_field,
+            server_temperature,
+        })
+    }
+
+    /// A chat completion body with the reply limit under the right name.
+    pub fn body(&self, model: &str, max_tokens: u64, rest: Value) -> Value {
+        let mut b = json!({ "model": model });
+        b[self.token_field] = json!(max_tokens);
+        if let Value::Object(m) = rest {
+            for (k, v) in m {
+                if k == "temperature" && self.server_temperature {
+                    continue;
+                }
+                b[k] = v;
+            }
+        }
+        b
     }
 }
 
@@ -232,16 +283,16 @@ fn server_root(base_url: &str) -> String {
 /// Waits until the profile's server is healthy, lists the model, and
 /// answers a 1-token completion; then checks tool calling once. Returns a
 /// readiness record for run.json.
-async fn wait_ready(p: &Profile) -> Result<Value, String> {
+async fn wait_ready(p: &Profile, style: RequestStyle) -> Result<Value, String> {
     let key = p.api_key.as_deref().map(expand_env).unwrap_or_default();
     let client = http();
     let deadline = Instant::now() + Duration::from_secs(p.ready_timeout_sec);
     let base = p.base_url.trim_end_matches('/').to_string();
     let mut last_err;
     loop {
-        match probe(&client, &base, &key, p).await {
+        match probe(&client, &base, &key, p, style).await {
             Ok(window) => {
-                let tools = tool_smoke(&client, &base, &key, p).await;
+                let tools = tool_smoke(&client, &base, &key, p, style).await;
                 return Ok(
                     json!({ "ready_at": rfc3339_utc(std::time::SystemTime::now()),
                                   "max_model_len": window, "tool_calls": tools }),
@@ -265,6 +316,7 @@ async fn probe(
     base: &str,
     key: &str,
     p: &Profile,
+    style: RequestStyle,
 ) -> Result<Option<u64>, String> {
     let health = client
         .get(format!("{}/health", server_root(base)))
@@ -289,11 +341,15 @@ async fn probe(
         .and_then(|d| d.iter().find(|m| m["id"].as_str() == Some(&p.model)))
         .ok_or_else(|| format!("model {} not listed", p.model))?;
     let window = entry["max_model_len"].as_u64();
+    // 16 tokens, not 1: Azure OpenAI rejects a reply it cannot finish.
     let r = client
         .post(format!("{base}/chat/completions"))
         .bearer_auth(key)
-        .json(&json!({ "model": p.model, "max_tokens": 1,
-                       "messages": [{ "role": "user", "content": "Say OK." }] }))
+        .json(&style.body(
+            &p.model,
+            16,
+            json!({ "messages": [{ "role": "user", "content": "Say OK." }] }),
+        ))
         .send()
         .await
         .map_err(|e| e.to_string())?;
@@ -307,7 +363,13 @@ async fn probe(
 /// server returns a well-formed call with valid JSON arguments), then one
 /// round trip (call, tool result, final answer that uses the result).
 /// Serving layers can drop or mangle tool calls silently; this records it.
-async fn tool_smoke(client: &reqwest::Client, base: &str, key: &str, p: &Profile) -> Value {
+async fn tool_smoke(
+    client: &reqwest::Client,
+    base: &str,
+    key: &str,
+    p: &Profile,
+    style: RequestStyle,
+) -> Value {
     let tools = json!([{ "type": "function", "function": {
         "name": "read_file", "description": "Read a text file.",
         "parameters": { "type": "object", "properties": { "path": { "type": "string" } },
@@ -331,8 +393,7 @@ async fn tool_smoke(client: &reqwest::Client, base: &str, key: &str, p: &Profile
     let mut ok = 0;
     let mut first: Option<(Value, Value)> = None;
     for _ in 0..5 {
-        let body =
-            json!({ "model": p.model, "max_tokens": 2048, "tools": tools, "messages": [ask] });
+        let body = style.body(&p.model, 2048, json!({ "tools": tools, "messages": [ask] }));
         if let Some(v) = post(body).await
             && let Some(call) = valid_call(&v)
         {
@@ -349,10 +410,14 @@ async fn tool_smoke(client: &reqwest::Client, base: &str, key: &str, p: &Profile
         if assistant["content"].is_null() {
             assistant["content"] = json!("");
         }
-        let body = json!({ "model": p.model, "max_tokens": 2048, "tools": tools, "messages": [
-            ask, assistant,
-            { "role": "tool", "tool_call_id": call["id"], "content": "The code word is PERIWINKLE." }
-        ]});
+        let body = style.body(
+            &p.model,
+            2048,
+            json!({ "tools": tools, "messages": [
+                ask, assistant,
+                { "role": "tool", "tool_call_id": call["id"], "content": "The code word is PERIWINKLE." }
+            ]}),
+        );
         roundtrip = post(body).await.is_some_and(|v| {
             v["choices"][0]["message"]["content"]
                 .as_str()
@@ -725,6 +790,7 @@ pub fn run_suite(
 
     for p in profiles {
         eprintln!("== profile {} ({})", p.name, p.model);
+        let style = RequestStyle::of(&opts.base_config, p)?;
         if let Some(setup) = &p.setup {
             eprintln!("  setup: {setup}");
             let st = std::process::Command::new("sh")
@@ -735,7 +801,7 @@ pub fn run_suite(
                 return Err(format!("setup for profile {} failed", p.name));
             }
         }
-        let mut ready = rt.block_on(wait_ready(p))?;
+        let mut ready = rt.block_on(wait_ready(p, style))?;
         if let Some(cmd) = &p.fingerprint {
             let out = std::process::Command::new("sh").arg("-c").arg(cmd).output();
             let text = out
@@ -802,7 +868,7 @@ pub fn run_suite(
                             ready_timeout_sec: 180,
                             ..p.clone()
                         };
-                        if rt.block_on(wait_ready(&quick)).is_err()
+                        if rt.block_on(wait_ready(&quick, style)).is_err()
                             && let Some(cmd) = p.restart.as_ref().or(p.setup.as_ref())
                         {
                             eprintln!("  server still down; restarting: {cmd}");
@@ -821,7 +887,7 @@ pub fn run_suite(
                             }
                             write_meta(&meta);
                         }
-                        rt.block_on(wait_ready(p))?;
+                        rt.block_on(wait_ready(p, style))?;
                         continue;
                     }
                     break rec;
@@ -1106,6 +1172,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn request_style_follows_the_profile() {
+        let mut p = profile_from_config(&toml::Table::new());
+        let base = toml::Table::new();
+        let local = RequestStyle::of(&base, &p).unwrap();
+        let b = local.body("m", 16, json!({ "temperature": 0.0, "messages": [] }));
+        assert_eq!(b["max_tokens"], 16);
+        assert_eq!(b["temperature"], 0.0);
+
+        p.mima = toml::from_str(
+            "[agent]\nmax_tokens_param = \"max_completion_tokens\"\ntemperature = \"server\"",
+        )
+        .unwrap();
+        let cloud = RequestStyle::of(&base, &p).unwrap();
+        let b = cloud.body("m", 16, json!({ "temperature": 0.0, "messages": [] }));
+        assert_eq!(b["max_completion_tokens"], 16);
+        assert!(b.get("max_tokens").is_none() && b.get("temperature").is_none());
+
+        p.mima = toml::from_str("[agent]\nmax_tokens_param = \"max_token\"").unwrap();
+        assert!(RequestStyle::of(&base, &p).is_err());
+    }
+
+    #[test]
     fn merge_and_set_build_the_trial_config() {
         let mut base: toml::Table =
             toml::from_str("[agent]\ntemperature = 0.2\nmax_tokens = 4096").unwrap();
@@ -1155,12 +1243,16 @@ fn effective_settings(base: &toml::Table, p: &Profile) -> Value {
     };
     let or = |v: Value, d: Value| if v.is_null() { d } else { v };
     json!({
-        "temperature": or(num(get("agent", "temperature")), json!(0.2)),
+        "temperature": match get("agent", "temperature") {
+            Some(toml::Value::String(w)) => json!(w),
+            v => or(num(v), json!(0.2)),
+        },
         "top_p": num(get("agent", "top_p")),
         "top_k": num(get("agent", "top_k")),
         "min_p": num(get("agent", "min_p")),
         "extra_body": get("agent", "extra_body").and_then(|v| serde_json::to_value(v).ok()),
         "max_tokens": or(num(get("agent", "max_tokens")), json!(4096)),
+        "max_tokens_param": get("agent", "max_tokens_param").and_then(|v| v.as_str().map(String::from)).unwrap_or_else(|| "max_tokens".into()),
         "window": num(get("context", "window")),
         "tool_calling": get("agent", "tool_calling").and_then(|v| v.as_str().map(String::from)).unwrap_or_else(|| "auto".into()),
     })

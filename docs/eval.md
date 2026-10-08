@@ -202,8 +202,8 @@ mima = { agent = { temperature = 0.6, top_p = 0.95, max_tokens = 8192 } }
 
 Profiles run one after another, all trials of one model before switching,
 because switching a large model takes minutes. After `setup`, `mima-eval`
-waits until the server is healthy, lists the model, and answers a one-token
-completion. A tool-calling preflight then sends five requests that should
+waits until the server is healthy, lists the model, and answers a short
+(16-token) completion. A tool-calling preflight then sends five requests that should
 produce a `read_file` call with valid JSON arguments, and one round trip
 (call, result, answer that uses the result); both are recorded, because
 serving layers can drop or mangle tool calls without an error.
@@ -215,6 +215,25 @@ profile actually used, the served image and engine flags (`fingerprint`)
 are recorded in `run.json` and shown in the report, which flags window,
 `max_tokens` and tool-calling differences between models. Small differences
 between models run under different settings are not meaningful.
+
+**Cloud endpoints.** A profile can point at an OpenAI-compatible cloud API
+such as Azure OpenAI. Leave out `setup`, `restart`, `fingerprint` and
+`power`, give the key as `api_key = "${MIMA_API_KEY}"` (expanded at run
+time, never recorded), and set the request style in `mima`, which the
+harness's own readiness and tool-call requests also follow:
+
+```toml
+[profile.gpt54mini]
+base_url = "https://<resource>.openai.azure.com/openai/v1"
+model = "gpt-5.4-mini"                                   # the deployment name
+api_key = "${MIMA_API_KEY}"
+ready_timeout_sec = 120
+mima = { agent = { temperature = "server", max_tokens = 8192, max_tokens_param = "max_completion_tokens", extra_body = { reasoning_effort = "medium" } }, context = { window = 32768 } }
+```
+
+Cloud APIs do not report the context window, so set `context.window`; using
+the same window as the local models keeps the comparison about the model
+rather than the context size. See `docs/cloud-providers.md`.
 
 **Energy.** With `power`, the harness samples the device's power during each
 trial and reports mean power and energy per solved task. The reading is the

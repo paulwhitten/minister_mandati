@@ -269,10 +269,12 @@ pub async fn generate_completion(
     let mut body = json!({
         "model": cfg.provider.default_model,
         "messages": ctx.messages(),
-        "temperature": cfg.agent.temperature,
-        "max_tokens": ctx.reply_limit(),
         "stream": cfg.agent.stream,
     });
+    body[cfg.agent.max_tokens_param.field()] = json!(ctx.reply_limit());
+    if let Some(t) = cfg.agent.temperature {
+        body["temperature"] = json!(t);
+    }
     if let Some(p) = cfg.agent.top_p {
         body["top_p"] = json!(p);
     }

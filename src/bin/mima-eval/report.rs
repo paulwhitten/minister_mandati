@@ -511,7 +511,13 @@ fn settings_section(s: &mut String, meta: &Value, profiles: &[&str]) {
                         keep.push(format!("{w} {}", words.get(i + 1).unwrap_or(&"")));
                     }
                 }
-                keep.join(" ")
+                // A cloud endpoint's fingerprint has no image or engine
+                // flags; show its text (the served model) instead.
+                if keep.is_empty() {
+                    f.trim().to_string()
+                } else {
+                    keep.join(" ")
+                }
             })
             .filter(|f| !f.is_empty())
             .unwrap_or_else(|| "not recorded".into());

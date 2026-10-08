@@ -37,7 +37,14 @@ pub fn run(suite: &Suite, p: &Profile) -> Result<String, String> {
         .timeout(Duration::from_secs(600))
         .build()
         .map_err(|e| e.to_string())?;
-    let key = p.api_key.clone().unwrap_or_default();
+    // The probe has no base config: the profile's `mima` table decides.
+    let style = super::run::RequestStyle::of(&toml::Table::new(), p)?;
+    let key = p
+        .api_key
+        .as_deref()
+        .map(super::run::expand_env)
+        .or_else(|| std::env::var("MIMA_API_KEY").ok())
+        .unwrap_or_default();
     let base = p.base_url.trim_end_matches('/').to_string();
     let mut s = String::new();
     let _ = writeln!(
@@ -65,8 +72,11 @@ pub fn run(suite: &Suite, p: &Profile) -> Result<String, String> {
              first line, then the correct code in a code block.",
             task.instruction
         );
-        let body = json!({ "model": p.model, "max_tokens": 4096, "temperature": 0.0,
-                           "messages": [{ "role": "user", "content": prompt }] });
+        let body = style.body(
+            &p.model,
+            4096,
+            json!({ "temperature": 0.0, "messages": [{ "role": "user", "content": prompt }] }),
+        );
         let answer = rt.block_on(async {
             let r = client
                 .post(format!("{base}/chat/completions"))
