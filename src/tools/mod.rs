@@ -348,7 +348,7 @@ impl BashExecutor {
     }
 
     /// The executor configured by `[security]`, with the shell sandbox when
-    /// enabled (see `sandbox.rs`).
+    /// enabled (see `src/sandbox.rs`).
     pub fn from_config(sec: &crate::config::Security) -> Self {
         let mut bash = Self::new(
             Duration::from_secs(sec.bash_timeout_secs),
@@ -610,14 +610,14 @@ mod tests {
         assert!(bash.env.iter().all(|(k, _)| !k.starts_with("MIMA_")));
         let out = bash
             .execute(
-                &json!({ "command": "env | cut -d= -f1 | sort; test -d \"$TMPDIR\" && stat -c %a \"$TMPDIR\"" }),
+                &json!({ "command": "env | cut -d= -f1 | sort; test -d \"$TMPDIR\" && ls -ld \"$TMPDIR\" | cut -c1-10" }),
                 &env(),
             )
             .await
             .unwrap();
         assert!(out.contains("TMPDIR"), "{out}");
         assert!(
-            out.contains("\n700\n"),
+            out.contains("\ndrwx------\n"),
             "TMPDIR exists with mode 700: {out}"
         );
         assert!(!out.contains("MIMA_"), "{out}");

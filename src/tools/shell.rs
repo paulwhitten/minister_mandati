@@ -305,6 +305,7 @@ mod tests {
         assert!(!p.exists());
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn runs_in_a_new_session_without_a_terminal() {
         // /proc/<pid>/stat: field 6 is the session id, field 7 the controlling tty.
@@ -320,6 +321,24 @@ mod tests {
         let v: Vec<&str> = out.split_whitespace().collect();
         assert_eq!(v[0], v[2], "the shell leads its own session: {out}");
         assert_eq!(v[1], "0", "no controlling terminal: {out}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn runs_in_a_new_session_without_a_terminal() {
+        // No /proc on macOS: ps reports the process group and terminal ("??" = none).
+        let f = run(
+            &sh("ps -o pgid=,tty= -p $$; echo $$"),
+            &base_env(),
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap()
+        .expect("finished");
+        let out = String::from_utf8_lossy(&f.stdout);
+        let v: Vec<&str> = out.split_whitespace().collect();
+        assert_eq!(v[0], v[2], "the shell leads its own group: {out}");
+        assert_eq!(v[1], "??", "no controlling terminal: {out}");
     }
 
     #[tokio::test]
