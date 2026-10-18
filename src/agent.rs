@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use snafu::prelude::*;
 use std::time::Instant;
 
-use crate::approval::needs_approval;
+use crate::approval;
 use crate::budget;
 use crate::client;
 use crate::context::{self, AgentContext, Message};
@@ -37,10 +37,19 @@ pub enum TurnOutcome {
 /// Sets the context window: `[context].window` if configured, else what the
 /// server reports, else the fallback (with a warning, since it may be wrong).
 pub async fn configure_window(ctx: &mut AgentContext) {
+    // The model entry is kept for the audit record even when the window is
+    // configured.
+    ctx.server_model = client::discover_model(&ctx.config).await;
+    ctx.server_version = client::server_version(&ctx.config).await;
     if ctx.config.context.window.is_some() {
         return;
     }
-    match client::discover_context_window(&ctx.config).await {
+    let window = ctx
+        .server_model
+        .as_ref()
+        .and_then(|m| m["max_model_len"].as_u64())
+        .map(|w| w as usize);
+    match window {
         Some(w) => {
             tracing::info!(window = w, "context window discovered from server");
             ctx.set_window(w);
@@ -115,9 +124,11 @@ pub fn finish_turn(
 ) {
     let tokens = ledger_json(ctx);
     let turn = ctx.session.turn();
+    let workspace = ctx.turn_end_workspace.take();
     let seq = ctx.session.record(
         "turn_end",
-        json!({ "turn": turn, "outcome": outcome, "answer": answer, "error": error, "tokens": tokens }),
+        json!({ "turn": turn, "outcome": outcome, "answer": answer, "error": error,
+                "tokens": tokens, "workspace": workspace }),
     );
     if outcome == "answered" {
         ctx.set_answer_origin(seq);
@@ -144,12 +155,32 @@ pub async fn run_turn(
     presenter: &mut dyn Presenter,
     instruction: &str,
 ) -> Result<TurnOutcome, snafu::Whatever> {
+    let result = run_turn_inner(ctx, registry, presenter, instruction).await;
+    // The workspace as the turn leaves it, for `turn_end` (audit record).
+    if ctx.session.is_recording() {
+        ctx.turn_end_workspace = Some(crate::evidence::git_summary(registry.runner()).await);
+    }
+    result
+}
+
+async fn run_turn_inner(
+    ctx: &mut AgentContext,
+    registry: &ToolRegistry,
+    presenter: &mut dyn Presenter,
+    instruction: &str,
+) -> Result<TurnOutcome, snafu::Whatever> {
     tracing::info!(instruction = %instruction, "starting task");
     presenter.task_started(instruction);
+    audit_gate(ctx)?;
     let turn = ctx.session.next_turn();
+    let workspace = if ctx.session.is_recording() {
+        crate::evidence::git_summary(registry.runner()).await
+    } else {
+        Value::Null
+    };
     let origin = ctx.session.record(
         "turn_start",
-        json!({ "turn": turn, "instruction": instruction }),
+        json!({ "turn": turn, "instruction": instruction, "workspace": workspace }),
     );
     ctx.begin_turn(instruction, origin);
 
@@ -194,7 +225,10 @@ pub async fn run_turn(
                                 "counted_prompt_tokens": counted.tokens,
                                 "count_source": counted.token_source,
                                 "finish_reason": r.finish_reason,
-                                "reasoning": r.reasoning }),
+                                "reasoning": r.reasoning,
+                                "request_sha256": r.request_sha256,
+                                "response_id": r.response_id,
+                                "served_model": r.served_model }),
                     );
                     break (r, seq);
                 }
@@ -284,15 +318,30 @@ pub async fn run_turn(
             let policy = registry.dedupe_policy(&call.name);
 
             let started = Instant::now();
+            // Evidence (audit record): files changed by a shell command, and
+            // a file tool's target before the call.
+            let mut workspace_changes: Option<Value> = None;
+            let file_before = (ctx.session.is_recording()
+                && matches!(call.name.as_str(), "edit_file" | "write_file"))
+            .then(|| call.args.get("path").and_then(Value::as_str))
+            .flatten()
+            .map(|p| crate::evidence::content_hash(std::path::Path::new(p)).0);
             let output = if let Some(skipped) = guards.skip_result(&call.name, policy, fp) {
                 tracing::info!(tool = %call.name, "duplicate call skipped");
-                record_approval(ctx, turn, &call.id, "skipped_duplicate", None);
+                record_approval(
+                    ctx,
+                    turn,
+                    &call.id,
+                    "skipped_duplicate",
+                    None,
+                    json!({ "rule": "loop_guard.skip_duplicate" }),
+                );
                 skipped
             } else {
-                let needs = needs_approval(&ctx.config, &call, registry.shell_sandboxed());
+                let decided = approval::policy(&ctx.config, &call, registry.shell_sandboxed());
                 // Tools with a preview (edits, overwrites) validate first and
                 // show the operator exactly what will change.
-                let preview = if needs {
+                let preview = if decided.needs {
                     registry
                         .preview(&call.name, &call.args)
                         .await
@@ -303,16 +352,46 @@ pub async fn run_turn(
                 match preview {
                     // The call cannot succeed as given: nothing to approve.
                     Err(invalid) => {
-                        record_approval(ctx, turn, &call.id, "not_requested_invalid", None);
+                        record_approval(
+                            ctx,
+                            turn,
+                            &call.id,
+                            "not_requested_invalid",
+                            None,
+                            json!({ "rule": "approval.invalid_call" }),
+                        );
                         invalid
                     }
                     Ok(preview) => {
-                        let decision = if needs {
-                            let decision = presenter
+                        let (decision, fields) = if !decided.needs {
+                            let mut f = json!({ "rule": decided.rule });
+                            if let Some(m) = &decided.matched {
+                                f["matched"] = json!(m);
+                            }
+                            (decided.decision, f)
+                        } else if ctx.config.security.approve_all {
+                            // Evaluation harness: approved by flag, not by a person.
+                            ("auto_approved", json!({ "rule": "approval.approve_all" }))
+                        } else {
+                            let asked = Instant::now();
+                            let reply = presenter
                                 .request_approval(&call, preview.as_deref())
                                 .whatever_context("approval prompt failed")?;
-                            if decision == Approval::Deny {
-                                record_approval(ctx, turn, &call.id, "denied", preview.as_deref());
+                            let fields = json!({
+                                "actor": "operator",
+                                "answer": reply.answer,
+                                "shown_sha256": crate::audit::hex(&crate::audit::sha256(&[reply.shown.as_bytes()])),
+                                "wait_ms": asked.elapsed().as_millis() as u64,
+                            });
+                            if reply.decision == Approval::Deny {
+                                record_approval(
+                                    ctx,
+                                    turn,
+                                    &call.id,
+                                    "denied",
+                                    preview.as_deref(),
+                                    fields,
+                                );
                                 let denied = "Error: user denied permission for this action.";
                                 let seq = ctx.session.record(
                                     "tool_result",
@@ -326,19 +405,27 @@ pub async fn run_turn(
                                 );
                                 continue;
                             }
-                            "approved"
-                        } else if call.name == "execute_bash"
-                            && ctx.config.security.require_approval_for_bash
-                        {
-                            "auto_approved"
-                        } else {
-                            "not_required"
+                            ("approved", fields)
                         };
-                        record_approval(ctx, turn, &call.id, decision, preview.as_deref());
+                        record_approval(ctx, turn, &call.id, decision, preview.as_deref(), fields);
                         let env = ToolEnv {
                             output_budget: ctx.output_cap_bytes(),
                         };
-                        match registry.execute(&call.name, &call.args, &env).await {
+                        // Required mode: the approval is on disk before the action.
+                        audit_gate(ctx)?;
+                        let watch = if call.name == "execute_bash" && ctx.session.is_recording() {
+                            crate::evidence::marks(registry.runner()).await
+                        } else {
+                            None
+                        };
+                        let executed = registry.execute(&call.name, &call.args, &env).await;
+                        if let Some((_, before)) = watch
+                            && let Some((_, after)) =
+                                crate::evidence::marks(registry.runner()).await
+                        {
+                            workspace_changes = Some(crate::evidence::changes(&before, &after));
+                        }
+                        match executed {
                             Ok(out) => {
                                 guards.record_success(policy, fp, &out);
                                 out
@@ -361,8 +448,20 @@ pub async fn run_turn(
                     "duration_ms": started.elapsed().as_millis() as u64,
                     "failed": failed, "bytes": output.len(), "sent_bytes": sent.len(),
                     "output": stored, "cap_bytes": cap });
-            if !failed && let Some(file) = file_state(&call) {
+            if !failed && let Some(mut file) = file_state(&call) {
+                if let Some(before) = file_before {
+                    file["before_sha256"] = json!(before);
+                }
                 fields["file"] = file;
+            }
+            if let Some(changes) = workspace_changes {
+                fields["workspace_changes"] = changes;
+            }
+            if output.len() > ctx.config.session.max_output_bytes {
+                // The stored copy is cut; this identifies the original.
+                fields["output_full_sha256"] = json!(crate::audit::hex(&crate::audit::sha256(&[
+                    output.as_bytes()
+                ])));
             }
             let seq = ctx.session.record("tool_result", fields);
             presenter.tool_completed(&call.name, &sent);
@@ -447,7 +546,8 @@ async fn final_summary(
         "model_response",
         json!({ "turn": turn, "step": ctx.config.agent.max_steps, "duration_ms": started.elapsed().as_millis() as u64,
                 "content": r.content, "tool_calls": [], "usage": usage,
-                "finish_reason": r.finish_reason }),
+                "finish_reason": r.finish_reason, "request_sha256": r.request_sha256,
+                "response_id": r.response_id, "served_model": r.served_model }),
     );
     let text = r.content.unwrap_or_default();
     if text.trim().is_empty() {
@@ -467,20 +567,37 @@ fn file_state(call: &crate::tools::ToolCall) -> Option<Value> {
     let path = call.args.get("path")?.as_str()?;
     let bytes = std::fs::read(path).ok()?;
     let hash = crate::transcript::hex(crate::transcript::fnv1a64(&bytes));
-    Some(json!({ "path": path, "fnv1a64": hash }))
+    let sha = crate::audit::hex(&crate::audit::sha256(&[&bytes]));
+    Some(json!({ "path": path, "fnv1a64": hash, "after_sha256": sha }))
 }
 
+/// Required audit mode: stop before acting when the record could not be
+/// written (docs/design/design-audit-record.md).
+fn audit_gate(ctx: &AgentContext) -> Result<(), snafu::Whatever> {
+    if !ctx.session.audit_ok() {
+        snafu::whatever!(
+            "the audit record could not be written; stopping before the next action (required mode)"
+        );
+    }
+    Ok(())
+}
+
+/// Records an approval decision; `fields` adds the rule or the operator's
+/// answer (docs/design/design-audit-record.md).
 pub fn record_approval(
     ctx: &mut AgentContext,
     turn: u64,
     call_id: &str,
     decision: &str,
     preview: Option<&str>,
+    fields: Value,
 ) {
-    ctx.session.record(
-        "approval",
-        json!({ "turn": turn, "call_id": call_id, "decision": decision, "preview": preview }),
-    );
+    let mut record =
+        json!({ "turn": turn, "call_id": call_id, "decision": decision, "preview": preview });
+    if let (Some(r), Value::Object(f)) = (record.as_object_mut(), fields) {
+        r.extend(f);
+    }
+    ctx.session.record("approval", record);
 }
 
 /// Emits cumulative token accounting for the task via the observability layer.

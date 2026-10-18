@@ -30,6 +30,28 @@ pub struct Line {
     pub seq: u64,
     /// UTC, RFC 3339 with milliseconds.
     pub ts: String,
+    /// 16 random bytes (hex) for the salted content digests of the audit
+    /// chain (docs/design/design-audit-record.md).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub salt: Option<String>,
+    /// Chain hash: SHA-256 of the previous record's hash and this record's
+    /// disclosure form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
+    /// Content fields replaced by their digests in a shared copy.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub withheld: Vec<String>,
+    /// In a shared copy: the salts of the content fields it discloses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub salts: Option<serde_json::Map<String, Value>>,
+    /// Open enum: who or what caused the record: operator, model, rule,
+    /// tool, system.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    /// The deterministic rule that decided, when `actor` is `rule` (see the
+    /// rule table in docs/sessions.md).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
     #[serde(flatten)]
     pub record: Record,
 }
@@ -38,7 +60,7 @@ pub struct Line {
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Record {
-    SessionStart(SessionStart),
+    SessionStart(Box<SessionStart>),
     SessionResumed(SessionResumed),
     TurnStart(TurnStart),
     ModelResponse(ModelResponse),
@@ -51,6 +73,7 @@ pub enum Record {
     Context(ContextRecord),
     TranscriptDisabled(TranscriptDisabled),
     SessionEnd(SessionEnd),
+    ChainReset(ChainReset),
     /// A record type this mima does not know (written by a newer one).
     #[serde(other)]
     #[cfg_attr(test, schemars(skip))]
@@ -86,6 +109,35 @@ pub struct SessionStart {
     pub allowed_paths: Option<Vec<String>>,
     #[serde(default)]
     pub token_counting: Option<String>,
+    /// Audit chain rules in use ("v1"); absent before chaining.
+    #[serde(default)]
+    pub chain: Option<String>,
+    /// Recording resumed after a gap: `seq` of the `transcript_disabled`.
+    #[serde(default)]
+    pub gap_after_seq: Option<u64>,
+    /// Audit header (docs/design/design-audit-record.md); open objects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +147,11 @@ pub struct Approvals {
     pub writes: bool,
     #[serde(default)]
     pub auto_approve_bash: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_approve_sandboxed: Option<bool>,
+    /// `--approve-all` (evaluation harness) was on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approve_all: Option<bool>,
 }
 
 /// Written when a session is continued (`--resume`).
@@ -132,6 +189,9 @@ pub struct FileChange {
 pub struct TurnStart {
     pub turn: u64,
     pub instruction: String,
+    /// The workspace's git state (head, branch, status_sha256, dirty).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,6 +215,14 @@ pub struct ModelResponse {
     /// The model's separate reasoning text, when the server returned one.
     #[serde(default)]
     pub reasoning: Option<String>,
+    /// SHA-256 of the request body sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_id: Option<String>,
+    /// The model the server says produced the response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,6 +262,18 @@ pub struct ApprovalRecord {
     pub decision: String,
     #[serde(default)]
     pub preview: Option<String>,
+    /// The allowlist entry that matched (`approval.auto_approve_bash`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched: Option<String>,
+    /// How a person answered: yes, no, empty (Enter), eof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<String>,
+    /// SHA-256 of the exact text shown to the person.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shown_sha256: Option<String>,
+    /// Time the person took to answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,6 +297,13 @@ pub struct ToolResult {
     /// The file a read/edit/write left behind, to detect later changes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<FileState>,
+    /// Paths a shell command changed: `paths` [{path, status, before_sha256,
+    /// after_sha256}] and `truncated`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_changes: Option<Value>,
+    /// SHA-256 of the complete output when the stored copy was cut.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_full_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -226,6 +313,12 @@ pub struct FileState {
     pub path: String,
     /// FNV-1a 64 of the file's bytes, 16 hex digits.
     pub fnv1a64: String,
+    /// SHA-256 of the file before an edit or write (null: it did not exist).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_sha256: Option<String>,
+    /// SHA-256 of the file after the call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -271,6 +364,9 @@ pub struct TurnEnd {
     pub error: Option<String>,
     #[serde(default)]
     pub tokens: Option<Tokens>,
+    /// The workspace's git state when the turn ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -280,6 +376,16 @@ pub struct Tokens {
     pub prompt: u64,
     pub completion: u64,
     pub unreported_requests: u64,
+}
+
+/// The operator continued a transcript whose audit chain was broken
+/// (`--accept-chain-break`); `findings` are the verifier's failures.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+pub struct ChainReset {
+    pub reason: String,
+    #[serde(default)]
+    pub findings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -434,7 +540,7 @@ impl Transcript {
     /// The first `session_start` (the session's identity and settings).
     pub fn start(&self) -> Option<&SessionStart> {
         self.lines.iter().find_map(|l| match &l.record {
-            Record::SessionStart(s) => Some(s),
+            Record::SessionStart(s) => Some(s.as_ref()),
             _ => None,
         })
     }
@@ -443,7 +549,7 @@ impl Transcript {
     /// have been re-enabled) followed by any resumes.
     fn latest_start(&self) -> Option<&SessionStart> {
         self.lines.iter().rev().find_map(|l| match &l.record {
-            Record::SessionStart(s) => Some(s),
+            Record::SessionStart(s) => Some(s.as_ref()),
             _ => None,
         })
     }
@@ -492,7 +598,7 @@ pub fn list_sessions(dir: &Path) -> Vec<SessionSummary> {
         .unwrap_or_default();
     paths.sort();
     paths.reverse();
-    paths
+    let mut sessions: Vec<SessionSummary> = paths
         .into_iter()
         .filter_map(|path| {
             let t = Transcript::load(&path).ok()?;
@@ -526,7 +632,11 @@ pub fn list_sessions(dir: &Path) -> Vec<SessionSummary> {
                 path,
             })
         })
-        .collect()
+        .collect();
+    // File names have second precision and a random suffix; the recorded
+    // start (milliseconds) orders sessions begun in the same second.
+    sessions.sort_by(|a, b| b.started.cmp(&a.started));
+    sessions
 }
 
 /// Finds a transcript by id (a unique prefix is enough) or "last".

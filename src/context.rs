@@ -220,6 +220,12 @@ pub struct AgentContext {
     pub session: Session,
     /// Server endpoint for exact token counts (vLLM `/tokenize`), when available.
     pub token_counter: Option<String>,
+    /// The model's entry in the server's `/models` list, for the audit record.
+    pub server_model: Option<serde_json::Value>,
+    /// The server's version, when it reports one.
+    pub server_version: Option<String>,
+    /// The workspace's git state when the last turn ended, for `turn_end`.
+    pub turn_end_workspace: Option<serde_json::Value>,
     messages: Vec<Message>,
     /// Number of leading messages that are never evicted (system + first user turn).
     pinned: usize,
@@ -239,6 +245,11 @@ pub struct AgentContext {
 }
 
 impl AgentContext {
+    /// The system prompt as sent.
+    pub fn system_prompt_text(&self) -> &str {
+        self.messages[0].content.as_deref().unwrap_or("")
+    }
+
     pub fn new(config: Config, tool_specs: Vec<ToolSpec>) -> Self {
         let mut system_prompt = config.system_prompt();
         if let Some(note) = config.environment_note() {
@@ -257,6 +268,9 @@ impl AgentContext {
             tool_specs,
             session,
             token_counter: None,
+            server_model: None,
+            server_version: None,
+            turn_end_workspace: None,
             messages: vec![Message::system(&system_prompt)],
             pinned: 1,
             turn_start: None,
@@ -921,6 +935,9 @@ mod tests {
             usage: None,
             finish_reason: None,
             reasoning: None,
+            request_sha256: None,
+            response_id: None,
+            served_model: None,
         }
     }
 
@@ -1129,6 +1146,9 @@ mod tests {
             usage: None,
             finish_reason: None,
             reasoning: None,
+            request_sha256: None,
+            response_id: None,
+            served_model: None,
         };
         let m = Message::assistant_tool_calls(&r);
         assert_eq!(

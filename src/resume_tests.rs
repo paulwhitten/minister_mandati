@@ -100,7 +100,7 @@ async fn context_record_restores_exactly_what_the_model_saw() {
         .enable(json!({ "mode": "test", "cwd": d.display().to_string() }))
         .unwrap();
     let mut presenter = CliPresenter::default();
-    presenter.approve_all = true;
+    ctx.config.security.approve_all = true;
     for instruction in [
         "Read the files and fix line 7 of a.txt.",
         "What does line 7 say now?",
@@ -176,7 +176,7 @@ async fn resumed_session_continues_in_the_same_file() {
     let mut ctx = AgentContext::new(cfg, registry.specs());
     ctx.session.enable(json!({ "mode": "test" })).unwrap();
     let mut presenter = CliPresenter::default();
-    presenter.approve_all = true;
+    ctx.config.security.approve_all = true;
     let result = run_turn(&mut ctx, &registry, &mut presenter, "first question").await;
     record_outcome(&mut ctx, &result);
     let path = ctx.session.transcript_path().unwrap().to_path_buf();

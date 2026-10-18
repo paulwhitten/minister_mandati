@@ -62,3 +62,37 @@ allowed_paths = ["./"]
 # transcripts = false
 # transcript_dir = "~/.mima/transcripts"
 # max_output_bytes = 1048576  # per tool output stored in a transcript
+
+# Audit record (see docs/design/design-audit-record.md).
+#
+# Every recorded transcript is hash-chained: each record carries a hash of
+# itself and the record before it, and the last record's hash (the head) is
+# printed when the session ends.
+#
+# The session ledger is a separate file with one line per session start,
+# recording on/off change and session end: time, user, host, working
+# directory, whether recording was on, and at the end the record count and
+# head. It is written even when transcripts are off, so unrecorded sessions
+# are visible too. It holds no instructions, outputs or code. Check a
+# transcript against it with `mima --audit-verify <id|last|path>`.
+#
+# A workspace ./agent.toml cannot change this table (it can only turn
+# required mode on): mima takes [audit] from your own config file
+# (~/.config/minister_mandati/agent.toml) or defaults.
+[audit]
+# ledger = "~/.mima/ledger.jsonl"   # where the session ledger (and each head) is kept
+# record_host = true                # host name in the ledger and session header
+# required = false                  # true: recording always on; a record is on disk
+#                                   # before its action; a write failure stops mima.
+#                                   # Per run: --audit or MIMA_AUDIT=1. Refuses to
+#                                   # start if a sandbox path covers the transcript
+#                                   # or ledger directory.
+#
+# Example: keep the ledger apart from the transcripts, where the account that
+# runs mima can append but not rewrite it (for example another mount or a
+# directory owned by an audit account), so a rewritten transcript no longer
+# matches its recorded head:
+# ledger = "/srv/audit/mima/ledger.jsonl"
+#
+# Example: regulated use:
+# required = true

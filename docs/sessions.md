@@ -98,7 +98,9 @@ Every record carries a timestamp:
 
 JSON Lines: one JSON object per line, appended and flushed as each event
 happens, so a crash loses at most the event in progress. Every line has
-`ts`, `type`, and `seq` (a per-session counter, to detect gaps or reordering).
+`ts`, `type`, and `seq` (a per-session counter, to detect gaps or reordering),
+plus the audit chain fields `salt` and `hash` (see "Audit chain and session
+ledger" below; the example lines omit them).
 
 ```json
 {"seq":0,"ts":"2026-09-27T14:32:05.123Z","type":"session_start","schema":1,"session":"20260927T143205Z-cli_agent-3f9a","session_started":"2026-09-27T14:32:05.120Z","turns_before":0,"mima_version":"0.1.0","mode":"interactive","cwd":"/home/user/cli_agent/src","model":"nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4","base_url":"http://thor.local:8000/v1","window":32768,"budget":27689,"approvals":{"bash":true,"writes":true,"auto_approve_bash":["cargo test"]}}
@@ -115,11 +117,11 @@ happens, so a crash loses at most the event in progress. Every line has
 
 | `type` | Written when | Key fields |
 |---|---|---|
-| `session_start` | recording begins (at session start, or when enabled later) | `schema`, `session`, `session_started`, `turns_before`, `mima_version`, `mode`, `cwd`, `model`, `base_url`, `window`, `budget`, `approvals`, `allowed_paths`, `token_counting` (`tokenize` or `usage+estimate`) |
+| `session_start` | recording begins (at session start, or when enabled later) | `schema`, `session`, `session_started`, `turns_before`, `mima_version`, `mode`, `cwd`, `model`, `base_url`, `window`, `budget`, `approvals`, `allowed_paths`, `token_counting` (`tokenize` or `usage+estimate`), `chain` (audit chain rules, `v1`), `gap_after_seq` (when recording resumes after `/disable_transcript`: that record's `seq`) |
 | `turn_start` | an instruction arrives | `turn`, `instruction` |
 | `model_response` | a completion returns | `turn`, `step`, `duration_ms`, `content`, `tool_calls`, `usage` (server-reported), `counted_prompt_tokens` and `count_source` (the count before sending; see [context.md](context.md)) |
 | `model_error` | a completion fails | `turn`, `step`, `error`, `overflow` (bool), `retry` |
-| `approval` | before a tool runs | `call_id`, `decision`: `not_required`, `auto_approved`, `approved`, `denied`, `skipped_duplicate`, `not_requested_invalid` (the call could not succeed, so nothing was asked); `preview` (the diff shown, for edits and overwrites) |
+| `approval` | before a tool runs | `call_id`, `decision`: `not_required`, `auto_approved`, `approved`, `denied`, `skipped_duplicate`, `not_requested_invalid` (the call could not succeed, so nothing was asked); `preview` (the diff shown, for edits and overwrites); `actor`, and `rule` (with `matched`) or the operator's `answer`, `shown_sha256`, `wait_ms` (see Attribution) |
 | `tool_result` | a tool finishes | `call_id`, `tool`, `duration_ms`, `failed`, `bytes`, `sent_bytes` (after the stage 0 cap), `output` (full), `cap_bytes` (the cap in effect), `file` (`{path, fnv1a64}` after a read, edit or write) |
 | `compaction` | a context stage acts | `stage` (`normalize`, `mask`, `evict`), `reason`, `call_ids`, `messages_removed`, token estimates before and after |
 | `loop_guard` | a nudge or stop | `action`, `repeats`, `tool` |
@@ -127,6 +129,7 @@ happens, so a crash loses at most the event in progress. Every line has
 | `transcript_disabled` | `/disable_transcript` | `turns` |
 | `session_end` | session ends | `reason` (`exit`, `eof`, `new`, `resume`, `task_done`, `interrupted`, `fatal`), `turns`, `tokens`, `error` |
 | `context` | a turn ends, or compaction runs | what the model sees, by reference to earlier records (`entries`), with `context_schema` and a `check`; see [design/session-resume.md](design/session-resume.md) |
+| `chain_reset` | `--resume --accept-chain-break` in required mode | `reason`, `findings` (the verifier's failures) |
 | `session_resumed` | `--resume` or `/resume` | `method` (`context` or `replay`), `reason`, `from_seq`, `mima_version`, `model`, `cwd`, `changed_files` |
 
 The format is defined by `schemas/transcript.schema.json` (JSON Schema
@@ -146,6 +149,139 @@ writes against it, and compares it with the last released schema.
   from filling the disk.
 - Final answers in full. Streamed chunks are not recorded individually.
 - Never the API key. `base_url` is recorded; the key is not.
+
+## Audit chain and session ledger
+
+Design: [design/design-audit-record.md](design/design-audit-record.md).
+Implemented in `src/audit.rs`.
+
+**Chain.** Each record carries `salt` (16 random bytes, hex) and `hash`:
+
+```
+hash = SHA-256( previous record's hash || canonical(disclosure form) )
+```
+
+The disclosure form is the record without `hash`, `salt`, `salts` and
+`withheld`, with each content field replaced by `"c:" + hex(SHA-256(field
+salt || 0x00 || canonical(value)))`, where the field salt is `SHA-256(salt ||
+path)`. Content fields: `turn_start.instruction`, `model_response.content`,
+`.reasoning` and `.tool_calls/*/args`, `approval.preview`,
+`tool_result.output` and `.output_full_sha256`, `turn_end.answer`,
+`context.entries/*/text`. Canonical encoding: keys sorted, no whitespace,
+minimal escaping, integers as written, floats in shortest round-trip form.
+
+**Sharing.** `mima --audit-export <id> --withhold <set> [--output FILE]`
+writes a copy in which the chosen content fields hold their digests (listed
+in `withheld`), disclosed content fields carry their own field salt (in
+`salts`), and record salts are gone, so withheld values cannot be guessed.
+Sets: `code` (all content, the default), `outputs` (tool outputs and
+diffs), or field names such as `turn_start.instruction`. The copy verifies
+with the same hashes and finds its heads in the ledger by session id.
+Disclosing one more value later is another export that withholds less.
+
+When the line before a record has no hash (a transcript written before
+chaining, or a partial line left by a crash), the chain continues from the
+SHA-256 of all bytes before the record. The last record's `hash` is the
+transcript's **head**; `mima` prints it when the session ends.
+
+**Attribution.** Every record has `actor`: `operator` (an instruction,
+`/disable_transcript`, an approval answer), `model` (a completion), `rule`
+(a decision by mima's deterministic code), `tool` (a tool's result) or
+`system` (session lifecycle, turn ends, context records, model errors).
+Records decided by a rule also name it in `rule`:
+
+| Rule | Decides |
+|---|---|
+| `approval.read_only` | a read-only tool runs without approval |
+| `approval.bash_not_required` | `require_approval_for_bash = false` |
+| `approval.writes_not_required` | `require_approval_for_writes = false` |
+| `approval.auto_approve_sandboxed` | a sandboxed shell command, with `auto_approve_sandboxed` |
+| `approval.auto_approve_bash` | an allowlist match; the entry is in `matched` |
+| `approval.approve_all` | `--approve-all` (evaluation harness), not a person |
+| `approval.invalid_call` | the call could not succeed, so nobody was asked |
+| `loop_guard.skip_duplicate` | an identical, already successful write is skipped |
+| `loop_guard.nudge` | repeated identical actions: a nudge is added |
+| `loop_guard.terminate` | repeated identical actions: the turn stops |
+| `loop_guard.continue` | an empty or cut-off reply: the model is asked to continue |
+| `loop_guard.steps_left` | the step limit is near: the model is told |
+| `context.normalize` | tool calls and results re-paired |
+| `context.mask` | old tool outputs replaced by placeholders |
+| `context.evict` | old steps removed |
+| `session.step_cap_summary` | at the step limit, a final summary is requested |
+
+**Header and evidence.** `session_start` records `build` (version, commit,
+whether the tree had uncommitted changes, profile, target, compiler),
+`binary_sha256`, `config` (source file, its SHA-256, whether it was the
+workspace's, ignored settings, the names of `MIMA_*` variables set, and the
+effective configuration without the API key), `system_prompt` (`text` and
+`sha256`), `tools` (`names`, `sha256` of the specifications sent),
+`sampling`, `server` (the model's `/models` entry, the server version),
+`sandbox`, `operator` (`user`, `uid`, `host`, `tty`), `workspace` (`root`,
+`git`: `head`, `branch`, `status_sha256`, `dirty`) and `os`. `turn_start` and
+`turn_end` carry `workspace` (the git summary). `model_response` carries
+`request_sha256` (the exact request body), `response_id` and
+`served_model`. File tools' `file` adds `before_sha256` (null: the file did
+not exist) and `after_sha256`. A shell command in a git workspace adds
+`workspace_changes.paths`: each path whose status or content changed, with
+`status` (`committed` when it returned to the committed version),
+`before_sha256` (null: as committed) and `after_sha256`; at most 1000 paths
+(`truncated`). git runs with the shell's sandbox and environment, with
+fsmonitor, the untracked cache, optional locks, system config and
+submodules off. A stored output cut at `max_output_bytes` adds
+`output_full_sha256`.
+
+An approval answered by a person has `actor: "operator"`, `answer` (`yes`,
+`no`, `empty` for Enter, `eof` for no input; the last two deny),
+`shown_sha256` (SHA-256 of the exact text displayed) and `wait_ms`.
+
+**Session ledger.** `~/.mima/ledger.jsonl` (`[audit].ledger`, mode 0600,
+appended under a lock, synced) gets one chained record per event, for every
+session whether or not it is recorded:
+
+| `type` | Fields |
+|---|---|
+| `session_start` | `session`, `mima_version`, `mode`, `resumed`, `cwd`, `recording` (`on`/`off`), `transcript` (absolute path or null), `user`, `uid`, `host` (unless `record_host = false`) |
+| `recording_changed` | `session`, `recording`, `turn`, `transcript` |
+| `session_end` | `session`, `reason`, `turns`, `records`, `head`, `transcript` |
+
+A workspace `./agent.toml` cannot change `[audit]` (it can only turn
+`required` on); it comes from the user's own config file or the defaults. A
+ledger write failure is reported once and, outside required mode, does not
+stop the session.
+
+**Required mode** (`--audit`, `MIMA_AUDIT=1`, `[audit].required = true`):
+the transcript is always on (mima refuses to start if it cannot be opened);
+each record is synced to disk before returning, so an approval is on disk
+before its tool runs; a transcript or ledger write failure stops mima
+before its next action (one-shot: exit status 1; REPL: the session ends).
+mima refuses to start when a sandbox path (`allowed_paths`,
+`sandbox_read_paths`, `sandbox_writable_paths`) covers the transcript or
+ledger directory, and warns when shell commands are not sandboxed at all.
+`--resume` continues only an intact chain; `--accept-chain-break` continues
+anyway and writes a `chain_reset` record (`actor: "operator"`, `reason`,
+`findings`). Turning recording off is allowed in every mode and recorded.
+
+**Verifying.** `mima --audit-verify <id|last|path> [--head HEAD]` checks,
+offline, with exit status 1 if any check fails:
+
+| Check | Fails or warns when |
+|---|---|
+| `lines` | a line is not JSON or the last line is incomplete (fail) |
+| `chain` | a hash does not recompute, or a record after chaining began has none (fail); records written before chaining (warn) |
+| `order` | `seq` does not increase by one (fail) |
+| `header` | a `session_start` lacks the audit header (warn) |
+| `files` | a file's state before a change differs from the state last recorded, during a turn or between turns (warn) |
+| `approvals` | a tool result has no approval, or a denied call ran (fail); an approved call has no result in a completed turn (warn) |
+| `attribute` | records without an actor, or unknown rule ids (warn) |
+| `gaps` | recording was turned off: each unrecorded interval, with its turns (warn) |
+| `complete` | no `session_end` at the end (warn) |
+| `ledger` | the ledger's own chain is broken (fail) |
+| `anchor` | a head the ledger recorded for this transcript is not in it (fail); records after the last recorded head (warn) |
+| `head` | the head given with `--head` is not in the transcript (fail) or is not its last record (warn) |
+
+`mima-eval` runs these checks on every trial transcript (against the
+trial's own ledger), keeps the failures in `metrics.audit_failures`, and
+reports the count per model.
 
 ## Privacy and security
 

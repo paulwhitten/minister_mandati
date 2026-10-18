@@ -2,6 +2,13 @@
   "$defs": {
     "ApprovalRecord": {
       "properties": {
+        "answer": {
+          "description": "How a person answered: yes, no, empty (Enter), eof.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "call_id": {
           "type": "string"
         },
@@ -9,8 +16,22 @@
           "description": "Open enum: not_required, auto_approved, approved, denied,\nskipped_duplicate, not_requested_invalid.",
           "type": "string"
         },
+        "matched": {
+          "description": "The allowlist entry that matched (`approval.auto_approve_bash`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "preview": {
           "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "shown_sha256": {
+          "description": "SHA-256 of the exact text shown to the person.",
           "type": [
             "string",
             "null"
@@ -20,6 +41,15 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "wait_ms": {
+          "description": "Time the person took to answer.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       },
       "required": [
@@ -31,12 +61,25 @@
     },
     "Approvals": {
       "properties": {
+        "approve_all": {
+          "description": "`--approve-all` (evaluation harness) was on.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "auto_approve_bash": {
           "default": [],
           "items": {
             "type": "string"
           },
           "type": "array"
+        },
+        "auto_approve_sandboxed": {
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "bash": {
           "type": "boolean"
@@ -67,6 +110,25 @@
         "id",
         "name",
         "args"
+      ],
+      "type": "object"
+    },
+    "ChainReset": {
+      "description": "The operator continued a transcript whose audit chain was broken\n(`--accept-chain-break`); `findings` are the verifier's failures.",
+      "properties": {
+        "findings": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason"
       ],
       "type": "object"
     },
@@ -303,6 +365,20 @@
     },
     "FileState": {
       "properties": {
+        "after_sha256": {
+          "description": "SHA-256 of the file after the call.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "before_sha256": {
+          "description": "SHA-256 of the file before an edit or write (null: it did not exist).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "fnv1a64": {
           "description": "FNV-1a 64 of the file's bytes, 16 hex digits.",
           "type": "string"
@@ -423,6 +499,26 @@
         "reasoning": {
           "default": null,
           "description": "The model's separate reasoning text, when the server returned one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "request_sha256": {
+          "description": "SHA-256 of the request body sent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "response_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "served_model": {
+          "description": "The model the server says produced the response.",
           "type": [
             "string",
             "null"
@@ -587,6 +683,12 @@
             "null"
           ]
         },
+        "binary_sha256": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "budget": {
           "default": null,
           "format": "uint64",
@@ -596,10 +698,32 @@
             "null"
           ]
         },
+        "build": {
+          "description": "Audit header (docs/design/design-audit-record.md); open objects."
+        },
+        "chain": {
+          "default": null,
+          "description": "Audit chain rules in use (\"v1\"); absent before chaining.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "config": true,
         "cwd": {
           "default": null,
           "type": [
             "string",
+            "null"
+          ]
+        },
+        "gap_after_seq": {
+          "default": null,
+          "description": "Recording resumed after a gap: `seq` of the `transcript_disabled`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
             "null"
           ]
         },
@@ -624,18 +748,24 @@
             "null"
           ]
         },
+        "operator": true,
+        "os": true,
+        "sampling": true,
+        "sandbox": true,
         "schema": {
           "description": "Transcript major version (see `session::SCHEMA`).",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
         },
+        "server": true,
         "session": {
           "type": "string"
         },
         "session_started": {
           "type": "string"
         },
+        "system_prompt": true,
         "token_counting": {
           "default": null,
           "type": [
@@ -643,6 +773,7 @@
             "null"
           ]
         },
+        "tools": true,
         "turns_before": {
           "default": 0,
           "format": "uint64",
@@ -657,7 +788,8 @@
             "integer",
             "null"
           ]
-        }
+        },
+        "workspace": true
       },
       "required": [
         "schema",
@@ -746,6 +878,13 @@
           "description": "Full output (cut at `[session].max_output_bytes`).",
           "type": "string"
         },
+        "output_full_sha256": {
+          "description": "SHA-256 of the complete output when the stored copy was cut.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "sent_bytes": {
           "format": "uint64",
           "minimum": 0,
@@ -758,6 +897,9 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "workspace_changes": {
+          "description": "Paths a shell command changed: `paths` [{path, status, before_sha256,\nafter_sha256}] and `truncated`."
         }
       },
       "required": [
@@ -818,6 +960,9 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "workspace": {
+          "description": "The workspace's git state when the turn ended."
         }
       },
       "required": [
@@ -835,6 +980,9 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "workspace": {
+          "description": "The workspace's git state (head, branch, status_sha256, dirty)."
         }
       },
       "required": [
@@ -1045,9 +1193,58 @@
         "type"
       ],
       "type": "object"
+    },
+    {
+      "$ref": "#/$defs/ChainReset",
+      "properties": {
+        "type": {
+          "const": "chain_reset",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
     }
   ],
   "properties": {
+    "actor": {
+      "description": "Open enum: who or what caused the record: operator, model, rule,\ntool, system.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "hash": {
+      "description": "Chain hash: SHA-256 of the previous record's hash and this record's\ndisclosure form.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "rule": {
+      "description": "The deterministic rule that decided, when `actor` is `rule` (see the\nrule table in docs/sessions.md).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "salt": {
+      "description": "16 random bytes (hex) for the salted content digests of the audit\nchain (docs/design/design-audit-record.md).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "salts": {
+      "additionalProperties": true,
+      "description": "In a shared copy: the salts of the content fields it discloses.",
+      "type": [
+        "object",
+        "null"
+      ]
+    },
     "seq": {
       "format": "uint64",
       "minimum": 0,
@@ -1056,6 +1253,13 @@
     "ts": {
       "description": "UTC, RFC 3339 with milliseconds.",
       "type": "string"
+    },
+    "withheld": {
+      "description": "Content fields replaced by their digests in a shared copy.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
     }
   },
   "required": [

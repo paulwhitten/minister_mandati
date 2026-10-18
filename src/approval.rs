@@ -11,48 +11,100 @@ const SHELL_METACHARS: &[char] = &[
     ';', '&', '|', '`', '$', '(', ')', '<', '>', '\n', '\r', '\\',
 ];
 
-/// Core policy: whether a tool call is state-changing and must be approved.
-/// `sandboxed` says whether shell commands run inside the Tier 1 sandbox:
-/// automatic approval (the allowlist, or `auto_approve_sandboxed`) applies
-/// only then, because an allowlist alone is easy to get around.
-pub fn needs_approval(cfg: &Config, call: &ToolCall, sandboxed: bool) -> bool {
+/// How the approval policy treats one tool call. `needs` means a person must
+/// decide; otherwise `decision` and `rule` say what decided and how, for the
+/// audit record (docs/design/design-audit-record.md).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Policy {
+    pub needs: bool,
+    pub decision: &'static str,
+    pub rule: Option<&'static str>,
+    /// The allowlist entry that matched, for `approval.auto_approve_bash`.
+    pub matched: Option<String>,
+}
+
+impl Policy {
+    fn ask() -> Self {
+        Self {
+            needs: true,
+            decision: "",
+            rule: None,
+            matched: None,
+        }
+    }
+
+    fn rule(decision: &'static str, rule: &'static str) -> Self {
+        Self {
+            needs: false,
+            decision,
+            rule: Some(rule),
+            matched: None,
+        }
+    }
+}
+
+/// Core policy: whether a tool call is state-changing and must be approved,
+/// and if not, which rule lets it through. `sandboxed` says whether shell
+/// commands run inside the Tier 1 sandbox: automatic approval (the
+/// allowlist, or `auto_approve_sandboxed`) applies only then, because an
+/// allowlist alone is easy to get around.
+pub fn policy(cfg: &Config, call: &ToolCall, sandboxed: bool) -> Policy {
     match call.name.as_str() {
         "execute_bash" => {
             if !cfg.security.require_approval_for_bash {
-                return false;
+                return Policy::rule("not_required", "approval.bash_not_required");
             }
             if !sandboxed {
-                return true;
+                return Policy::ask();
             }
             let cmd = call.args["command"].as_str().unwrap_or("");
             if cfg.security.auto_approve_sandboxed {
                 tracing::info!(command = %cmd, "sandboxed bash command auto-approved");
-                return false;
+                return Policy::rule("auto_approved", "approval.auto_approve_sandboxed");
             }
-            if bash_auto_approved(cmd, &cfg.security.auto_approve_bash) {
+            if let Some(entry) = bash_allowlist_match(cmd, &cfg.security.auto_approve_bash) {
                 tracing::info!(command = %cmd, "bash command auto-approved by allowlist");
-                return false;
+                return Policy {
+                    matched: Some(entry.to_string()),
+                    ..Policy::rule("auto_approved", "approval.auto_approve_bash")
+                };
             }
-            true
+            Policy::ask()
         }
-        "write_file" | "edit_file" => cfg.security.require_approval_for_writes,
-        _ => false, // read-only tools never prompt
+        "write_file" | "edit_file" if cfg.security.require_approval_for_writes => Policy::ask(),
+        "write_file" | "edit_file" => Policy::rule("not_required", "approval.writes_not_required"),
+        _ => Policy::rule("not_required", "approval.read_only"), // read-only tools never prompt
     }
+}
+
+/// Whether a tool call must be approved by a person.
+#[cfg(test)]
+pub fn needs_approval(cfg: &Config, call: &ToolCall, sandboxed: bool) -> bool {
+    policy(cfg, call, sandboxed).needs
 }
 
 /// True when `cmd` is a plain command (no shell metacharacters) whose leading
 /// words equal one of the `allowed` entries. Matching is whole-word, so
 /// `git status` matches `git status --short` but not `git statusx`. Empty
 /// entries are ignored rather than matching everything.
+#[cfg(test)]
 pub fn bash_auto_approved(cmd: &str, allowed: &[String]) -> bool {
+    bash_allowlist_match(cmd, allowed).is_some()
+}
+
+/// The allowlist entry `cmd` matches, under the rules of `bash_auto_approved`.
+pub fn bash_allowlist_match<'a>(cmd: &str, allowed: &'a [String]) -> Option<&'a str> {
     if cmd.contains(SHELL_METACHARS) {
-        return false;
+        return None;
     }
     let words: Vec<&str> = cmd.split_whitespace().collect();
-    allowed.iter().any(|entry| {
-        let prefix: Vec<&str> = entry.split_whitespace().collect();
-        !prefix.is_empty() && words.starts_with(&prefix)
-    })
+    allowed
+        .iter()
+        .find(|entry| {
+            let prefix: Vec<&str> = entry.split_whitespace().collect();
+            !prefix.is_empty() && words.starts_with(&prefix)
+        })
+        .map(String::as_str)
 }
 
 #[cfg(test)]
@@ -121,6 +173,57 @@ mod tests {
         cfg.security.require_approval_for_bash = false;
         assert!(!needs_approval(&cfg, &bash("cargo build"), true));
         assert!(!needs_approval(&cfg, &bash("cargo build"), false));
+    }
+
+    #[test]
+    fn policy_names_the_rule_that_decided() {
+        let mut cfg = Config::default();
+        cfg.security.auto_approve_bash = list(&["git status", "cargo test"]);
+        let read = ToolCall {
+            id: "1".into(),
+            name: "read_file".into(),
+            args: json!({ "path": "a" }),
+        };
+        assert_eq!(policy(&cfg, &read, true).rule, Some("approval.read_only"));
+        let p = policy(&cfg, &bash("cargo test --release"), true);
+        assert_eq!(
+            (p.needs, p.decision, p.rule, p.matched.as_deref()),
+            (
+                false,
+                "auto_approved",
+                Some("approval.auto_approve_bash"),
+                Some("cargo test")
+            )
+        );
+        let p = policy(&cfg, &bash("cargo build"), true);
+        assert!(p.needs && p.rule.is_none());
+        cfg.security.auto_approve_sandboxed = true;
+        assert_eq!(
+            policy(&cfg, &bash("cargo build"), true).rule,
+            Some("approval.auto_approve_sandboxed")
+        );
+        cfg.security.require_approval_for_bash = false;
+        assert_eq!(
+            policy(&cfg, &bash("rm x"), false).rule,
+            Some("approval.bash_not_required")
+        );
+        cfg.security.require_approval_for_writes = false;
+        let write = ToolCall {
+            id: "2".into(),
+            name: "edit_file".into(),
+            args: json!({}),
+        };
+        assert_eq!(
+            policy(&cfg, &write, true).rule,
+            Some("approval.writes_not_required")
+        );
+        for p in [
+            policy(&cfg, &read, true),
+            policy(&cfg, &bash("ls"), true),
+            policy(&cfg, &write, true),
+        ] {
+            assert!(crate::audit::RULES.contains(&p.rule.unwrap()));
+        }
     }
 
     #[test]

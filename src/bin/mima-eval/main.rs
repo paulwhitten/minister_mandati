@@ -2,6 +2,9 @@
 //! real `mima` binary, scores them with deterministic checks, and reports
 //! honest statistics. See docs/eval.md.
 
+#[allow(dead_code)]
+#[path = "../../audit.rs"]
+mod audit;
 mod calibrate;
 mod checks;
 mod exec;

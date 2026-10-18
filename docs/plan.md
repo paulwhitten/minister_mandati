@@ -129,7 +129,7 @@ Safety:
 | Sandbox S2 remainder: escalation argument, trusted-source-only widening, `.git/hooks` integrity check, `mima sandbox --status` | Partial | [design/design-shell-sandboxing.md](design/design-shell-sandboxing.md) |
 | Sandbox S3: test matrix on the Thor (Landlock ABI 4) | Planned | [design/design-shell-sandboxing.md](design/design-shell-sandboxing.md) |
 | Sandbox Tiers 2 and 3 (bubblewrap, systemd scope limits) | Planned | [design/design-shell-sandboxing.md](design/design-shell-sandboxing.md) |
-| macOS shell sandbox via Seatbelt (`sandbox-exec`), phases M0-M5 | Proposal | [design/design-shell-sandboxing.md](design/design-shell-sandboxing.md#macos-seatbelt) |
+| macOS shell sandbox via Seatbelt (`sandbox-exec`), phases M0-M5: profile generator with base rules from measured denials, `probe()`/`wrap()`, macOS itests, CI job | Partial | [design/design-shell-sandboxing.md](design/design-shell-sandboxing.md#macos-seatbelt) |
 | Scoped least-privilege approval rules (`Tool(glob)`, per-session "always") | Planned | |
 | Taint tracking of untrusted content (files, repositories, web, MCP output) | Planned | |
 | Sanitizing model-produced tool arguments | Planned | |
@@ -179,8 +179,9 @@ Exit criteria:
 |---|---|---|
 | Static x86_64 build (`crt-static`, static-pie) | Done | [../README.md](../README.md) |
 | macOS build (Landlock and seccomp compiled on Linux only) | Done | |
-| CI: format, clippy with warnings denied, tests | Done | |
+| CI: format, clippy with warnings denied, tests, release build; Linux and macOS | Done | |
 | Transcript JSON Schema with compatibility tests | Done | [design/session-resume.md](design/session-resume.md) |
+| Audit record: hash chain, session ledger, attribution (actor and rule ids), complete header, evidence hashes, required mode, export, `--audit-verify`, eval integration | Done | [design/design-audit-record.md](design/design-audit-record.md) |
 | Static `aarch64` build verified on the Thor; size and dependency surface | Planned | |
 | `cargo-deny` and SBOM | Planned | |
 | Model-weight supply chain: prefer safetensors, verify checksums | Planned | |

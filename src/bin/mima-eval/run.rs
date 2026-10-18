@@ -624,6 +624,16 @@ fn run_trial(
     let _ = std::fs::write(dirs.root.join("agent.stderr"), &out.stderr);
 
     let mut m: Metrics = metrics::from_transcript(&transcript);
+    if transcript.exists() {
+        // The trial ran with its own HOME, so its ledger is there.
+        let ledger = dirs.home.join(".mima/ledger.jsonl");
+        m.audit_failures =
+            crate::audit::verify(&transcript, ledger.exists().then_some(ledger.as_path()))
+                .into_iter()
+                .filter(|f| f.level == crate::audit::Level::Fail)
+                .map(|f| format!("{}: {}", f.check, f.detail))
+                .collect();
+    }
     if out.timed_out {
         m.exit_reason = "agent_timeout".into();
     } else if m.exit_reason == "error" && is_transport_error(&m.last_model_error) {

@@ -96,12 +96,68 @@ pub struct ToolRegistry {
     files: Arc<edit::FileTracker>,
     /// Whether `execute_bash` runs commands inside the Tier 1 sandbox.
     shell_sandboxed: bool,
+    /// Runs mima's own read-only commands (`git status` for the audit
+    /// record) with the same wrapper, environment and sandbox as the shell.
+    runner: CommandRunner,
+}
+
+/// Runs a command the way `execute_bash` would (wrapper, environment,
+/// sandbox, process-group kill), for commands mima itself issues.
+#[derive(Clone)]
+pub struct CommandRunner {
+    wrapper: Vec<String>,
+    env: Vec<(String, String)>,
+    sandbox: Option<std::result::Result<SandboxRun, String>>,
+    summary: String,
+}
+
+impl CommandRunner {
+    /// Runs `argv` with `extra_env` added; an error when it cannot start,
+    /// times out, or the required sandbox is unavailable.
+    pub async fn run(
+        &self,
+        argv: &[String],
+        extra_env: &[(&str, &str)],
+        timeout: Duration,
+    ) -> std::result::Result<shell::Finished, String> {
+        let inner = match &self.sandbox {
+            None => argv.to_vec(),
+            Some(Ok(run)) => crate::sandbox::wrap(&run.exe, &run.policy, argv),
+            Some(Err(e)) => return Err(e.clone()),
+        };
+        let full: Vec<String> = self.wrapper.iter().cloned().chain(inner).collect();
+        let mut env = self.env.clone();
+        for (k, v) in extra_env {
+            env.retain(|(n, _)| n != k);
+            env.push((k.to_string(), v.to_string()));
+        }
+        match shell::run(&full, &env, timeout).await {
+            Ok(Ok(done)) => Ok(done),
+            Ok(Err(_)) => Err(format!("timed out after {} s", timeout.as_secs())),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// How commands are confined: `off`, an error, or the sandbox summary.
+    pub fn summary(&self) -> &str {
+        &self.summary
+    }
+
+    pub fn sandboxed(&self) -> bool {
+        matches!(self.sandbox, Some(Ok(_)))
+    }
 }
 
 impl ToolRegistry {
     pub fn init_default(config: &Config) -> Self {
         let bash = BashExecutor::from_config(&config.security);
         let shell_sandboxed = matches!(bash.sandbox, Some(Ok(_)));
+        let runner = CommandRunner {
+            wrapper: bash.wrapper.clone(),
+            env: bash.env.clone(),
+            sandbox: bash.sandbox.clone(),
+            summary: bash.sandbox_summary(),
+        };
         let allowed = config.security.allowed_paths.clone();
         let files = edit::FileTracker::shared();
         let tools: Vec<Box<dyn BaseTool>> = vec![
@@ -126,7 +182,13 @@ impl ToolRegistry {
             tools: map,
             files,
             shell_sandboxed,
+            runner,
         }
+    }
+
+    /// Runs mima's own commands under the shell's confinement.
+    pub fn runner(&self) -> &CommandRunner {
+        &self.runner
     }
 
     /// Whether shell commands run inside the Tier 1 sandbox.
@@ -319,6 +381,7 @@ pub struct BashExecutor {
 }
 
 /// How to run a command inside the sandbox.
+#[derive(Clone)]
 struct SandboxRun {
     exe: std::path::PathBuf,
     policy: crate::sandbox::Policy,

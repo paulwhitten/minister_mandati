@@ -846,6 +846,7 @@ dependencies = [
  "libc",
  "regex",
  "reqwest",
+ "ring",
  "rustyline",
  "schemars",
  "seccompiler",

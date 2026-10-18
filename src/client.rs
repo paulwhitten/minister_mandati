@@ -175,10 +175,9 @@ pub async fn count_prompt_tokens(ctx: &AgentContext, url: &str) -> Result<usize>
     tokenize(&ctx.config, url, &messages, request_tools(ctx)).await
 }
 
-/// Asks the server for the model's context window. vLLM lists it as
-/// `max_model_len` in `GET {base_url}/models`; other servers may not report
-/// it, in which case this returns `None`. Uses only the configured endpoint.
-pub async fn discover_context_window(cfg: &Config) -> Option<usize> {
+/// The configured model's entry in `GET {base_url}/models` (or the only
+/// listed model when ids differ), for the window and the audit record.
+pub async fn discover_model(cfg: &Config) -> Option<Value> {
     let url = format!("{}/models", cfg.provider.base_url.trim_end_matches('/'));
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -195,18 +194,46 @@ pub async fn discover_context_window(cfg: &Config) -> Option<usize> {
         return None;
     }
     let payload: Value = resp.json().await.ok()?;
-    window_from_models(&payload, &cfg.provider.default_model)
+    model_entry(&payload, &cfg.provider.default_model).cloned()
+}
+
+/// The server's version, where it reports one (vLLM: `GET {root}/version`,
+/// the API root without `/v1`). Uses only the configured endpoint.
+pub async fn server_version(cfg: &Config) -> Option<String> {
+    let base = cfg.provider.base_url.trim_end_matches('/');
+    let root = base.strip_suffix("/v1").unwrap_or(base);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .ok()?;
+    let resp = client
+        .get(format!("{root}/version"))
+        .bearer_auth(&cfg.provider.api_key)
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let v: Value = resp.json().await.ok()?;
+    v["version"].as_str().map(str::to_string)
+}
+
+/// The entry for `model` in a `/models` payload, or the only listed model.
+fn model_entry<'a>(payload: &'a Value, model: &str) -> Option<&'a Value> {
+    let data = payload.get("data")?.as_array()?;
+    data.iter()
+        .find(|m| m["id"].as_str() == Some(model))
+        .or_else(|| (data.len() == 1).then(|| &data[0]))
 }
 
 /// Picks `max_model_len` for `model` from a `/models` payload, or from the
 /// only listed model when ids differ (servers often alias the served name).
+#[cfg(test)]
 fn window_from_models(payload: &Value, model: &str) -> Option<usize> {
-    let data = payload.get("data")?.as_array()?;
-    let entry = data
-        .iter()
-        .find(|m| m["id"].as_str() == Some(model))
-        .or_else(|| (data.len() == 1).then(|| &data[0]))?;
-    entry["max_model_len"].as_u64().map(|w| w as usize)
+    model_entry(payload, model)?["max_model_len"]
+        .as_u64()
+        .map(|w| w as usize)
 }
 
 /// Token accounting from a single model response.
@@ -253,6 +280,11 @@ pub struct CompletionResponse {
     /// (vLLM `reasoning_content`, or `reasoning`). Recorded in transcripts;
     /// not sent back to the model.
     pub reasoning: Option<String>,
+    /// SHA-256 of the request body sent (for the audit record).
+    pub request_sha256: Option<String>,
+    /// The server's id for this response and the model it says served it.
+    pub response_id: Option<String>,
+    pub served_model: Option<String>,
 }
 
 #[tracing::instrument(skip(ctx, on_delta), fields(model = %ctx.config.provider.default_model))]
@@ -299,19 +331,26 @@ pub async fn generate_completion(
     tracing::debug!(%url, stream = cfg.agent.stream, "sending completion request");
     dump_request(&body);
     let client = reqwest::Client::new();
+    // reqwest's `.json` serializes with the same serde_json call, so this
+    // hashes exactly the bytes sent.
+    let request_sha256 = serde_json::to_vec(&body)
+        .ok()
+        .map(|b| crate::audit::hex(&crate::audit::sha256(&[&b])));
     let response = send_with_retry(&client, &url, cfg, &body).await?;
 
-    if cfg.agent.stream {
+    let mut result = if cfg.agent.stream {
         let (message, usage) = read_stream(response, on_delta).await?;
         let result = build_response(&message, usage, cfg);
         tracing::debug!(
             tool_calls = result.tool_calls.as_ref().map(|c| c.len()).unwrap_or(0),
             "stream complete"
         );
-        Ok(result)
+        result
     } else {
-        parse_json_response(response, cfg).await
-    }
+        parse_json_response(response, cfg).await?
+    };
+    result.request_sha256 = request_sha256;
+    Ok(result)
 }
 
 /// Sends the request, retrying transient transport errors and retryable status
@@ -380,6 +419,11 @@ async fn parse_json_response(
     if let Some(f) = payload.pointer("/choices/0/finish_reason").cloned() {
         message["finish_reason"] = f;
     }
+    for (from, to) in [("id", "response_id"), ("model", "served_model")] {
+        if let Some(v) = payload.get(from).filter(|v| v.is_string()) {
+            message[to] = v.clone();
+        }
+    }
     Ok(build_response(&message, usage, cfg))
 }
 
@@ -403,6 +447,7 @@ async fn read_stream(
     let mut usage = None;
     let mut finish_reason: Option<String> = None;
     let mut reasoning = String::new();
+    let mut ids = json!({});
     let mut buf: Vec<u8> = Vec::new();
 
     while let Some(chunk) = response.chunk().await.context(HttpSnafu)? {
@@ -423,6 +468,13 @@ async fn read_stream(
             };
             if let Some(u) = TokenUsage::from_payload(&json) {
                 usage = Some(u);
+            }
+            for (from, to) in [("id", "response_id"), ("model", "served_model")] {
+                if ids.get(to).is_none()
+                    && let Some(v) = json.get(from).filter(|v| v.is_string())
+                {
+                    ids[to] = v.clone();
+                }
             }
             if let Some(f) = json
                 .pointer("/choices/0/finish_reason")
@@ -472,6 +524,11 @@ async fn read_stream(
     }
     if !reasoning.is_empty() {
         message["reasoning_content"] = json!(reasoning);
+    }
+    if let Value::Object(ids) = ids {
+        for (k, v) in ids {
+            message[k] = v;
+        }
     }
     Ok((message, usage))
 }
@@ -546,6 +603,15 @@ fn build_response(message: &Value, usage: Option<TokenUsage>, cfg: &Config) -> C
             .iter()
             .find_map(|k| message.get(*k).and_then(Value::as_str))
             .filter(|r| !r.is_empty())
+            .map(str::to_string),
+        request_sha256: None,
+        response_id: message
+            .get("response_id")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        served_model: message
+            .get("served_model")
+            .and_then(Value::as_str)
             .map(str::to_string),
     }
 }

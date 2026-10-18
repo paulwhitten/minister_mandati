@@ -6,7 +6,7 @@
 //! `${ENV_VAR}` references are expanded so secrets stay out of the file. The
 //! `MIMA_BASE_URL`, `MIMA_MODEL`, and `MIMA_API_KEY` env vars override after.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use std::path::{Path, PathBuf};
 
@@ -26,7 +26,7 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default)]
     pub provider: Provider,
@@ -38,15 +38,71 @@ pub struct Config {
     pub context: Context,
     #[serde(default)]
     pub session: SessionConfig,
+    #[serde(default)]
+    pub audit: Audit,
+    /// Where this configuration came from (for the audit record).
+    #[serde(skip)]
+    pub source: ConfigSource,
 }
 
-#[derive(Debug, Deserialize)]
+/// Provenance of the loaded configuration.
+#[derive(Debug, Default, Clone)]
+pub struct ConfigSource {
+    /// The file read, or `None` for built-in defaults.
+    pub path: Option<PathBuf>,
+    /// SHA-256 of the file's bytes.
+    pub sha256: Option<String>,
+    /// The file is the workspace's own `./agent.toml`.
+    pub workspace: bool,
+    /// Settings ignored because the workspace may not set them.
+    pub ignored: Vec<String>,
+}
+
+/// Audit record settings (docs/design/design-audit-record.md).
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+#[serde(default)]
+pub struct Audit {
+    /// The session ledger: one chained line per session start, recording
+    /// change and end, with each transcript's head. `~/` means the home
+    /// directory.
+    pub ledger: String,
+    /// Record the host name in the ledger.
+    pub record_host: bool,
+    /// Required mode: recording always on, each record on disk before its
+    /// action, and a recording failure stops mima. Also `--audit` or
+    /// `MIMA_AUDIT=1`; a workspace `./agent.toml` can turn it on, never off.
+    pub required: bool,
+}
+
+impl Default for Audit {
+    fn default() -> Self {
+        Self {
+            ledger: "~/.mima/ledger.jsonl".to_string(),
+            record_host: true,
+            required: false,
+        }
+    }
+}
+
+/// The `[audit]` table of the user's own config file, if it has one.
+fn user_audit() -> Option<Audit> {
+    #[derive(Deserialize)]
+    struct OnlyAudit {
+        #[serde(default)]
+        audit: Audit,
+    }
+    let path = user_config_paths().into_iter().find(|p| p.is_file())?;
+    let text = std::fs::read_to_string(path).ok()?;
+    toml::from_str::<OnlyAudit>(&text).ok().map(|c| c.audit)
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Provider {
     // Reserved for provider-specific behavior (e.g. anthropic vs openai); parsed now, used later.
     #[allow(dead_code)]
     #[serde(rename = "type", default = "default_provider_type")]
     pub provider_type: String,
-    #[serde(default = "default_api_key")]
+    #[serde(default = "default_api_key", skip_serializing)]
     pub api_key: String,
     #[serde(default = "default_base_url")]
     pub base_url: String,
@@ -54,7 +110,7 @@ pub struct Provider {
     pub default_model: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Agent {
     /// Sampling temperature, or `"server"` to leave it out of requests (some
@@ -113,7 +169,7 @@ pub struct Agent {
 
 /// Context-window management (see `docs/context.md`). Fractions are of the
 /// operating budget E = min(usable window, `budget`).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Context {
     /// Context window in tokens; `None` discovers it from the server.
@@ -132,7 +188,7 @@ pub struct Context {
 }
 
 /// Sessions and transcripts (see `docs/sessions.md`).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SessionConfig {
     /// Write a transcript for each session. Off by default; can also be
@@ -167,7 +223,7 @@ impl Default for Context {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Security {
     pub require_approval_for_bash: bool,
@@ -213,6 +269,9 @@ pub struct Security {
     pub auto_approve_sandboxed: bool,
     /// Sandbox roots for the filesystem tools only (not a shell sandbox).
     pub allowed_paths: Vec<String>,
+    /// `--approve-all` (evaluation harness only). Never read from a file.
+    #[serde(skip)]
+    pub approve_all: bool,
 }
 
 impl Default for Agent {
@@ -346,6 +405,7 @@ impl Default for Security {
             sandbox_writable_paths: Vec::new(),
             auto_approve_sandboxed: false,
             allowed_paths: vec!["./".to_string()],
+            approve_all: false,
         }
     }
 }
@@ -383,7 +443,7 @@ fn default_true() -> bool {
 }
 
 /// Name of the reply-limit field in chat completion requests.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TokenParam {
     #[default]
@@ -447,8 +507,20 @@ impl Config {
                 // ./agent.toml lives in the workspace, which an untrusted
                 // repository controls; it may narrow security, never widen it.
                 if path == Path::new("agent.toml") {
+                    c.source.workspace = true;
                     for msg in c.security.restrict_to_untrusted() {
                         tracing::warn!("ignored in ./agent.toml (workspace config): {msg}");
+                        c.source.ignored.push(format!("security.{msg}"));
+                    }
+                    // The workspace must not move or silence the audit
+                    // ledger: [audit] comes from the user's file or defaults.
+                    let mut audit = user_audit().unwrap_or_default();
+                    // The workspace may require auditing, never relax it.
+                    audit.required |= c.audit.required;
+                    if c.audit != audit {
+                        tracing::warn!("ignored in ./agent.toml (workspace config): [audit]");
+                        c.source.ignored.push("audit".into());
+                        c.audit = audit;
                     }
                     if c.provider.base_url != default_base_url() {
                         tracing::warn!(
@@ -472,9 +544,12 @@ impl Config {
             path: path.to_path_buf(),
         })?;
         let expanded = expand_env(&raw);
-        let config: Config = toml::from_str(&expanded).context(ParseSnafu {
+        let mut config: Config = toml::from_str(&expanded).context(ParseSnafu {
             path: path.to_path_buf(),
         })?;
+        config.source.path = Some(path.to_path_buf());
+        // Of the file as written, before `${VAR}` expansion (no secrets).
+        config.source.sha256 = Some(crate::audit::hex(&crate::audit::sha256(&[raw.as_bytes()])));
         Ok(config)
     }
 
@@ -610,6 +685,11 @@ fn discover_config_path() -> Option<PathBuf> {
     if local.is_file() {
         return Some(local);
     }
+    user_config_paths().into_iter().find(|p| p.is_file())
+}
+
+/// Candidate locations of the user's own config file, in order.
+fn user_config_paths() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
         candidates.push(PathBuf::from(xdg).join("minister_mandati/agent.toml"));
@@ -617,7 +697,7 @@ fn discover_config_path() -> Option<PathBuf> {
     if let Some(home) = std::env::var_os("HOME") {
         candidates.push(PathBuf::from(home).join(".config/minister_mandati/agent.toml"));
     }
-    candidates.into_iter().find(|p| p.is_file())
+    candidates
 }
 
 /// Replaces `${VAR}` occurrences with the value of the environment variable

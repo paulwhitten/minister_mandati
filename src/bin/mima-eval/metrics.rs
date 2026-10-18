@@ -33,6 +33,9 @@ pub struct Metrics {
     /// The last model error's text, if any (to tell an unreachable server
     /// from a model failure).
     pub last_model_error: String,
+    /// Audit checks the trial's transcript failed (`mima --audit-verify`),
+    /// against the trial's own ledger; empty when all pass.
+    pub audit_failures: Vec<String>,
 }
 
 /// Parses a transcript file. Missing or unreadable files give default

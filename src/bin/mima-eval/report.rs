@@ -399,13 +399,13 @@ fn cost_section(s: &mut String, profiles: &[&str], by_profile: &BTreeMap<&str, V
     let _ = writeln!(s, "\n## Cost\n");
     let _ = writeln!(
         s,
-        "Agent time is wall-clock per trial. Output speed is completion tokens per second of agent time (it includes prompt processing and tool time, so it understates decode speed). Energy is whole-device energy during trials (agent and checks) from the profile's power command. Timeouts and truncated replies (cut off at max_tokens) are often harness settings rather than model failures.\n"
+        "Agent time is wall-clock per trial. Output speed is completion tokens per second of agent time (it includes prompt processing and tool time, so it understates decode speed). Energy is whole-device energy during trials (agent and checks) from the profile's power command. Timeouts and truncated replies (cut off at max_tokens) are often harness settings rather than model failures. Audit failures count trials whose transcript failed `mima --audit-verify` (see each trial's metrics.audit_failures); they should be zero.\n"
     );
     let _ = writeln!(
         s,
-        "| Model | Solved | Agent time total | Time per solved | Output tok/s (median) | Mean power | Energy per solved | Timeouts | Truncated replies |"
+        "| Model | Solved | Agent time total | Time per solved | Output tok/s (median) | Mean power | Energy per solved | Timeouts | Truncated replies | Audit failures |"
     );
-    let _ = writeln!(s, "|---|---|---|---|---|---|---|---|---|");
+    let _ = writeln!(s, "|---|---|---|---|---|---|---|---|---|---|");
     for p in profiles {
         let Some(rs) = by_profile.get(p) else {
             continue;
@@ -430,6 +430,14 @@ fn cost_section(s: &mut String, profiles: &[&str], by_profile: &BTreeMap<&str, V
             .iter()
             .map(|r| r.metrics["truncated"].as_u64().unwrap_or(0))
             .sum();
+        let audit_failures = rs
+            .iter()
+            .filter(|r| {
+                r.metrics["audit_failures"]
+                    .as_array()
+                    .is_some_and(|a| !a.is_empty())
+            })
+            .count();
         let per_solved = |total: f64, unit: &str| {
             if solved == 0 {
                 "n/a".to_string()
@@ -447,7 +455,7 @@ fn cost_section(s: &mut String, profiles: &[&str], by_profile: &BTreeMap<&str, V
         };
         let _ = writeln!(
             s,
-            "| {p} | {solved}/{} | {:.0} min | {} | {:.1} | {power_cell} | {energy_cell} | {timeouts} | {truncated} |",
+            "| {p} | {solved}/{} | {:.0} min | {} | {:.1} | {power_cell} | {energy_cell} | {timeouts} | {truncated} | {audit_failures} |",
             rs.len(),
             secs / 60.0,
             per_solved(secs, " s"),

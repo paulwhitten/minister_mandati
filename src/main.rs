@@ -5,10 +5,12 @@ use std::path::Path;
 
 mod agent;
 mod approval;
+mod audit;
 mod budget;
 mod client;
 mod config;
 mod context;
+mod evidence;
 mod loop_guard;
 mod presenter;
 #[cfg(test)]
@@ -27,7 +29,7 @@ use agent::{finish_turn, ledger_json, record_outcome, run_turn};
 use config::Config;
 use context::AgentContext;
 use presenter::{CliPresenter, Presenter};
-use serde_json::json;
+use serde_json::{Value, json};
 use tools::ToolRegistry;
 
 /// minister_mandati (`mima`) — an auditable, edge-native coding agent.
@@ -86,6 +88,48 @@ struct Cli {
     /// only: refused unless MIMA_EVAL_SANDBOX=1 is set (see docs/eval.md).
     #[arg(long)]
     approve_all: bool,
+
+    /// Required audit mode: recording always on, each record on disk before
+    /// its action, and a recording failure stops mima (also MIMA_AUDIT=1 or
+    /// [audit].required).
+    #[arg(long)]
+    audit: bool,
+
+    /// With --resume in required mode: continue a transcript whose audit
+    /// chain is broken, recording that you accepted it (chain_reset).
+    #[arg(long)]
+    accept_chain_break: bool,
+
+    /// Check a transcript's audit chain and its heads against the session
+    /// ledger, then exit: a session id (a unique prefix is enough), "last",
+    /// or a file path. Exit status 1 if any check fails.
+    #[arg(long, value_name = "ID|PATH")]
+    audit_verify: Option<String>,
+
+    /// With --audit-verify: also compare the transcript's head with HEAD, an
+    /// anchor kept elsewhere (as printed at session end).
+    #[arg(long, value_name = "HEAD", requires = "audit_verify")]
+    head: Option<String>,
+
+    /// Write a copy of a transcript to share, with content withheld (see
+    /// --withhold); it verifies with the same hashes. Then exit.
+    #[arg(long, value_name = "ID|PATH")]
+    audit_export: Option<String>,
+
+    /// With --audit-export: what to withhold, comma-separated: "code" (all
+    /// content, the default), "outputs" (tool outputs and diffs), or field
+    /// names such as turn_start.instruction.
+    #[arg(
+        long,
+        value_name = "SET",
+        default_value = "code",
+        requires = "audit_export"
+    )]
+    withhold: String,
+
+    /// With --audit-export: write the copy to FILE instead of stdout.
+    #[arg(long, value_name = "FILE", requires = "audit_export")]
+    output: Option<std::path::PathBuf>,
 }
 
 /// How mima was invoked; recorded in the transcript and used for messages.
@@ -125,15 +169,12 @@ async fn async_main() {
     init_tracing();
     let cli = Cli::parse();
     let mut presenter = CliPresenter::default();
-    if cli.approve_all {
-        if std::env::var("MIMA_EVAL_SANDBOX").as_deref() != Ok("1") {
-            eprintln!(
-                "error: --approve-all is only for the evaluation harness (docs/eval.md); \
-                 it requires MIMA_EVAL_SANDBOX=1"
-            );
-            std::process::exit(2);
-        }
-        presenter.approve_all = true;
+    if cli.approve_all && std::env::var("MIMA_EVAL_SANDBOX").as_deref() != Ok("1") {
+        eprintln!(
+            "error: --approve-all is only for the evaluation harness (docs/eval.md); \
+             it requires MIMA_EVAL_SANDBOX=1"
+        );
+        std::process::exit(2);
     }
     if let Err(e) = run(cli, &mut presenter).await {
         tracing::error!(error = %e, "fatal error");
@@ -156,9 +197,32 @@ async fn run(cli: Cli, presenter: &mut dyn Presenter) -> Result<(), snafu::Whate
     if let Some(n) = cli.max_steps {
         config.agent.max_steps = n;
     }
+    config.security.approve_all = cli.approve_all;
+    // Required mode only tightens, so it applies however the config was found.
+    config.audit.required |= cli.audit
+        || std::env::var("MIMA_AUDIT").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    if let Some(target) = &cli.audit_verify {
+        // Offline: no model endpoint is contacted.
+        std::process::exit(audit_verify(&config, target, cli.head.as_deref()));
+    }
+    if let Some(target) = &cli.audit_export {
+        std::process::exit(audit_export(
+            &config,
+            target,
+            &cli.withhold,
+            cli.output.as_deref(),
+        ));
+    }
     let registry = ToolRegistry::init_default(&config);
     let specs = registry.specs();
+    let ledger = ledger_for(&config);
+    let required = config.audit.required;
+    if required {
+        check_audit_exposure(&config, &registry)?;
+    }
     let mut ctx = AgentContext::new(config, specs);
+    ctx.session.set_ledger(ledger);
+    ctx.session.set_required(required);
     agent::configure_window(&mut ctx).await;
     agent::configure_token_counter(&mut ctx).await;
 
@@ -192,10 +256,18 @@ async fn run(cli: Cli, presenter: &mut dyn Presenter) -> Result<(), snafu::Whate
         ctx.session.set_path(path.clone());
     }
     if let Some(id) = &cli.resume {
-        resume_session(&mut ctx, id).whatever_context("cannot resume")?;
-    } else if cli.transcript || cli.transcript_path.is_some() || ctx.config.session.transcripts {
-        enable_transcript(&mut ctx, mode);
+        resume_session(&mut ctx, id, cli.accept_chain_break).whatever_context("cannot resume")?;
+    } else if required
+        || cli.transcript
+        || cli.transcript_path.is_some()
+        || ctx.config.session.transcripts
+    {
+        let enabled = enable_transcript(&mut ctx, &registry, mode).await;
+        if required && !enabled {
+            snafu::whatever!("audit mode is required but the transcript cannot be opened");
+        }
     }
+    ctx.session.begin(mode.as_str(), cli.resume.is_some());
     if mode != Mode::Interactive {
         announce_transcript(&ctx, mode); // the REPL announces after its banner
     }
@@ -218,10 +290,12 @@ async fn run(cli: Cli, presenter: &mut dyn Presenter) -> Result<(), snafu::Whate
 
 /// Starts recording the current session. Returns false (after telling the
 /// operator) if the transcript cannot be opened; the agent keeps working.
-fn enable_transcript(ctx: &mut AgentContext, mode: Mode) -> bool {
+async fn enable_transcript(ctx: &mut AgentContext, registry: &ToolRegistry, mode: Mode) -> bool {
+    let (workspace, _) = evidence::workspace(registry.runner()).await;
+    let audit = evidence::header(ctx, registry.runner(), Some(workspace));
     let c = &ctx.config;
     let b = ctx.stats().budget;
-    let header = json!({
+    let mut header = json!({
         "mode": mode.as_str(),
         "mima_version": env!("CARGO_PKG_VERSION"),
         "cwd": std::env::current_dir().ok(),
@@ -233,10 +307,15 @@ fn enable_transcript(ctx: &mut AgentContext, mode: Mode) -> bool {
             "bash": c.security.require_approval_for_bash,
             "writes": c.security.require_approval_for_writes,
             "auto_approve_bash": c.security.auto_approve_bash,
+            "auto_approve_sandboxed": c.security.auto_approve_sandboxed,
+            "approve_all": c.security.approve_all,
         },
         "allowed_paths": c.security.allowed_paths,
         "token_counting": if ctx.token_counter.is_some() { "tokenize" } else { "usage+estimate" },
     });
+    if let (Some(h), Value::Object(a)) = (header.as_object_mut(), audit) {
+        h.extend(a);
+    }
     match ctx.session.enable(header) {
         Ok(path) => {
             tracing::info!(path = %path.display(), "transcript enabled");
@@ -266,6 +345,124 @@ fn announce_transcript(ctx: &AgentContext, mode: Mode) {
     } else {
         eprintln!("{msg}");
     }
+}
+
+/// The session ledger from `[audit]`; `None` when no path is set.
+fn ledger_for(config: &Config) -> Option<audit::Ledger> {
+    let path = config.audit.ledger.trim();
+    (!path.is_empty())
+        .then(|| audit::Ledger::new(session::expand_home(path), config.audit.record_host))
+}
+
+/// Required mode keeps transcripts and the ledger out of reach of shell
+/// commands: refuses to start when a sandbox path covers them, and warns
+/// when commands are not sandboxed at all.
+fn check_audit_exposure(config: &Config, registry: &ToolRegistry) -> Result<(), snafu::Whatever> {
+    if !registry.shell_sandboxed() {
+        eprintln!(
+            "warning: audit mode is required but shell commands are not sandboxed, so they \
+             could alter transcripts and the ledger"
+        );
+        return Ok(());
+    }
+    let canon = |p: &str| {
+        let p = session::expand_home(p);
+        std::fs::canonicalize(&p).unwrap_or(p)
+    };
+    let sec = &config.security;
+    let exposed: Vec<std::path::PathBuf> = sec
+        .allowed_paths
+        .iter()
+        .chain(&sec.sandbox_read_paths)
+        .chain(&sec.sandbox_writable_paths)
+        .map(|p| canon(p))
+        .collect();
+    let mut protected = vec![canon(&config.session.transcript_dir)];
+    if let Some(parent) = canon(&config.audit.ledger).parent() {
+        protected.push(parent.to_path_buf());
+    }
+    for p in &protected {
+        if let Some(e) = exposed.iter().find(|e| p.starts_with(e)) {
+            snafu::whatever!(
+                "audit mode is required but {} is inside the sandbox path {}, so shell \
+                 commands could alter the audit record; move it or narrow the sandbox paths",
+                p.display(),
+                e.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A transcript given as a file path, a session id (prefix) or "last".
+fn transcript_target(config: &Config, target: &str) -> Result<std::path::PathBuf, String> {
+    if Path::new(target).is_file() {
+        return Ok(std::path::PathBuf::from(target));
+    }
+    let dir = session::expand_home(&config.session.transcript_dir);
+    transcript::find(&dir, target)
+}
+
+/// `--audit-export`: writes the shared copy; returns the exit status.
+fn audit_export(config: &Config, target: &str, withhold: &str, output: Option<&Path>) -> i32 {
+    let result = transcript_target(config, target)
+        .and_then(|p| std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display())))
+        .and_then(|bytes| {
+            let sets: Vec<String> = withhold
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            audit::export(&bytes, &sets)
+        })
+        .and_then(|copy| match output {
+            Some(path) => {
+                std::fs::write(path, copy).map_err(|e| format!("{}: {e}", path.display()))
+            }
+            None => {
+                print!("{copy}");
+                Ok(())
+            }
+        });
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("error: {e}");
+            2
+        }
+    }
+}
+
+/// `--audit-verify`: prints each check and returns the exit status.
+fn audit_verify(config: &Config, target: &str, head: Option<&str>) -> i32 {
+    let path = match transcript_target(config, target) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 2;
+        }
+    };
+    let ledger = ledger_for(config);
+    let findings = audit::verify_with_head(&path, ledger.as_ref().map(|l| l.path()), head);
+    println!("{}", path.display());
+    for f in &findings {
+        let level = match f.level {
+            audit::Level::Pass => "PASS",
+            audit::Level::Warn => "WARN",
+            audit::Level::Fail => "FAIL",
+        };
+        println!("  {level}  {:<9} {}", f.check, f.detail);
+    }
+    let failed = findings.iter().any(|f| f.level == audit::Level::Fail);
+    println!(
+        "{}",
+        if failed {
+            "verification FAILED"
+        } else {
+            "verification passed"
+        }
+    );
+    i32::from(failed)
 }
 
 /// Writes `session_end` (when recording) with the session's token totals.
@@ -345,7 +542,7 @@ async fn run_repl(
         if let Some(cmd) = line.strip_prefix('/') {
             match cmd {
                 "exit" | "quit" => return Ok("exit"),
-                "new" | "reset" => new_session(ctx, registry),
+                "new" | "reset" => new_session(ctx, registry).await,
                 "sessions" => print_sessions(ctx),
                 c if c.starts_with("resume") => {
                     let id = c.trim_start_matches("resume").trim();
@@ -354,15 +551,18 @@ async fn run_repl(
                     ctx.reset();
                     registry.reset_files();
                     ctx.session = ctx.session.successor();
-                    if let Err(e) = resume_session(ctx, id) {
+                    let resumed = resume_session(ctx, id, false);
+                    if let Err(e) = &resumed {
                         println!("cannot resume: {e}");
                     }
+                    ctx.session
+                        .begin(Mode::Interactive.as_str(), resumed.is_ok());
                 }
                 "session" => print_session(ctx),
                 "enable_transcript" => {
                     if let Some(path) = ctx.session.transcript_path() {
                         println!("Transcripts: already on ({})", path.display());
-                    } else if enable_transcript(ctx, Mode::Interactive) {
+                    } else if enable_transcript(ctx, registry, Mode::Interactive).await {
                         announce_transcript(ctx, Mode::Interactive);
                     }
                 }
@@ -378,21 +578,28 @@ async fn run_repl(
             continue;
         }
         run_turn_cancellable(ctx, registry, presenter, line, &mut sigint).await;
+        if !ctx.session.audit_ok() {
+            eprintln!(
+                "error: the audit record could not be written; ending the session (required mode)"
+            );
+            return Ok("audit_failure");
+        }
     }
 }
 
 /// `/new`: ends the current session and starts a fresh one (new id, empty
 /// context). Recording carries over: if the old session had a transcript,
 /// the new one gets its own.
-fn new_session(ctx: &mut AgentContext, registry: &ToolRegistry) {
+async fn new_session(ctx: &mut AgentContext, registry: &ToolRegistry) {
     let recording = ctx.session.is_recording();
     end_session(ctx, "new", None);
     ctx.reset();
     registry.reset_files();
     ctx.session = ctx.session.successor();
     if recording {
-        enable_transcript(ctx, Mode::Interactive);
+        enable_transcript(ctx, registry, Mode::Interactive).await;
     }
+    ctx.session.begin(Mode::Interactive.as_str(), false);
     println!("New session {}.", ctx.session.id());
     announce_transcript(ctx, Mode::Interactive);
 }
@@ -435,9 +642,27 @@ fn print_sessions(ctx: &AgentContext) {
 /// Continues a recorded session in `ctx` (docs/design/session-resume.md):
 /// rebuilds the context from its latest `context` record or by replay,
 /// reopens its transcript for appending, and reports what changed since.
-fn resume_session(ctx: &mut AgentContext, id: &str) -> Result<(), String> {
+fn resume_session(ctx: &mut AgentContext, id: &str, accept_break: bool) -> Result<(), String> {
     let dir = session::expand_home(&ctx.config.session.transcript_dir);
     let path = transcript::find(&dir, id)?;
+    // Required mode continues only an intact chain, unless the operator
+    // explicitly accepts the break (recorded below).
+    let mut chain_problems = Vec::new();
+    if ctx.config.audit.required {
+        chain_problems = audit::verify(&path, None)
+            .into_iter()
+            .filter(|f| f.level == audit::Level::Fail && matches!(f.check, "lines" | "chain"))
+            .map(|f| format!("{}: {}", f.check, f.detail))
+            .collect();
+        if !chain_problems.is_empty() && !accept_break {
+            return Err(format!(
+                "{} fails audit verification ({}); required mode continues only an intact \
+                 chain. Use --accept-chain-break to continue and record that you accepted it.",
+                path.display(),
+                chain_problems.join("; ")
+            ));
+        }
+    }
     let t = transcript::Transcript::load(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let start = t
         .start()
@@ -452,7 +677,7 @@ fn resume_session(ctx: &mut AgentContext, id: &str) -> Result<(), String> {
         ));
     }
     let rebuilt = transcript::rebuild(&t, ctx.output_cap_bytes());
-    let resumed = session::Session::resume(
+    let mut resumed = session::Session::resume(
         &path,
         ctx.config.session.max_output_bytes,
         start.session_started.clone(),
@@ -460,7 +685,16 @@ fn resume_session(ctx: &mut AgentContext, id: &str) -> Result<(), String> {
         t.turns(),
     )
     .map_err(|e| e.to_string())?;
+    resumed.set_ledger(ctx.session.take_ledger());
+    resumed.set_required(ctx.config.audit.required);
     ctx.session = resumed;
+    if !chain_problems.is_empty() {
+        ctx.session.record(
+            "chain_reset",
+            json!({ "actor": "operator", "reason": "accepted with --accept-chain-break",
+                    "findings": chain_problems }),
+        );
+    }
     let count = rebuilt.messages.len();
     ctx.restore(
         rebuilt.messages,

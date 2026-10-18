@@ -92,6 +92,29 @@ Options:
       --approve-all
           Approve every tool call without asking. For the evaluation harness only: refused unless MIMA_EVAL_SANDBOX=1 is set (see docs/eval.md)
 
+      --audit
+          Required audit mode: recording always on, each record on disk before its action, and a recording failure stops mima (also MIMA_AUDIT=1 or [audit].required)
+
+      --accept-chain-break
+          With --resume in required mode: continue a transcript whose audit chain is broken, recording that you accepted it (chain_reset)
+
+      --audit-verify <ID|PATH>
+          Check a transcript's audit chain and its heads against the session ledger, then exit: a session id (a unique prefix is enough), "last", or a file path. Exit status 1 if any check fails
+
+      --head <HEAD>
+          With --audit-verify: also compare the transcript's head with HEAD, an anchor kept elsewhere (as printed at session end)
+
+      --audit-export <ID|PATH>
+          Write a copy of a transcript to share, with content withheld (see --withhold); it verifies with the same hashes. Then exit
+
+      --withhold <SET>
+          With --audit-export: what to withhold, comma-separated: "code" (all content, the default), "outputs" (tool outputs and diffs), or field names such as turn_start.instruction
+          
+          [default: code]
+
+      --output <FILE>
+          With --audit-export: write the copy to FILE instead of stdout
+
   -h, --help
           Print help (see a summary with '-h')
 
@@ -188,6 +211,39 @@ never leave the machine; they can contain source code and command output, so
 prune them as needed:
 `find ~/.mima/transcripts -name '*.jsonl' -mtime +30 -delete`. Format and
 record types: [docs/sessions.md](docs/sessions.md).
+
+### Audit chain and session ledger
+
+Every transcript record carries a SHA-256 `hash` of itself and the record
+before it, so an edited, deleted, inserted or reordered record is detected.
+When a session ends, `mima` prints the transcript's head (its last hash).
+
+The **session ledger** (`~/.mima/ledger.jsonl`, chained the same way) gets a
+line for every session start, recording on/off change and session end:
+time, user, host, working directory, whether recording was on, and the
+transcript's head. It is written even when transcripts are off and holds no
+instructions, outputs or code. Because it keeps each head, a transcript that
+was cut short or rewritten no longer matches it.
+
+Every record also names its **actor** (operator, model, rule, tool, system)
+and, when one of mima's deterministic rules decided (an auto-approval, a loop
+guard, a compaction), the **rule id**. The session header records the build,
+the binary's hash, the configuration and where it came from, the system
+prompt, the tool specifications, sampling settings, the server's model, the
+sandbox, the operator and the workspace's git state; tool results record file
+hashes before and after, and the files each shell command changed.
+
+Check a transcript with `mima --audit-verify <id|last|path>` (offline; exit
+status 1 if a check fails; `--head` compares with a head kept elsewhere).
+Share one without its code with `mima --audit-export <id> --withhold code
+--output copy.jsonl`: the copy verifies with the same hashes.
+
+**Required mode** (`--audit`, `MIMA_AUDIT=1` or `[audit].required = true`),
+for regulated work: recording is always on, each record is on disk before
+the action it describes, and a recording failure stops `mima` before its
+next action. Settings are in `[audit]`
+([agent.toml.example](agent.toml.example)); design:
+[docs/design/design-audit-record.md](docs/design/design-audit-record.md).
 
 ## Evaluation
 

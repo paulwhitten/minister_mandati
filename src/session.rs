@@ -3,6 +3,7 @@
 //! timestamped events under `~/.mima/transcripts/`. Transcripts are off by
 //! default. All times are UTC. See `docs/sessions.md`.
 
+use crate::audit::{self, Hash, Ledger};
 use serde_json::{Map, Value, json};
 use std::collections::hash_map::RandomState;
 use std::fs::{DirBuilder, File, OpenOptions};
@@ -14,6 +15,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Transcript format version; bumped only for breaking changes.
 pub const SCHEMA: u32 = 1;
+/// Lock attempts, 10 ms apart, before a transcript is reported in use.
+const LOCK_RETRIES: usize = 20;
 /// Longest project label in a session id.
 const MAX_LABEL: usize = 32;
 
@@ -33,6 +36,19 @@ pub struct Session {
     path_override: Option<PathBuf>,
     /// Start time of a resumed session, as recorded in its transcript.
     started_text: Option<String>,
+    /// The session ledger (docs/design/design-audit-record.md), if configured.
+    ledger: Option<Ledger>,
+    /// `session_start` was written to the ledger (see `begin`).
+    begun: bool,
+    /// `session_end` was written to the ledger.
+    ended: bool,
+    /// `seq` of the last `transcript_disabled`, until recording resumes.
+    disabled_at: Option<u64>,
+    /// Required mode: each record is synced to disk before returning, and a
+    /// failure to record marks the session (see `audit_ok`).
+    required: bool,
+    /// A record or ledger entry could not be written (or chained).
+    audit_failed: bool,
 }
 
 struct Transcript {
@@ -40,6 +56,24 @@ struct Transcript {
     path: PathBuf,
     /// Set after the first write failure, so it is reported only once.
     failed: bool,
+    /// Hash of the last record written: the chain continues from it.
+    prev: Hash,
+}
+
+/// Opens a transcript for appending under the lock and finds where its hash
+/// chain continues; finishes a partial last line (left by a crash) first.
+fn open_transcript(path: &Path) -> std::io::Result<Transcript> {
+    let mut file = open_locked(path)?;
+    let (prev, partial) = audit::chain_tail(&mut File::open(path)?)?;
+    if partial {
+        file.write_all(b"\n")?;
+    }
+    Ok(Transcript {
+        file,
+        path: path.to_path_buf(),
+        failed: false,
+        prev,
+    })
 }
 
 impl Session {
@@ -73,13 +107,52 @@ impl Session {
             seq: 0,
             path_override: None,
             started_text: None,
+            ledger: None,
+            begun: false,
+            ended: false,
+            disabled_at: None,
+            required: false,
+            audit_failed: false,
         }
     }
 
     /// The next session in the same process: new id, same directory and
     /// limits. The caller re-enables the transcript if it was on.
     pub fn successor(&self) -> Self {
-        Self::with_label(self.dir.clone(), self.max_output_bytes, self.label.clone())
+        let mut next =
+            Self::with_label(self.dir.clone(), self.max_output_bytes, self.label.clone());
+        next.ledger = self.ledger.clone();
+        next.required = self.required;
+        next
+    }
+
+    /// Required mode (docs/design/design-audit-record.md).
+    pub fn set_required(&mut self, required: bool) {
+        self.required = required;
+    }
+
+    /// False once a record or ledger entry could not be written in required
+    /// mode; the agent then stops before its next action.
+    pub fn audit_ok(&self) -> bool {
+        !self.audit_failed
+    }
+
+    fn ledger_append(&mut self, kind: &str, fields: Value) {
+        if let Some(l) = self.ledger.as_mut()
+            && !l.append(kind, fields)
+            && self.required
+        {
+            self.audit_failed = true;
+        }
+    }
+
+    /// Records this session's start, recording changes and end in `ledger`.
+    pub fn set_ledger(&mut self, ledger: Option<Ledger>) {
+        self.ledger = ledger;
+    }
+
+    pub fn take_ledger(&mut self) -> Option<Ledger> {
+        self.ledger.take()
     }
 
     /// Writes the transcript to `path` instead of the transcript directory.
@@ -112,22 +185,24 @@ impl Session {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
         let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
-        let file = open_locked(path)?;
+        let transcript = open_transcript(path)?;
         Ok(Self {
             id,
             label: None,
             started: SystemTime::now(),
             dir,
             max_output_bytes,
-            transcript: Some(Transcript {
-                file,
-                path: path.to_path_buf(),
-                failed: false,
-            }),
+            transcript: Some(transcript),
             turns,
             seq: next_seq,
             path_override: Some(path.to_path_buf()),
             started_text: Some(started),
+            ledger: None,
+            begun: false,
+            ended: false,
+            disabled_at: None,
+            required: false,
+            audit_failed: false,
         })
     }
 
@@ -137,6 +212,51 @@ impl Session {
 
     pub fn is_recording(&self) -> bool {
         self.transcript.is_some()
+    }
+
+    /// The transcript's head: the hash of its last record, while recording.
+    pub fn head(&self) -> Option<String> {
+        self.transcript.as_ref().map(|t| audit::hex(&t.prev))
+    }
+
+    /// Writes `session_start` to the ledger once the session is set up
+    /// (transcript decided). Every session gets one, recorded or not.
+    pub fn begin(&mut self, mode: &str, resumed: bool) {
+        if self.begun {
+            return;
+        }
+        self.begun = true;
+        let transcript = self.transcript_path().map(audit::absolute);
+        let recording = if self.is_recording() { "on" } else { "off" };
+        let Some(identity) = self.ledger.as_ref().map(Ledger::identity) else {
+            return;
+        };
+        let mut fields = json!({
+            "session": self.id,
+            "mima_version": env!("CARGO_PKG_VERSION"),
+            "mode": mode,
+            "resumed": resumed,
+            "required": self.required,
+            "cwd": std::env::current_dir().ok().map(|d| d.display().to_string()),
+            "recording": recording,
+            "transcript": transcript,
+        });
+        merge(&mut fields, identity);
+        self.ledger_append("session_start", fields);
+    }
+
+    /// Ledger entry for recording turned on or off mid-session.
+    fn ledger_recording(&mut self, on: bool) {
+        if !self.begun || self.ended {
+            return;
+        }
+        let fields = json!({
+            "session": self.id,
+            "recording": if on { "on" } else { "off" },
+            "turn": self.turns,
+            "transcript": self.transcript_path().map(audit::absolute),
+        });
+        self.ledger_append("recording_changed", fields);
     }
 
     /// Number of the turn being started (1-based), for transcript records.
@@ -167,38 +287,61 @@ impl Session {
                 .mode(0o700)
                 .create(parent)?;
         }
-        let file = open_locked(&path)?;
-        self.transcript = Some(Transcript {
-            file,
-            path: path.clone(),
-            failed: false,
-        });
+        self.transcript = Some(open_transcript(&path)?);
         let mut fields = json!({
             "schema": SCHEMA,
             "session": self.id,
             "session_started": self.started_utc(),
             "turns_before": self.turns,
+            "chain": audit::CHAIN,
         });
+        if let Some(seq) = self.disabled_at.take() {
+            fields["gap_after_seq"] = json!(seq);
+        }
         merge(&mut fields, header);
         self.record("session_start", fields);
+        self.ledger_recording(true);
         Ok(path)
     }
 
     /// Stops recording for the rest of this session (the session continues).
+    /// The stop itself is recorded, in the transcript and the ledger.
     pub fn disable(&mut self) {
-        self.record("transcript_disabled", json!({ "turns": self.turns }));
-        self.transcript = None;
-    }
-
-    /// Writes `session_end` and closes the transcript. No-op when off.
-    pub fn end(&mut self, reason: &str, fields: Value) {
         if self.transcript.is_none() {
             return;
         }
-        let mut all = json!({ "reason": reason, "turns": self.turns });
-        merge(&mut all, fields);
-        self.record("session_end", all);
+        self.disabled_at = self.record("transcript_disabled", json!({ "turns": self.turns }));
+        self.ledger_recording(false);
         self.transcript = None;
+    }
+
+    /// Writes `session_end` and closes the transcript (when recording), then
+    /// records the end, with the transcript's head, in the ledger.
+    pub fn end(&mut self, reason: &str, fields: Value) {
+        let mut records = None;
+        let mut head = None;
+        if self.transcript.is_some() {
+            let mut all = json!({ "reason": reason, "turns": self.turns });
+            merge(&mut all, fields);
+            self.record("session_end", all);
+            records = Some(self.seq);
+            head = self.head();
+        }
+        let transcript = self.transcript_path().map(audit::absolute);
+        self.transcript = None;
+        if !self.begun || self.ended {
+            return;
+        }
+        self.ended = true;
+        let fields = json!({ "session": self.id, "reason": reason, "turns": self.turns,
+                             "records": records, "head": head, "transcript": transcript });
+        self.ledger_append("session_end", fields);
+        if let Some(h) = &head {
+            eprintln!(
+                "Transcript head: sha256:{h} ({} records)",
+                records.unwrap_or(0)
+            );
+        }
     }
 
     /// Appends one event: `seq`, `ts` (UTC) and `type`, then `fields`. Each
@@ -211,17 +354,33 @@ impl Session {
         let mut line =
             json!({ "seq": self.seq, "ts": rfc3339_utc(SystemTime::now()), "type": kind });
         merge(&mut line, fields);
+        audit::attribute(kind, &mut line);
         self.seq += 1;
+        let sealed = audit::seal(&mut line, &t.prev);
         let mut text = line.to_string();
         text.push('\n');
-        if let Err(e) = t
+        let required = self.required;
+        let written = t
             .file
             .write_all(text.as_bytes())
             .and_then(|_| t.file.flush())
-            && !t.failed
-        {
-            t.failed = true;
-            tracing::warn!(error = %e, path = %t.path.display(), "transcript write failed; continuing without it");
+            // Required mode: on disk before the action it describes.
+            .and_then(|_| if required { t.file.sync_data() } else { Ok(()) });
+        match (&written, sealed) {
+            (Ok(()), Ok(h)) => t.prev = h,
+            (Ok(()), Err(e)) => {
+                // Unreachable in practice (seal adds the salt it needs); the
+                // record is written unchained and the verifier will say so.
+                tracing::warn!(error = %e, "transcript record could not be chained");
+                self.audit_failed |= required;
+            }
+            (Err(e), _) => {
+                if !t.failed {
+                    t.failed = true;
+                    tracing::warn!(error = %e, path = %t.path.display(), "transcript write failed");
+                }
+                self.audit_failed |= required;
+            }
         }
         Some(seq)
     }
@@ -253,14 +412,22 @@ fn open_locked(path: &Path) -> std::io::Result<File> {
         .create(true)
         .mode(0o600)
         .open(path)?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(std::fs::TryLockError::WouldBlock) => Err(std::io::Error::other(format!(
-            "{} is in use by another mima process",
-            path.display()
-        ))),
-        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    // A child process forked (by any thread) between our open and its exec
+    // holds an inherited copy of the lock until the exec closes it, so a
+    // just-released transcript can look busy for a moment: retry briefly.
+    for _ in 0..LOCK_RETRIES {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                std::thread::sleep(std::time::Duration::from_millis(10))
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(e),
+        }
     }
+    Err(std::io::Error::other(format!(
+        "{} is in use by another mima process",
+        path.display()
+    )))
 }
 
 /// Copies `extra`'s fields into `base` (both JSON objects).
@@ -510,6 +677,28 @@ mod tests {
         assert_eq!(b.record("turn_start", json!({ "turn": 2 })), Some(5));
         assert_eq!(b.started_utc(), "2026-09-30T00:00:00.000Z");
         assert_eq!(b.id(), a.id());
+    }
+
+    #[test]
+    fn required_mode_marks_a_failed_ledger_write() {
+        let mut s = Session::new(temp_dir("required"), 1024);
+        s.set_ledger(Some(Ledger::new(
+            PathBuf::from("/proc/mima-no/ledger.jsonl"),
+            false,
+        )));
+        s.set_required(true);
+        assert!(s.audit_ok());
+        s.begin("one_shot", false);
+        assert!(!s.audit_ok(), "a lost ledger entry must stop required mode");
+
+        // Outside required mode the same failure only warns.
+        let mut s = Session::new(temp_dir("not-required"), 1024);
+        s.set_ledger(Some(Ledger::new(
+            PathBuf::from("/proc/mima-no/ledger.jsonl"),
+            false,
+        )));
+        s.begin("one_shot", false);
+        assert!(s.audit_ok());
     }
 
     #[test]

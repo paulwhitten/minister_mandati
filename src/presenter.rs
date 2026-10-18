@@ -13,13 +13,31 @@ pub enum Approval {
     Deny,
 }
 
+/// An operator's answer to an approval prompt, with what the audit record
+/// needs: the exact text shown and how the answer was given.
+#[derive(Debug, Clone)]
+pub struct ApprovalReply {
+    pub decision: Approval,
+    /// `yes`, `no`, `empty` (Enter, which denies) or `eof` (no input: denies).
+    pub answer: &'static str,
+    /// The question exactly as displayed.
+    pub shown: String,
+}
+
 /// Interprets a line of user input as an approval decision: `y`/`yes` allow
 /// and `n`/`no` deny, in any mix of case; an empty answer takes the default,
 /// deny. Anything else is `None` (not understood; ask again).
+#[cfg(test)]
 pub fn parse_approval(input: &str) -> Option<Approval> {
+    parse_answer(input).map(|(d, _)| d)
+}
+
+/// The decision and how it was given (`yes`, `no` or `empty`).
+fn parse_answer(input: &str) -> Option<(Approval, &'static str)> {
     match input.trim().to_ascii_lowercase().as_str() {
-        "y" | "yes" => Some(Approval::Allow),
-        "n" | "no" | "" => Some(Approval::Deny),
+        "y" | "yes" => Some((Approval::Allow, "yes")),
+        "n" | "no" => Some((Approval::Deny, "no")),
+        "" => Some((Approval::Deny, "empty")),
         _ => None,
     }
 }
@@ -106,7 +124,7 @@ pub fn ask_approval(
     question: &str,
     input: &mut impl BufRead,
     out: &mut impl Write,
-) -> io::Result<Approval> {
+) -> io::Result<(Approval, &'static str)> {
     writeln!(out, "{question}")?;
     loop {
         write!(out, "Approve? (y/N): ")?;
@@ -114,10 +132,10 @@ pub fn ask_approval(
         let mut line = String::new();
         if input.read_line(&mut line)? == 0 {
             writeln!(out)?;
-            return Ok(Approval::Deny);
+            return Ok((Approval::Deny, "eof"));
         }
-        match parse_approval(&line) {
-            Some(decision) => return Ok(decision),
+        match parse_answer(&line) {
+            Some(answer) => return Ok(answer),
             None => writeln!(out, "Sorry, I didn't get that. Please answer y or n.")?,
         }
     }
@@ -152,7 +170,11 @@ pub trait Presenter {
     /// Ask the operator to approve a state-changing action. `preview` is
     /// what the tool will change (a diff for edits and overwrites), if it
     /// provides one; otherwise the front end describes the call itself.
-    fn request_approval(&mut self, call: &ToolCall, preview: Option<&str>) -> io::Result<Approval>;
+    fn request_approval(
+        &mut self,
+        call: &ToolCall,
+        preview: Option<&str>,
+    ) -> io::Result<ApprovalReply>;
 
     /// The final assistant answer for the task.
     fn final_answer(&mut self, content: &str);
@@ -162,8 +184,6 @@ pub trait Presenter {
 /// stdout/stdin. Requires only the core dependencies.
 #[derive(Default)]
 pub struct CliPresenter {
-    /// Approve every request without asking (evaluation harness only).
-    pub approve_all: bool,
     /// A streamed line is open on stdout and needs a closing newline.
     line_open: bool,
     /// Content was streamed this step, so `final_answer` must not reprint it.
@@ -200,19 +220,24 @@ impl Presenter for CliPresenter {
         self.close_line();
     }
 
-    fn request_approval(&mut self, call: &ToolCall, preview: Option<&str>) -> io::Result<Approval> {
-        if self.approve_all {
-            return Ok(Approval::Allow);
-        }
-        let question = match preview {
+    fn request_approval(
+        &mut self,
+        call: &ToolCall,
+        preview: Option<&str>,
+    ) -> io::Result<ApprovalReply> {
+        let shown = match preview {
             Some(p) => render_preview(p, io::stdout().is_terminal()),
             None => describe_action(call),
         };
-        let decision = ask_approval(&question, &mut io::stdin().lock(), &mut io::stdout())?;
+        let (decision, answer) = ask_approval(&shown, &mut io::stdin().lock(), &mut io::stdout())?;
         if decision == Approval::Deny {
             println!("Denied.");
         }
-        Ok(decision)
+        Ok(ApprovalReply {
+            decision,
+            answer,
+            shown,
+        })
     }
 
     fn final_answer(&mut self, content: &str) {
@@ -249,14 +274,28 @@ mod tests {
     }
 
     fn ask(answers: &str) -> (Approval, String) {
+        let (d, _, out) = ask_full(answers);
+        (d, out)
+    }
+
+    fn ask_full(answers: &str) -> (Approval, &'static str, String) {
         let mut out = Vec::new();
-        let d = ask_approval(
+        let (d, how) = ask_approval(
             "Run shell command:\n  ls",
             &mut answers.as_bytes(),
             &mut out,
         )
         .unwrap();
-        (d, String::from_utf8(out).unwrap())
+        (d, how, String::from_utf8(out).unwrap())
+    }
+
+    #[test]
+    fn answers_say_how_they_were_given() {
+        assert_eq!(ask_full("y\n").1, "yes");
+        assert_eq!(ask_full("no\n").1, "no");
+        assert_eq!(ask_full("\n").1, "empty");
+        assert_eq!(ask_full("").1, "eof");
+        assert_eq!(ask_full("huh\nYES\n").1, "yes");
     }
 
     #[test]
