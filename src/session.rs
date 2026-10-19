@@ -719,7 +719,10 @@ mod tests {
 
     #[test]
     fn sanitizes_labels() {
-        assert_eq!(sanitize_label("cli_agent").as_deref(), Some("cli_agent"));
+        assert_eq!(
+            sanitize_label("minister_mandati").as_deref(),
+            Some("minister_mandati")
+        );
         assert_eq!(
             sanitize_label("my repo: v2").as_deref(),
             Some("my_repo__v2")
@@ -760,15 +763,15 @@ mod tests {
     #[test]
     fn id_and_file_name_carry_the_label() {
         let dir = temp_dir("label");
-        let mut s = Session::with_label(dir, 1024, Some("cli_agent".into()));
+        let mut s = Session::with_label(dir, 1024, Some("minister_mandati".into()));
         let parts: Vec<&str> = s.id().split('-').collect();
         assert_eq!(parts.len(), 3, "{}", s.id());
         assert_eq!(parts[0].len(), 16); // 20260927T143205Z
-        assert_eq!(parts[1], "cli_agent");
+        assert_eq!(parts[1], "minister_mandati");
         assert_eq!(parts[2].len(), 4);
         let path = s.enable(json!({})).unwrap();
         assert_eq!(path.file_stem().unwrap().to_str().unwrap(), s.id());
-        assert!(s.successor().id().contains("-cli_agent-"));
+        assert!(s.successor().id().contains("-minister_mandati-"));
 
         let unlabeled = Session::with_label(temp_dir("nolabel"), 1024, None);
         assert_eq!(unlabeled.id().split('-').count(), 2);

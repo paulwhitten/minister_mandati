@@ -11,6 +11,7 @@ mod client;
 mod config;
 mod context;
 mod evidence;
+mod instructions;
 mod loop_guard;
 mod presenter;
 #[cfg(test)]
@@ -99,6 +100,10 @@ struct Cli {
     /// chain is broken, recording that you accepted it (chain_reset).
     #[arg(long)]
     accept_chain_break: bool,
+
+    /// Do not load AGENTS.md project instructions for this run.
+    #[arg(long)]
+    no_project_instructions: bool,
 
     /// Check a transcript's audit chain and its heads against the session
     /// ledger, then exit: a session id (a unique prefix is enough), "last",
@@ -198,6 +203,9 @@ async fn run(cli: Cli, presenter: &mut dyn Presenter) -> Result<(), snafu::Whate
         config.agent.max_steps = n;
     }
     config.security.approve_all = cli.approve_all;
+    if cli.no_project_instructions {
+        config.instructions.enabled = false;
+    }
     // Required mode only tightens, so it applies however the config was found.
     config.audit.required |= cli.audit
         || std::env::var("MIMA_AUDIT").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
@@ -220,7 +228,16 @@ async fn run(cli: Cli, presenter: &mut dyn Presenter) -> Result<(), snafu::Whate
     if required {
         check_audit_exposure(&config, &registry)?;
     }
+    let loaded = instructions::load(
+        &config.instructions,
+        &std::env::current_dir().unwrap_or_default(),
+        std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .as_deref(),
+        config.prompt_overridden(),
+    );
     let mut ctx = AgentContext::new(config, specs);
+    ctx.set_instructions(loaded);
     ctx.session.set_ledger(ledger);
     ctx.session.set_required(required);
     agent::configure_window(&mut ctx).await;
@@ -269,7 +286,9 @@ async fn run(cli: Cli, presenter: &mut dyn Presenter) -> Result<(), snafu::Whate
     }
     ctx.session.begin(mode.as_str(), cli.resume.is_some());
     if mode != Mode::Interactive {
-        announce_transcript(&ctx, mode); // the REPL announces after its banner
+        // The REPL announces after its banner.
+        announce_transcript(&ctx, mode);
+        eprintln!("{}", ctx.instructions.summary());
     }
 
     let result = match mode {
@@ -515,6 +534,7 @@ async fn run_repl(
 
     println!("minister_mandati (mima) — interactive mode. /help for commands, Ctrl-D to exit.");
     announce_transcript(ctx, Mode::Interactive);
+    println!("{}", ctx.instructions.summary());
 
     // Line editing (arrow keys, Home/End, Delete, history with Up/Down).
     // History stays in memory for this process; nothing is written to disk.
@@ -571,6 +591,7 @@ async fn run_repl(
                     println!("Transcripts: off.");
                 }
                 "tokens" => print_tokens(ctx),
+                "instructions" => println!("{}", ctx.instructions.details()),
                 "context" => print_context(ctx),
                 "help" => print_help(),
                 other => println!("unknown command: /{other} (try /help)"),
@@ -710,7 +731,8 @@ fn resume_session(ctx: &mut AgentContext, id: &str, accept_break: bool) -> Resul
         "session_resumed",
         json!({ "method": rebuilt.method, "reason": rebuilt.reason, "from_seq": rebuilt.from_seq,
                 "mima_version": env!("CARGO_PKG_VERSION"), "model": model,
-                "cwd": cwd.display().to_string(), "changed_files": changed }),
+                "cwd": cwd.display().to_string(), "changed_files": changed,
+                "instructions": ctx.instructions.record() }),
     );
 
     let how = match &rebuilt.reason {
@@ -832,6 +854,7 @@ fn print_help() {
         "commands:\n  \
          /help                show this help\n  \
          /tokens              show token usage\n  \
+         /instructions        show the AGENTS.md files loaded and their text\n  \
          /context             show context budget\n  \
          /session             show session id, start time and transcript\n  \
          /new                 start a new session (alias: /reset)\n  \

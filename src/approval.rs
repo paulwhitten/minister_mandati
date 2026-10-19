@@ -72,6 +72,16 @@ pub fn policy(cfg: &Config, call: &ToolCall, sandboxed: bool) -> Policy {
             Policy::ask()
         }
         "write_file" | "edit_file" if cfg.security.require_approval_for_writes => Policy::ask(),
+        // What the next session loads as instructions or configuration:
+        // always a person's decision (docs/design/design-project-instructions.md).
+        "write_file" | "edit_file"
+            if crate::instructions::is_protected_name(
+                call.args["path"].as_str().unwrap_or(""),
+                &cfg.instructions.files,
+            ) =>
+        {
+            Policy::ask()
+        }
         "write_file" | "edit_file" => Policy::rule("not_required", "approval.writes_not_required"),
         _ => Policy::rule("not_required", "approval.read_only"), // read-only tools never prompt
     }
@@ -224,6 +234,23 @@ mod tests {
         ] {
             assert!(crate::audit::RULES.contains(&p.rule.unwrap()));
         }
+    }
+
+    #[test]
+    fn writes_to_instruction_files_always_ask() {
+        let mut cfg = Config::default();
+        cfg.security.require_approval_for_writes = false;
+        let write = |path: &str| ToolCall {
+            id: "1".into(),
+            name: "write_file".into(),
+            args: json!({ "path": path, "content": "x" }),
+        };
+        assert!(!needs_approval(&cfg, &write("src/lib.rs"), true));
+        assert!(needs_approval(&cfg, &write("AGENTS.md"), true));
+        assert!(needs_approval(&cfg, &write("sub/agents.md"), true));
+        assert!(needs_approval(&cfg, &write("agent.toml"), true));
+        cfg.instructions.files.push("CLAUDE.md".into());
+        assert!(needs_approval(&cfg, &write("CLAUDE.md"), true));
     }
 
     #[test]

@@ -340,7 +340,7 @@ no pager, and a timeout. A git failure is recorded, not hidden.
 At session end mima prints the head, the record count and the path:
 
 ```
-Transcript head: sha256:9c41…7be2 (214 records) ~/.mima/transcripts/20261018T140301Z-cli_agent-3f9a.jsonl
+Transcript head: sha256:9c41…7be2 (214 records) ~/.mima/transcripts/20261018T140301Z-minister_mandati-3f9a.jsonl
 ```
 
 **Session ledger.** `~/.mima/ledger.jsonl` (mode 0600) gets one record per

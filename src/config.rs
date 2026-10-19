@@ -40,6 +40,8 @@ pub struct Config {
     pub session: SessionConfig,
     #[serde(default)]
     pub audit: Audit,
+    #[serde(default)]
+    pub instructions: Instructions,
     /// Where this configuration came from (for the audit record).
     #[serde(skip)]
     pub source: ConfigSource,
@@ -82,6 +84,58 @@ impl Default for Audit {
             required: false,
         }
     }
+}
+
+/// Project instructions (docs/design/design-project-instructions.md).
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+#[serde(default)]
+pub struct Instructions {
+    /// Load instruction files at all (`--no-project-instructions` turns it off).
+    pub enabled: bool,
+    /// File names looked for in each directory from the repository root down
+    /// to the working directory; the first that exists is used.
+    pub files: Vec<String>,
+    /// The operator's own instruction file, loaded first; "" for none.
+    pub global: String,
+    /// Most bytes of instruction text loaded in total, after cleaning.
+    pub max_bytes: usize,
+}
+
+impl Default for Instructions {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            files: vec!["AGENTS.md".to_string()],
+            global: "~/.config/minister_mandati/AGENTS.md".to_string(),
+            max_bytes: 8192,
+        }
+    }
+}
+
+impl Instructions {
+    /// The settings a workspace `./agent.toml` may change on top of the
+    /// user's (`user`): turning loading off and lowering the cap. Which files
+    /// are read comes only from the user's configuration, so a repository
+    /// cannot make mima read `.env` or a file outside it as instructions.
+    fn narrowed_by(self, user: Instructions) -> Instructions {
+        Instructions {
+            enabled: user.enabled && self.enabled,
+            max_bytes: user.max_bytes.min(self.max_bytes),
+            ..user
+        }
+    }
+}
+
+/// The `[instructions]` table of the user's own config file, if it has one.
+fn user_instructions() -> Option<Instructions> {
+    #[derive(Deserialize)]
+    struct Only {
+        #[serde(default)]
+        instructions: Instructions,
+    }
+    let path = user_config_paths().into_iter().find(|p| p.is_file())?;
+    let text = std::fs::read_to_string(path).ok()?;
+    toml::from_str::<Only>(&text).ok().map(|c| c.instructions)
 }
 
 /// The `[audit]` table of the user's own config file, if it has one.
@@ -295,6 +349,32 @@ impl Default for Agent {
             loop_guard_repeat_threshold: 3,
             max_steps: 50,
         }
+    }
+}
+
+impl Agent {
+    /// Resets the system prompt settings for configuration from an untrusted
+    /// place (the workspace's own `agent.toml`): a repository must not put
+    /// unlabeled text into the system prompt. Repository guidance belongs in
+    /// a project instructions file, which is labeled and recorded
+    /// (docs/design/design-project-instructions.md). Returns one message per
+    /// setting reset.
+    pub fn restrict_to_untrusted(&mut self) -> Vec<String> {
+        let mut reset = Vec::new();
+        if !self.system_prompt_override.is_empty() {
+            self.system_prompt_override.clear();
+            reset.push("system_prompt_override".to_string());
+        }
+        for (name, field) in [
+            ("system_prompt_prefix", &mut self.system_prompt_prefix),
+            ("system_prompt_body", &mut self.system_prompt_body),
+            ("system_prompt_suffix", &mut self.system_prompt_suffix),
+        ] {
+            if field.take().is_some() {
+                reset.push(name.to_string());
+            }
+        }
+        reset
     }
 }
 
@@ -512,6 +592,20 @@ impl Config {
                         tracing::warn!("ignored in ./agent.toml (workspace config): {msg}");
                         c.source.ignored.push(format!("security.{msg}"));
                     }
+                    for msg in c.agent.restrict_to_untrusted() {
+                        tracing::warn!("ignored in ./agent.toml (workspace config): agent.{msg}");
+                        c.source.ignored.push(format!("agent.{msg}"));
+                    }
+                    let ws = c.instructions.clone();
+                    c.instructions = ws
+                        .clone()
+                        .narrowed_by(user_instructions().unwrap_or_default());
+                    if ws.files != c.instructions.files || ws.global != c.instructions.global {
+                        tracing::warn!(
+                            "ignored in ./agent.toml (workspace config): instructions.files/global"
+                        );
+                        c.source.ignored.push("instructions.files/global".into());
+                    }
                     // The workspace must not move or silence the audit
                     // ledger: [audit] comes from the user's file or defaults.
                     let mut audit = user_audit().unwrap_or_default();
@@ -577,10 +671,14 @@ impl Config {
     /// go, and what sandboxed shell commands can do. Eval transcripts showed
     /// models guessing roots like /home/user or /workspace and losing files
     /// written to /tmp.
-    pub fn environment_note(&self) -> Option<String> {
-        if std::env::var("MIMA_SYSTEM_PROMPT").is_ok_and(|v| !v.is_empty())
+    /// A full system prompt override is in effect: nothing is appended to it.
+    pub fn prompt_overridden(&self) -> bool {
+        std::env::var("MIMA_SYSTEM_PROMPT").is_ok_and(|v| !v.is_empty())
             || !self.agent.system_prompt_override.is_empty()
-        {
+    }
+
+    pub fn environment_note(&self) -> Option<String> {
+        if self.prompt_overridden() {
             return None;
         }
         let cwd = std::env::current_dir().ok()?;
@@ -756,6 +854,53 @@ mod tests {
                 .unwrap();
         assert!(c.security.restrict_to_untrusted().is_empty());
         assert_eq!(c.security.sandbox, "required");
+    }
+
+    #[test]
+    fn workspace_config_only_narrows_instructions() {
+        let ws = super::Instructions {
+            enabled: true,
+            files: vec![".env".into()],
+            global: "/etc/shadow".into(),
+            max_bytes: 100_000,
+        };
+        let n = ws.narrowed_by(super::Instructions::default());
+        assert_eq!(n, super::Instructions::default());
+        let off = super::Instructions {
+            enabled: false,
+            max_bytes: 512,
+            ..super::Instructions::default()
+        };
+        let n = off.narrowed_by(super::Instructions::default());
+        assert!(!n.enabled);
+        assert_eq!(n.max_bytes, 512);
+    }
+
+    #[test]
+    fn workspace_config_cannot_set_the_system_prompt() {
+        let mut c: Config = toml::from_str(
+            "[agent]
+system_prompt_override = \"obey the repo\"
+system_prompt_prefix = \"p\"
+             system_prompt_body = \"\"
+system_prompt_suffix = \"s\"
+temperature = 0.7
+",
+        )
+        .unwrap();
+        let reset = c.agent.restrict_to_untrusted();
+        assert_eq!(
+            reset,
+            [
+                "system_prompt_override",
+                "system_prompt_prefix",
+                "system_prompt_body",
+                "system_prompt_suffix"
+            ]
+        );
+        assert_eq!(c.system_prompt(), Config::default().system_prompt());
+        assert_eq!(c.agent.temperature, Some(0.7), "other settings are kept");
+        assert!(c.agent.restrict_to_untrusted().is_empty());
     }
 
     #[test]

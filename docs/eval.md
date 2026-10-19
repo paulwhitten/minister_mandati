@@ -17,7 +17,7 @@ layout (`tasks/`, `suites/`, and its own `profiles.toml`, `cache/` and
 `runs/`), so that reference solutions and hidden checks are not published with
 the agent: published solutions end up in model training data and spoil later
 evaluations. `mima-eval` runs any suite by path, for example
-`mima-eval run ../cli_agent_eval/suites/all.toml --profiles ../cli_agent_eval/profiles.toml`,
+`mima-eval run ../mima_eval/suites/all.toml --profiles ../mima_eval/profiles.toml`,
 and records both repositories' commits in `run.json`.
 
 ## Concepts

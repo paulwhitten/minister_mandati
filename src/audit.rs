@@ -38,6 +38,7 @@ const CONTENT: &[(&str, &str)] = &[
     ("tool_result", "output_full_sha256"),
     ("turn_end", "answer"),
     ("context", "entries/*/text"),
+    ("session_start", "system_prompt/text"),
 ];
 
 /// Every rule id mima can write. Listed in docs/sessions.md; a test keeps
@@ -115,6 +116,7 @@ const HEADER: &[&str] = &[
     "operator",
     "workspace",
     "os",
+    "instructions",
 ];
 
 /// Bytes read from the end of a file to find its last line.

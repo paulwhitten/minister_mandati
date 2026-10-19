@@ -226,6 +226,8 @@ pub struct AgentContext {
     pub server_version: Option<String>,
     /// The workspace's git state when the last turn ended, for `turn_end`.
     pub turn_end_workspace: Option<serde_json::Value>,
+    /// Project instruction files loaded into the system prompt.
+    pub instructions: crate::instructions::Loaded,
     messages: Vec<Message>,
     /// Number of leading messages that are never evicted (system + first user turn).
     pinned: usize,
@@ -245,6 +247,16 @@ pub struct AgentContext {
 }
 
 impl AgentContext {
+    /// Appends the project instructions to the system prompt (once, before
+    /// the first request) and keeps them for the audit record.
+    pub fn set_instructions(&mut self, loaded: crate::instructions::Loaded) {
+        if let Some(section) = loaded.prompt_section() {
+            let base = self.messages[0].content.clone().unwrap_or_default();
+            self.messages[0] = Message::system(&format!("{base}\n\n{section}"));
+        }
+        self.instructions = loaded;
+    }
+
     /// The system prompt as sent.
     pub fn system_prompt_text(&self) -> &str {
         self.messages[0].content.as_deref().unwrap_or("")
@@ -271,6 +283,7 @@ impl AgentContext {
             server_model: None,
             server_version: None,
             turn_end_workspace: None,
+            instructions: crate::instructions::Loaded::default(),
             messages: vec![Message::system(&system_prompt)],
             pinned: 1,
             turn_start: None,

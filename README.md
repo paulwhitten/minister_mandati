@@ -98,6 +98,9 @@ Options:
       --accept-chain-break
           With --resume in required mode: continue a transcript whose audit chain is broken, recording that you accepted it (chain_reset)
 
+      --no-project-instructions
+          Do not load AGENTS.md project instructions for this run
+
       --audit-verify <ID|PATH>
           Check a transcript's audit chain and its heads against the session ledger, then exit: a session id (a unique prefix is enough), "last", or a file path. Exit status 1 if any check fails
 
@@ -191,6 +194,24 @@ Static glibc still resolves hostnames through NSS at runtime, so behavior can
 differ from the dynamic build on hosts with unusual NSS configuration. A musl
 build (`--target x86_64-unknown-linux-musl`) avoids this but needs a musl C
 compiler (e.g. the `musl-tools` package) for the `ring` crate.
+
+## Project instructions (AGENTS.md)
+
+`mima` reads `AGENTS.md` files, the common convention for telling coding
+agents how to work in a repository: every `AGENTS.md` from the repository
+root (the nearest `.git`) down to the working directory, root first, plus
+your own `~/.config/minister_mandati/AGENTS.md` if it exists. They are read
+once at startup, cleaned of invisible characters, capped at 8 KiB in total,
+and added to the end of the system prompt in a labeled section that says
+they cannot change tools, approvals or the sandbox. `mima` prints what it
+loaded (`Instructions: AGENTS.md (1.2 KiB)`); `/instructions` shows the
+text; `--no-project-instructions` turns it off for a run. A workspace
+`./agent.toml` can only turn loading off or lower the cap, and can no longer
+set the system prompt. Writes to files named like an instruction file or
+`agent.toml` always ask for approval. Keep the file short and specific (the
+commands to build and test, what not to touch): in published measurements,
+long or generated files raised cost without improving results. Design:
+[docs/design/design-project-instructions.md](docs/design/design-project-instructions.md).
 
 ## Sessions and transcripts
 

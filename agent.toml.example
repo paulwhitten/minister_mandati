@@ -63,6 +63,17 @@ allowed_paths = ["./"]
 # transcript_dir = "~/.mima/transcripts"
 # max_output_bytes = 1048576  # per tool output stored in a transcript
 
+# Project instructions (see docs/design/design-project-instructions.md):
+# AGENTS.md files from the repository root down to the working directory,
+# plus your own global file, added to the system prompt as labeled guidance.
+# A workspace ./agent.toml may only turn this off or lower max_bytes.
+[instructions]
+# enabled = true                                  # or --no-project-instructions
+# files = ["AGENTS.md"]                           # per directory, first match wins
+#                                                 # (e.g. ["AGENTS.md", "CLAUDE.md"])
+# global = "~/.config/minister_mandati/AGENTS.md" # "" for none
+# max_bytes = 8192                                # total loaded, after cleaning
+
 # Audit record (see docs/design/design-audit-record.md).
 #
 # Every recorded transcript is hash-chained: each record carries a hash of

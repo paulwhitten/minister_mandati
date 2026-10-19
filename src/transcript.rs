@@ -138,6 +138,10 @@ pub struct SessionStart {
     pub workspace: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub os: Option<Value>,
+    /// Project instruction files: cap, loaded bytes, per-file path, sizes,
+    /// hashes, truncation, removed characters, skip reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,6 +178,9 @@ pub struct SessionResumed {
     /// Files that differ on disk from what the session last saw.
     #[serde(default)]
     pub changed_files: Vec<FileChange>,
+    /// The project instruction files the continuation loaded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

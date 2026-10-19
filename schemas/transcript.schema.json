@@ -624,6 +624,9 @@
             "null"
           ]
         },
+        "instructions": {
+          "description": "The project instruction files the continuation loaded."
+        },
         "method": {
           "description": "\"context\" (rebuilt from a context record) or \"replay\".",
           "type": "string"
@@ -726,6 +729,9 @@
             "integer",
             "null"
           ]
+        },
+        "instructions": {
+          "description": "Project instruction files: cap, loaded bytes, per-file path, sizes,\nhashes, truncation, removed characters, skip reason."
         },
         "mima_version": {
           "default": null,

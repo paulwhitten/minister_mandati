@@ -343,6 +343,7 @@ pub fn header(ctx: &AgentContext, runner: &CommandRunner, workspace: Option<Valu
         "operator": operator(c.audit.record_host),
         "workspace": workspace,
         "os": os_info(),
+        "instructions": ctx.instructions.record(),
     })
 }
 

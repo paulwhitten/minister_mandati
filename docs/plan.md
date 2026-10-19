@@ -68,7 +68,7 @@ Headline conclusions:
 | Cloud endpoints (Azure OpenAI) | Done | [cloud-providers.md](cloud-providers.md) |
 | Summarizing compaction: a short progress note when steps are evicted | Planned | |
 | `recall_output` tool: fetch a masked tool output back by call ID from the transcript | Planned | |
-| Project instructions file loaded into the system prompt (nearest file up to the repository root) | Planned | |
+| Project instructions: `AGENTS.md` from the repository root to the working directory plus a global file, cleaned, capped, labeled, recorded; workspace `agent.toml` can no longer set the system prompt | Done (paired A/B pending) | [design/design-project-instructions.md](design/design-project-instructions.md) |
 | Verifier-gated self-refine wired into the loop | Planned | |
 
 Exit criteria:
@@ -206,7 +206,7 @@ Ordered by dependency, then impact:
 3. Verifier-gated self-refine: detect the project's build and test command,
    run it after edits, feed failures back, and require a passing check (or a
    stated reason) before the final answer.
-4. Project instructions file and the TODO tool.
+4. The TODO tool (project instructions done; measure them with a paired A/B using hand-written AGENTS.md files on a task subset).
 5. Summarizing compaction and `recall_output`, measured on the 8k-window
    regression task.
 6. Prompt-injection red-team track, then taint tracking and tool-argument

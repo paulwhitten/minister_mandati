@@ -16,7 +16,7 @@ starts:
 ```
 Transcripts: off. Enable with /enable_transcript.     (interactive)
 Transcripts: off. Enable with --transcript.            (one-shot, on stderr)
-Transcripts: on (/home/user/.mima/transcripts/20260927T143205Z-cli_agent-3f9a.jsonl)
+Transcripts: on (/home/user/.mima/transcripts/20260927T143205Z-minister_mandati-3f9a.jsonl)
 ```
 
 Turn them on for one run with `--transcript`, during an interactive session
@@ -57,8 +57,8 @@ never write to one file; each running process has its own session.
 ## Session id and file name
 
 ```
-~/.mima/transcripts/20260927T143205Z-cli_agent-3f9a.jsonl
-                    └── start time ──┘ └ label ┘ └┘ 4 hex chars of randomness
+~/.mima/transcripts/20260927T143205Z-minister_mandati-3f9a.jsonl
+                    └─ start time ─┘ └─── label ────┘ └──┘ 4 hex chars of randomness
 ```
 
 - The id and the file name are the same string, so `/session` output maps
@@ -103,7 +103,7 @@ plus the audit chain fields `salt` and `hash` (see "Audit chain and session
 ledger" below; the example lines omit them).
 
 ```json
-{"seq":0,"ts":"2026-09-27T14:32:05.123Z","type":"session_start","schema":1,"session":"20260927T143205Z-cli_agent-3f9a","session_started":"2026-09-27T14:32:05.120Z","turns_before":0,"mima_version":"0.1.0","mode":"interactive","cwd":"/home/user/cli_agent/src","model":"nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4","base_url":"http://thor.local:8000/v1","window":32768,"budget":27689,"approvals":{"bash":true,"writes":true,"auto_approve_bash":["cargo test"]}}
+{"seq":0,"ts":"2026-09-27T14:32:05.123Z","type":"session_start","schema":1,"session":"20260927T143205Z-minister_mandati-3f9a","session_started":"2026-09-27T14:32:05.120Z","turns_before":0,"mima_version":"0.1.0","mode":"interactive","cwd":"/home/user/minister_mandati/src","model":"nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4","base_url":"http://thor.local:8000/v1","window":32768,"budget":27689,"approvals":{"bash":true,"writes":true,"auto_approve_bash":["cargo test"]}}
 {"seq":1,"ts":"2026-09-27T14:32:09.870Z","type":"turn_start","turn":1,"instruction":"add a unit test for truncate_middle"}
 {"seq":2,"ts":"2026-09-27T14:32:14.402Z","type":"model_response","turn":1,"step":0,"duration_ms":4521,"content":null,"tool_calls":[{"id":"call_1","name":"read_file","args":{"path":"src/tools/mod.rs"}}],"usage":{"prompt":1843,"completion":61}}
 {"seq":3,"ts":"2026-09-27T14:32:14.405Z","type":"approval","turn":1,"call_id":"call_1","decision":"not_required"}
@@ -167,7 +167,8 @@ salt || 0x00 || canonical(value)))`, where the field salt is `SHA-256(salt ||
 path)`. Content fields: `turn_start.instruction`, `model_response.content`,
 `.reasoning` and `.tool_calls/*/args`, `approval.preview`,
 `tool_result.output` and `.output_full_sha256`, `turn_end.answer`,
-`context.entries/*/text`. Canonical encoding: keys sorted, no whitespace,
+`context.entries/*/text`, `session_start.system_prompt/text` (it includes
+the project instructions). Canonical encoding: keys sorted, no whitespace,
 minimal escaping, integers as written, floats in shortest round-trip form.
 
 **Sharing.** `mima --audit-export <id> --withhold <set> [--output FILE]`
@@ -217,7 +218,12 @@ effective configuration without the API key), `system_prompt` (`text` and
 `sha256`), `tools` (`names`, `sha256` of the specifications sent),
 `sampling`, `server` (the model's `/models` entry, the server version),
 `sandbox`, `operator` (`user`, `uid`, `host`, `tty`), `workspace` (`root`,
-`git`: `head`, `branch`, `status_sha256`, `dirty`) and `os`. `turn_start` and
+`git`: `head`, `branch`, `status_sha256`, `dirty`), `os`, and `instructions`
+(the project instruction files: `cap`, `loaded_bytes`, `override`, and per
+file `source`, `path`, `scope`, `bytes`, `raw_sha256`, `loaded_sha256`,
+`loaded_bytes`, `truncated`, `removed_chars`, `skipped`;
+[design/design-project-instructions.md](design/design-project-instructions.md)).
+`session_resumed` also carries `instructions`. `turn_start` and
 `turn_end` carry `workspace` (the git summary). `model_response` carries
 `request_sha256` (the exact request body), `response_id` and
 `served_model`. File tools' `file` adds `before_sha256` (null: the file did
