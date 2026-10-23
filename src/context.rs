@@ -1836,7 +1836,9 @@ mod tests {
         let text = c.report().render(false);
         assert!(text.contains("Window W 32,768 (assumed) ="), "{text}");
         assert!(text.contains("set\n        [context].window"), "{text}");
-        assert!(text.lines().all(|l| l.len() <= 90), "{text}");
+        let mut hints = text.lines().skip_while(|l| !l.starts_with("  Hint:"));
+        assert!(hints.clone().count() >= 2, "{text}");
+        assert!(hints.all(|l| l.len() <= 80), "{text}");
         c.set_window(65_536, crate::context_report::WINDOW_SERVER);
         let text = c.report().render(false);
         assert!(text.contains("Window W 65,536 (from server) ="), "{text}");
