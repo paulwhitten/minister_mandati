@@ -104,6 +104,32 @@ replacement, is colored on a terminal, and is cut after 200 lines. Control
 characters in model-supplied text are shown escaped. The diff and the
 decision are recorded in the session transcript ([sessions.md](sessions.md)).
 
+## Tool arguments
+
+Before approval, every call's arguments are checked against the types its
+tool declares. vLLM converts argument values only for tools it was given, so
+a call under another agent's tool name (`str_replace_editor`) arrives as
+text, as in `"offset": "735"`.
+
+- **Converted** when the meaning is exact: digits for an integer (`" 42 "`),
+  a whole number such as `5.0` for an integer, `true`/`false` in any case
+  for a boolean, JSON text for an array or object (`"[1, 100]"`), and
+  `null` as an absent argument (its default applies). The transcript
+  records each conversion in `tool_result.converted` as `{arg, from}`
+  (rule `tools.convert_args`).
+- **Refused** otherwise, with the argument and the expected type, and the
+  call does not run: `read_file: argument \`offset\` must be a whole number,
+  got "two"`. This covers `"7.5"` or `7.5` for an integer, `"yes"` or `1`
+  for a boolean, and a value below the schema's `minimum` (negative offsets
+  and limits). A bad value is never replaced by the default.
+- Arguments the tool does not declare, and string arguments, are passed as
+  sent.
+
+OpenHands' agent SDK takes the same approach: it decodes lists and objects
+sent as JSON strings, then validates with pydantic and returns the
+validation error to the model. Its boolean conversion also accepts `yes`,
+`on` and `1`; mima accepts only `true` and `false`.
+
 ## Errors the model sees
 
 Every failure says that nothing changed, why, and what to do next, and

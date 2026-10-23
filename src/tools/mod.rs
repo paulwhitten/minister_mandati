@@ -90,6 +90,129 @@ pub trait BaseTool: Send + Sync {
     }
 }
 
+/// A non-negative integer argument, given as a JSON number or as a string
+/// of digits: some models send `"offset": "735"` for an integer parameter.
+/// Calls are checked against their schema first (`conform`); this also
+/// reads other agents' arguments while `normalize_call` maps them.
+pub fn arg_u64(args: &Value, key: &str) -> Option<u64> {
+    args.get(key).and_then(lenient_u64)
+}
+
+/// A boolean argument, given as `true`/`false` or as the strings
+/// `"true"`/`"false"`.
+pub fn arg_bool(args: &Value, key: &str) -> Option<bool> {
+    match args.get(key)? {
+        Value::Bool(b) => Some(*b),
+        Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn lenient_u64(v: &Value) -> Option<u64> {
+    v.as_u64().or_else(|| v.as_str()?.trim().parse().ok())
+}
+
+fn lenient_i64(v: &Value) -> Option<i64> {
+    v.as_i64().or_else(|| v.as_str()?.trim().parse().ok())
+}
+
+/// Brings a call's arguments to the JSON types its tool's schema declares,
+/// before approval and execution. vLLM converts argument values only for
+/// tools it was given, so a call under another agent's tool name arrives
+/// as text: `"offset": "735"`, `"replace_all": "true"`, `"[1, 100]"`.
+///
+/// A value whose meaning is exact is converted and listed as `{arg, from}`
+/// for the audit record (rule `tools.convert_args`): digits for an integer,
+/// `true`/`false` for a boolean, JSON text for an array or object, a whole
+/// number for an integer, and `null` as an absent argument. Anything else
+/// (`"abc"`, `"7.5"`, `"yes"`, a value below the schema's `minimum`) is an
+/// error naming the argument, never a silent default. Undeclared keys and
+/// string arguments are left as sent.
+pub fn conform(schema: &Value, args: &Value) -> std::result::Result<(Value, Vec<Value>), String> {
+    let (Some(props), Some(given)) = (
+        schema.get("properties").and_then(Value::as_object),
+        args.as_object(),
+    ) else {
+        return Ok((args.clone(), Vec::new()));
+    };
+    let mut out = given.clone();
+    let mut converted = Vec::new();
+    for (key, value) in given {
+        let Some(prop) = props.get(key) else {
+            continue;
+        };
+        let want = prop.get("type").and_then(Value::as_str).unwrap_or("");
+        let fits = match want {
+            "integer" => value.is_i64() || value.is_u64(),
+            "number" => value.is_number(),
+            "boolean" => value.is_boolean(),
+            "array" => value.is_array(),
+            "object" => value.is_object(),
+            _ => true,
+        };
+        if value.is_null() && !fits {
+            out.remove(key);
+            converted.push(serde_json::json!({ "arg": key, "from": null }));
+            continue;
+        }
+        let value = if fits {
+            value.clone()
+        } else {
+            let Some(v) = convert(want, value) else {
+                let expected = match want {
+                    "integer" => "a whole number",
+                    "number" => "a number",
+                    "boolean" => "true or false",
+                    "array" => "an array",
+                    _ => "an object",
+                };
+                return Err(format!("argument `{key}` must be {expected}, got {value}"));
+            };
+            converted.push(serde_json::json!({ "arg": key, "from": value }));
+            out.insert(key.clone(), v.clone());
+            v
+        };
+        if let (Some(min), Some(n)) = (prop.get("minimum").and_then(Value::as_f64), value.as_f64())
+            && n < min
+        {
+            return Err(format!(
+                "argument `{key}` must be at least {min}, got {value}"
+            ));
+        }
+    }
+    Ok((Value::Object(out), converted))
+}
+
+/// The exact conversions `conform` makes; `None` when the meaning is not exact.
+fn convert(want: &str, v: &Value) -> Option<Value> {
+    match (want, v) {
+        ("integer", Value::Number(n)) => n
+            .as_f64()
+            .filter(|f| f.fract() == 0.0 && f.abs() < 9.0e15)
+            .map(|f| Value::from(f as i64)),
+        ("integer", Value::String(s)) => s.trim().parse::<i64>().ok().map(Value::from),
+        ("number", Value::String(s)) => s
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .and_then(serde_json::Number::from_f64)
+            .map(Value::Number),
+        ("boolean", Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" => Some(Value::Bool(true)),
+            "false" => Some(Value::Bool(false)),
+            _ => None,
+        },
+        ("array" | "object", Value::String(s)) => serde_json::from_str::<Value>(s.trim())
+            .ok()
+            .filter(|p| p.is_array() == (want == "array") && (p.is_array() || p.is_object())),
+        _ => None,
+    }
+}
+
 pub struct ToolRegistry {
     tools: HashMap<String, Box<dyn BaseTool>>,
     /// Which files the model has read (shared by the file tools).
@@ -210,6 +333,22 @@ impl ToolRegistry {
         self.files.clear();
     }
 
+    /// The call's arguments in the types its tool declares, and what was
+    /// converted (see `conform`). Unknown tools pass through; `execute`
+    /// reports them.
+    pub fn conform_args(
+        &self,
+        name: &str,
+        args: &Value,
+    ) -> std::result::Result<(Value, Vec<Value>), String> {
+        match self.tools.get(name) {
+            Some(tool) => {
+                conform(&tool.spec().parameters, args).map_err(|e| format!("{name}: {e}"))
+            }
+            None => Ok((args.clone(), Vec::new())),
+        }
+    }
+
     /// The tool's approval preview (see `BaseTool::preview`).
     pub async fn preview(&self, name: &str, args: &Value) -> Result<Option<String>> {
         match self.tools.get(name) {
@@ -279,10 +418,22 @@ pub fn normalize_call(call: ToolCall) -> ToolCall {
             match (a.get("command").and_then(Value::as_str), path) {
                 (Some("view"), Some(path)) => {
                     let mut args = serde_json::json!({ "path": path });
-                    if let Some(r) = a.get("view_range").and_then(Value::as_array)
+                    // Line ranges given the way read_file takes them.
+                    for key in ["offset", "limit"] {
+                        if let Some(n) = arg_u64(a, key) {
+                            args[key] = serde_json::json!(n);
+                        }
+                    }
+                    // view_range: an array, or (Nemotron 3 Nano) the same
+                    // array as a JSON string, "[1, 100]".
+                    let range = match a.get("view_range") {
+                        Some(Value::String(t)) => serde_json::from_str::<Value>(t).ok(),
+                        other => other.cloned(),
+                    };
+                    if let Some(r) = range.as_ref().and_then(Value::as_array)
                         && let (Some(start), Some(end)) = (
-                            r.first().and_then(Value::as_u64),
-                            r.get(1).and_then(Value::as_i64),
+                            r.first().and_then(lenient_u64),
+                            r.get(1).and_then(lenient_i64),
                         )
                     {
                         args["offset"] = serde_json::json!(start.max(1));
@@ -394,6 +545,15 @@ impl BashExecutor {
             Ok(t) => {
                 env.retain(|(k, _)| k != "TMPDIR");
                 env.push(("TMPDIR".into(), t.path().display().to_string()));
+                // Go writes a build cache (default ~/.cache/go-build, which
+                // the sandbox does not let commands write): keep it in the
+                // session's directory unless the user chose one.
+                if !env.iter().any(|(k, _)| k == "GOCACHE") {
+                    env.push((
+                        "GOCACHE".into(),
+                        t.path().join("go-build").display().to_string(),
+                    ));
+                }
                 Some(t)
             }
             Err(e) => {
@@ -726,6 +886,151 @@ mod tests {
             json!({ "command": "undo_edit" }),
         ));
         assert_eq!(c.name, "str_replace_editor");
+    }
+
+    #[test]
+    fn view_keeps_offset_and_limit_even_as_strings() {
+        // Nemotron 3 Nano's calls in the pro calibration: offset and limit
+        // given directly, as strings. They used to be dropped, so the model
+        // got the start of the file again and again until the loop guard
+        // stopped the turn.
+        let c = normalize_call(ToolCall {
+            id: "1".into(),
+            name: "str_replace_editor".into(),
+            args: json!({ "command": "view", "path": "lark/lark.py", "offset": "735", "limit": "50" }),
+        });
+        assert_eq!(c.name, "read_file");
+        assert_eq!(
+            (&c.args["offset"], &c.args["limit"]),
+            (&json!(735), &json!(50))
+        );
+        let c = normalize_call(ToolCall {
+            id: "2".into(),
+            name: "str_replace_editor".into(),
+            args: json!({ "command": "view", "path": "a.py", "view_range": ["5", "9"] }),
+        });
+        assert_eq!(
+            (&c.args["offset"], &c.args["limit"]),
+            (&json!(5), &json!(5))
+        );
+        // How Nano actually sends it: the whole array as a JSON string.
+        let c = normalize_call(ToolCall {
+            id: "3".into(),
+            name: "str_replace_editor".into(),
+            args: json!({ "command": "view", "path": "a.py", "view_range": "[1, 100]" }),
+        });
+        assert_eq!(
+            (&c.args["offset"], &c.args["limit"]),
+            (&json!(1), &json!(100))
+        );
+        let c = normalize_call(ToolCall {
+            id: "4".into(),
+            name: "str_replace_editor".into(),
+            args: json!({ "command": "view", "path": "a.py", "view_range": "[40, -1]" }),
+        });
+        assert_eq!(c.args["offset"], 40);
+        assert!(c.args.get("limit").is_none(), "-1 means to the end");
+    }
+
+    #[test]
+    fn numbers_and_booleans_may_arrive_as_strings() {
+        let a = json!({ "n": 7, "s": " 42 ", "neg": "-1", "x": "seven", "t": "TRUE", "f": false, "b": "maybe" });
+        assert_eq!(arg_u64(&a, "n"), Some(7));
+        assert_eq!(arg_u64(&a, "s"), Some(42));
+        assert_eq!(arg_u64(&a, "neg"), None);
+        assert_eq!(arg_u64(&a, "x"), None);
+        assert_eq!(arg_u64(&a, "missing"), None);
+        assert_eq!(arg_bool(&a, "t"), Some(true));
+        assert_eq!(arg_bool(&a, "f"), Some(false));
+        assert_eq!(arg_bool(&a, "b"), None);
+    }
+
+    #[test]
+    fn arguments_take_their_declared_types_or_are_refused() {
+        let schema = json!({ "type": "object", "properties": {
+            "path": { "type": "string" },
+            "offset": { "type": "integer", "minimum": 0 },
+            "all": { "type": "boolean" },
+            "range": { "type": "array" },
+            "ratio": { "type": "number" }
+        }});
+        let ok = |args: Value| conform(&schema, &args).unwrap();
+        // Already the right types: unchanged, nothing recorded.
+        let (a, c) = ok(json!({ "path": "7", "offset": 3, "all": true, "extra": "x" }));
+        assert_eq!(
+            a,
+            json!({ "path": "7", "offset": 3, "all": true, "extra": "x" })
+        );
+        assert!(c.is_empty());
+        // Exact conversions, each recorded with what the model sent.
+        let (a, c) = ok(json!({ "offset": " 42 ", "all": "TRUE", "range": "[1, 5]",
+                                "ratio": "0.5", "path": null }));
+        assert_eq!(
+            a,
+            json!({ "offset": 42, "all": true, "range": [1, 5], "ratio": 0.5,
+                              "path": null })
+        );
+        assert_eq!(c.len(), 4);
+        assert!(c.contains(&json!({ "arg": "offset", "from": " 42 " })));
+        let (a, c) = ok(json!({ "offset": 5.0, "all": null }));
+        assert_eq!(a, json!({ "offset": 5 }), "a whole float; null is absent");
+        assert_eq!(c.len(), 2);
+        // Anything inexact is an error naming the argument.
+        for (args, msg) in [
+            (
+                json!({ "offset": "abc" }),
+                "argument `offset` must be a whole number, got \"abc\"",
+            ),
+            (json!({ "offset": "7.5" }), "must be a whole number"),
+            (json!({ "offset": 7.5 }), "must be a whole number"),
+            (
+                json!({ "offset": -1 }),
+                "argument `offset` must be at least 0, got -1",
+            ),
+            (json!({ "offset": "-1" }), "must be at least 0"),
+            (
+                json!({ "all": "yes" }),
+                "argument `all` must be true or false",
+            ),
+            (json!({ "all": 1 }), "must be true or false"),
+            (
+                json!({ "range": "1-5" }),
+                "argument `range` must be an array",
+            ),
+            (json!({ "range": "{}" }), "must be an array"),
+        ] {
+            let e = conform(&schema, &args).unwrap_err();
+            assert!(e.contains(msg), "{args}: {e}");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_file_honors_string_line_numbers() {
+        let d = std::env::temp_dir().join(format!("mima-strnum-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("f.txt");
+        std::fs::write(
+            &f,
+            (1..=20).map(|i| format!("line {i}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let tool = fs::ReadFile::new(vec![d.display().to_string()], edit::FileTracker::shared());
+        let out = tool
+            .execute(
+                &json!({ "path": f.display().to_string(), "offset": "15", "limit": "2" }),
+                &env(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.contains("line 15") && out.contains("line 16") && !out.contains("line 17"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("line 1\n") && !out.contains("    1\t"),
+            "{out}"
+        );
     }
 
     #[tokio::test]

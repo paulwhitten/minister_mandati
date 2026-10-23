@@ -131,6 +131,7 @@ Safety:
 | Sandbox Tiers 2 and 3 (bubblewrap, systemd scope limits) | Planned | [design/design-shell-sandboxing.md](design/design-shell-sandboxing.md) |
 | macOS shell sandbox via Seatbelt (`sandbox-exec`), phases M0-M5: profile generator with base rules from measured denials, `probe()`/`wrap()`, macOS itests, CI job | Partial | [design/design-shell-sandboxing.md](design/design-shell-sandboxing.md#macos-seatbelt) |
 | Scoped least-privilege approval rules (`Tool(glob)`, per-session "always") | Planned | |
+| Tool vocabularies: advertise each model's trained tool names and shapes (OpenHands, Codex, OpenCode, Claude Code, mima) on shared core operations; `auto` selection by model id; measured per vocabulary | Proposal | [design/design-tool-vocabularies.md](design/design-tool-vocabularies.md) |
 | Taint tracking of untrusted content (files, repositories, web, MCP output) | Planned | |
 | Sanitizing model-produced tool arguments | Planned | |
 | Web search and fetch tools (off by default) | Proposal | [design/design-web-tools.md](design/design-web-tools.md) |

@@ -168,8 +168,8 @@ impl BaseTool for ReadFile {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "File path to read" },
-                    "offset": { "type": "integer", "description": "First line to show, 1-based (default 1)" },
-                    "limit": { "type": "integer", "description": "Maximum number of lines to show" }
+                    "offset": { "type": "integer", "minimum": 0, "description": "First line to show, 1-based (default 1)" },
+                    "limit": { "type": "integer", "minimum": 1, "description": "Maximum number of lines to show" }
                 },
                 "required": ["path"]
             }),
@@ -179,11 +179,8 @@ impl BaseTool for ReadFile {
     #[tracing::instrument(skip_all)]
     async fn execute(&self, args: &Value, env: &ToolEnv) -> Result<String> {
         let shown = arg_str(args, "read_file", "path")?;
-        let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(1) as usize;
-        let limit = args
-            .get("limit")
-            .and_then(Value::as_u64)
-            .map(|l| l as usize);
+        let offset = super::arg_u64(args, "offset").unwrap_or(1) as usize;
+        let limit = super::arg_u64(args, "limit").map(|l| l as usize);
         let safe = ensure_allowed(Path::new(shown), &self.allowed)?;
         let bytes = tokio::fs::read(&safe).await.context(FsSnafu {
             path: safe.display().to_string(),

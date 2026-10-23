@@ -246,6 +246,7 @@ the table does not list. Initial ids:
 | Area | Ids |
 |---|---|
 | Approval | `approval.read_only`, `approval.bash_not_required`, `approval.writes_not_required`, `approval.auto_approve_sandboxed`, `approval.auto_approve_bash`, `approval.approve_all`, `approval.invalid_call` |
+| Tools | `tools.convert_args` (an argument converted to its declared type; `tool_result.converted`) |
 | Loop guard | `loop_guard.skip_duplicate`, `loop_guard.nudge`, `loop_guard.terminate`, `loop_guard.continue`, `loop_guard.steps_left` |
 | Context | `context.normalize`, `context.mask`, `context.evict` (an overflow retry is a mask or evict with reason `overflow`) |
 | Session | `session.step_cap_summary` |

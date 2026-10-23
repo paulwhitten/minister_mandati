@@ -268,8 +268,17 @@ Each trial gets:
   so the agent cannot read this repository (reference solutions, hidden
   checks, cached upstream repositories), other trials, or package caches such
   as `~/.cargo/registry` that hold pristine copies of task code. Toolchain
-  `bin` directories on `PATH` and `RUSTUP_HOME` are mounted back read-only,
-  and the trial's own directory is writable. mima itself runs outside the
+  `bin` directories on `PATH`, `RUSTUP_HOME` and the Go root (found from the
+  `go` on `PATH`) are mounted back read-only, and the trial's own directory
+  is writable. Go gets per-trial `GOPATH` and `GOCACHE` under the trial's
+  home, `GOTOOLCHAIN=local` and `GOPROXY=off`, so Go tasks must have no
+  dependencies or vendor them.
+- mima's own shell sandbox inside the trial is given the same toolchain
+  directories to read, and the trial's home to write (where `CARGO_HOME` and
+  Go's caches live). Before 2026-10-19 it was not: `cargo`, `rustc` and
+  `rustup` under `~/.cargo/bin` were denied to the agent (the hidden checks,
+  which run outside mima's sandbox, were not affected), so Rust results from
+  earlier runs measured an agent that could not build or test. mima itself runs outside the
   sandbox so it can reach the model server.
 
 mima is started with `--approve-all`, which approves every tool call without

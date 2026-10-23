@@ -104,7 +104,13 @@ pub fn sandbox_prefix(dirs: &TrialDirs, enabled: bool) -> Vec<String> {
     for h in &hidden {
         args.extend(["--tmpfs".into(), h.display().to_string()]);
     }
-    for dir in reexposed(&hidden, path.split(':').chain([rustup.as_str()])) {
+    let goroot = go_root()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    for dir in reexposed(
+        &hidden,
+        path.split(':').chain([rustup.as_str(), goroot.as_str()]),
+    ) {
         let d = dir.display().to_string();
         args.extend(["--ro-bind".into(), d.clone(), d]);
     }
@@ -178,6 +184,48 @@ fn reexposed<'a>(hidden: &[PathBuf], dirs: impl Iterator<Item = &'a str>) -> Vec
     out
 }
 
+/// Toolchain locations commands need to read: every PATH entry, the rustup
+/// home and the Go root. Given to mima's own sandbox in a trial, whose
+/// defaults (`~/.cargo`, `~/.rustup`) would resolve to the trial's home.
+pub fn toolchain_dirs() -> Vec<PathBuf> {
+    let path = std::env::var("PATH").unwrap_or_default();
+    let rustup = std::env::var("RUSTUP_HOME")
+        .unwrap_or_else(|_| format!("{}/.rustup", std::env::var("HOME").unwrap_or_default()));
+    let mut out: Vec<PathBuf> = Vec::new();
+    for d in path
+        .split(':')
+        .map(PathBuf::from)
+        .chain([PathBuf::from(rustup)])
+        .chain(go_root())
+    {
+        if let Ok(c) = d.canonicalize()
+            && c.is_dir()
+            && !out.contains(&c)
+        {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The Go installation the `go` on PATH belongs to (the directory holding
+/// `bin/go` and `src/runtime`), so the sandbox can expose the standard
+/// library, not only the binary.
+pub fn go_root() -> Option<PathBuf> {
+    if let Ok(r) = std::env::var("GOROOT")
+        && Path::new(&r).join("src/runtime").is_dir()
+    {
+        return Some(PathBuf::from(r));
+    }
+    let path = std::env::var("PATH").unwrap_or_default();
+    path.split(':')
+        .map(|d| Path::new(d).join("go"))
+        .find(|g| g.is_file())
+        .and_then(|g| g.canonicalize().ok())
+        .and_then(|g| Some(g.parent()?.parent()?.to_path_buf()))
+        .filter(|root| root.join("src/runtime").is_dir())
+}
+
 pub fn bwrap_available() -> bool {
     Command::new("bwrap")
         .args(["--ro-bind", "/", "/", "true"])
@@ -203,6 +251,19 @@ pub fn trial_env(dirs: &TrialDirs, extra: &[(&str, String)]) -> BTreeMap<String,
     }
     env.insert("HOME".into(), dirs.home.display().to_string());
     env.insert("TMPDIR".into(), dirs.tmp.display().to_string());
+    // Go: the toolchain from PATH, per-trial module and build caches, and no
+    // toolchain downloads or module proxy (the network is off anyway).
+    if let Some(root) = go_root() {
+        env.insert("GOROOT".into(), root.display().to_string());
+        env.insert("GOPATH".into(), dirs.home.join("go").display().to_string());
+        env.insert(
+            "GOCACHE".into(),
+            dirs.home.join(".cache/go-build").display().to_string(),
+        );
+        env.insert("GOTOOLCHAIN".into(), "local".into());
+        env.insert("GOPROXY".into(), "off".into());
+        env.insert("GOTELEMETRY".into(), "off".into());
+    }
     env.insert(
         "CARGO_HOME".into(),
         dirs.home.join(".cargo").display().to_string(),

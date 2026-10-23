@@ -28,6 +28,14 @@ pub const MAX_OVERFLOW_RETRIES: u32 = 2;
 #[derive(Debug)]
 pub enum TurnOutcome {
     Answered(String),
+    /// The model stopped without an answer or a tool call after the allowed
+    /// continue prompts: an empty reply (`truncated` false) or one still cut
+    /// off at the reply limit (`truncated` true, with any partial text).
+    /// Never counted as an answer.
+    NoAnswer {
+        truncated: bool,
+        partial: String,
+    },
     LoopGuard,
     /// The step limit was reached; the summary the model gave afterwards,
     /// if any.
@@ -141,6 +149,12 @@ pub fn finish_turn(
 pub fn record_outcome(ctx: &mut AgentContext, result: &Result<TurnOutcome, snafu::Whatever>) {
     match result {
         Ok(TurnOutcome::Answered(a)) => finish_turn(ctx, "answered", Some(a), None),
+        Ok(TurnOutcome::NoAnswer { truncated, partial }) => finish_turn(
+            ctx,
+            if *truncated { "truncated" } else { "no_answer" },
+            (!partial.is_empty()).then_some(partial.as_str()),
+            None,
+        ),
         Ok(TurnOutcome::LoopGuard) => finish_turn(ctx, "loop_guard", None, None),
         Ok(TurnOutcome::StepCap(summary)) => finish_turn(ctx, "step_cap", summary.as_deref(), None),
         Err(e) => finish_turn(ctx, "error", None, Some(e.to_string())),
@@ -288,6 +302,27 @@ async fn run_turn_inner(
                 ctx.add_message(Message::user(context::CONTINUE).with_origin(seq));
                 continue;
             }
+            // Still empty or cut off after the continue prompts: no answer.
+            _ if response.content.as_deref().unwrap_or("").trim().is_empty()
+                || response.finish_reason.as_deref() == Some("length") =>
+            {
+                let truncated = response.finish_reason.as_deref() == Some("length");
+                let partial = response.content.clone().unwrap_or_default();
+                let why = if truncated {
+                    format!(
+                        "the model's replies were cut off at the reply limit ({} tokens) \
+                         {} times without a tool call or an answer; raise [agent].max_tokens",
+                        ctx.config.agent.max_tokens,
+                        continues + 1
+                    )
+                } else {
+                    "the model gave no answer and no tool call".to_string()
+                };
+                tracing::warn!("{why}");
+                presenter.final_answer(&format!("[no answer: {why}]"));
+                log_token_summary(ctx);
+                return Ok(TurnOutcome::NoAnswer { truncated, partial });
+            }
             _ => {
                 let final_msg = response.content.clone().unwrap_or_default();
                 presenter.final_answer(&final_msg);
@@ -309,7 +344,16 @@ async fn run_turn_inner(
         for call in calls {
             // Calls written for other agents' tools map onto mima's, before
             // approval and loop checks see them.
-            let call = crate::tools::normalize_call(call);
+            let mut call = crate::tools::normalize_call(call);
+            // Arguments in the types the tool declares: exact conversions
+            // are made and recorded, anything else is refused with the reason.
+            let (invalid_args, converted) = match registry.conform_args(&call.name, &call.args) {
+                Ok((args, converted)) => {
+                    call.args = args;
+                    (None, converted)
+                }
+                Err(e) => (Some(format!("Error: {e}")), Vec::new()),
+            };
             tracing::info!(tool = %call.name, args = %call.args, "tool requested");
             presenter.tool_requested(&call);
 
@@ -337,6 +381,17 @@ async fn run_turn_inner(
                     json!({ "rule": "loop_guard.skip_duplicate" }),
                 );
                 skipped
+            } else if let Some(invalid) = invalid_args {
+                // The call cannot succeed as given: nothing to approve.
+                record_approval(
+                    ctx,
+                    turn,
+                    &call.id,
+                    "not_requested_invalid",
+                    None,
+                    json!({ "rule": "approval.invalid_call" }),
+                );
+                invalid
             } else {
                 let decided = approval::policy(&ctx.config, &call, registry.shell_sandboxed());
                 // Tools with a preview (edits, overwrites) validate first and
@@ -456,6 +511,9 @@ async fn run_turn_inner(
             }
             if let Some(changes) = workspace_changes {
                 fields["workspace_changes"] = changes;
+            }
+            if !converted.is_empty() {
+                fields["converted"] = json!(converted);
             }
             if output.len() > ctx.config.session.max_output_bytes {
                 // The stored copy is cut; this identifies the original.

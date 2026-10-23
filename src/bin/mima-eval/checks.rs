@@ -149,6 +149,20 @@ fn evaluate(kind: &CheckKind, ev: &Evidence, log: &mut String, name: &str) -> (b
             Err(e) => (false, format!("{path}: {e}")),
         },
         CheckKind::Unchanged { paths } => {
+            // Source tasks have no fixture directory: their start state is
+            // the trial's first commit, so compare with what changed since.
+            if !ev.task.fixture().is_dir() {
+                for p in paths {
+                    let p = p.trim_end_matches('/');
+                    if let Some(f) = ev.changed.iter().find(|f| {
+                        (f.as_str() == p || f.starts_with(&format!("{p}/")))
+                            && !exec::is_build_artifact(f)
+                    }) {
+                        return (false, format!("{f}: changed"));
+                    }
+                }
+                return (true, String::new());
+            }
             for p in paths {
                 if let Err(e) = exec::unchanged(&ev.task.fixture(), work, p) {
                     return (false, e);

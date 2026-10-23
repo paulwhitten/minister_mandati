@@ -311,6 +311,10 @@ pub struct ToolResult {
     /// SHA-256 of the complete output when the stored copy was cut.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_full_sha256: Option<String>,
+    /// Arguments mima converted to their declared type before the call
+    /// (rule `tools.convert_args`): `[{arg, from}]`, `from` as the model sent it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub converted: Option<Vec<Value>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

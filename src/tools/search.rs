@@ -150,9 +150,7 @@ fn root(
 }
 
 fn limit(args: &Value, default: usize) -> usize {
-    args.get("limit")
-        .and_then(Value::as_u64)
-        .map_or(default, |l| l.clamp(1, 1000) as usize)
+    super::arg_u64(args, "limit").map_or(default, |l| l.clamp(1, 1000) as usize)
 }
 
 pub struct FindFiles {
@@ -179,7 +177,7 @@ impl BaseTool for FindFiles {
                 "properties": {
                     "pattern": { "type": "string", "description": "Glob, e.g. *.py or src/**/test_*.c" },
                     "path": { "type": "string", "description": "Directory to search (default .)" },
-                    "limit": { "type": "integer", "description": "Most results to return (default 200)" }
+                    "limit": { "type": "integer", "minimum": 1, "description": "Most results to return (default 200)" }
                 },
                 "required": ["pattern"]
             }),
@@ -249,7 +247,7 @@ impl BaseTool for SearchFiles {
                     "path": { "type": "string", "description": "Directory to search (default .)" },
                     "glob": { "type": "string", "description": "Only files matching this glob, e.g. *.c" },
                     "ignore_case": { "type": "boolean", "description": "Case-insensitive (default false)" },
-                    "limit": { "type": "integer", "description": "Most matching lines to return (default 100)" }
+                    "limit": { "type": "integer", "minimum": 1, "description": "Most matching lines to return (default 100)" }
                 },
                 "required": ["pattern"]
             }),
@@ -260,10 +258,7 @@ impl BaseTool for SearchFiles {
         let Some(pattern) = args.get("pattern").and_then(Value::as_str) else {
             return refuse("search_files failed: `pattern` is required.".into());
         };
-        let ignore_case = args
-            .get("ignore_case")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let ignore_case = super::arg_bool(args, "ignore_case").unwrap_or(false);
         let re = match RegexBuilder::new(pattern)
             .case_insensitive(ignore_case)
             .build()

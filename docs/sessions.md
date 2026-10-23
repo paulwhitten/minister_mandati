@@ -125,7 +125,7 @@ ledger" below; the example lines omit them).
 | `tool_result` | a tool finishes | `call_id`, `tool`, `duration_ms`, `failed`, `bytes`, `sent_bytes` (after the stage 0 cap), `output` (full), `cap_bytes` (the cap in effect), `file` (`{path, fnv1a64}` after a read, edit or write) |
 | `compaction` | a context stage acts | `stage` (`normalize`, `mask`, `evict`), `reason`, `call_ids`, `messages_removed`, token estimates before and after |
 | `loop_guard` | a nudge or stop | `action`, `repeats`, `tool` |
-| `turn_end` | a turn finishes | `turn`, `outcome` (`answered`, `loop_guard`, `step_cap`, `cancelled`, `error`), `answer`, `tokens` |
+| `turn_end` | a turn finishes | `turn`, `outcome` (`answered`, `no_answer` (only empty replies after the continue prompts), `truncated` (replies still cut off at `max_tokens`; `answer` holds any partial text), `loop_guard`, `step_cap`, `cancelled`, `error`), `answer`, `tokens` |
 | `transcript_disabled` | `/disable_transcript` | `turns` |
 | `session_end` | session ends | `reason` (`exit`, `eof`, `new`, `resume`, `task_done`, `interrupted`, `fatal`), `turns`, `tokens`, `error` |
 | `context` | a turn ends, or compaction runs | what the model sees, by reference to earlier records (`entries`), with `context_schema` and a `check`; see [design/session-resume.md](design/session-resume.md) |
@@ -166,7 +166,7 @@ The disclosure form is the record without `hash`, `salt`, `salts` and
 salt || 0x00 || canonical(value)))`, where the field salt is `SHA-256(salt ||
 path)`. Content fields: `turn_start.instruction`, `model_response.content`,
 `.reasoning` and `.tool_calls/*/args`, `approval.preview`,
-`tool_result.output` and `.output_full_sha256`, `turn_end.answer`,
+`tool_result.output`, `.output_full_sha256` and `.converted/*/from`, `turn_end.answer`,
 `context.entries/*/text`, `session_start.system_prompt/text` (it includes
 the project instructions). Canonical encoding: keys sorted, no whitespace,
 minimal escaping, integers as written, floats in shortest round-trip form.
@@ -200,6 +200,7 @@ Records decided by a rule also name it in `rule`:
 | `approval.auto_approve_bash` | an allowlist match; the entry is in `matched` |
 | `approval.approve_all` | `--approve-all` (evaluation harness), not a person |
 | `approval.invalid_call` | the call could not succeed, so nobody was asked |
+| `tools.convert_args` | an argument sent as the wrong JSON type was converted (`tool_result.converted`) |
 | `loop_guard.skip_duplicate` | an identical, already successful write is skipped |
 | `loop_guard.nudge` | repeated identical actions: a nudge is added |
 | `loop_guard.terminate` | repeated identical actions: the turn stops |
@@ -234,7 +235,9 @@ not exist) and `after_sha256`. A shell command in a git workspace adds
 (`truncated`). git runs with the shell's sandbox and environment, with
 fsmonitor, the untracked cache, optional locks, system config and
 submodules off. A stored output cut at `max_output_bytes` adds
-`output_full_sha256`.
+`output_full_sha256`. An argument the model sent as the wrong JSON type and
+mima converted to the type the tool declares adds `converted`: `[{arg,
+from}]`, with `from` as sent (see [editing.md](editing.md#tool-arguments)).
 
 An approval answered by a person has `actor: "operator"`, `answer` (`yes`,
 `no`, `empty` for Enter, `eof` for no input; the last two deny),

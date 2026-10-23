@@ -13,8 +13,11 @@ default_model = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
 [agent]
 # A number, or "server" to send none (OpenAI reasoning models accept only their default).
 temperature = 0.2
-# Reply limit per request; also reserved out of the context window.
-max_tokens = 4096
+# Reply limit per request (reasoning counts against it). The context budget
+# reserves at most half the window for it, and each request caps it at the
+# room left. Cloud models have their own maximums (gpt-4o-mini: 16384); set
+# it at or below the model's limit there.
+max_tokens = 131072
 # Request field for max_tokens: "max_tokens" (vLLM, Ollama) or "max_completion_tokens"
 # (newer OpenAI and Azure OpenAI models, which reject "max_tokens").
 # max_tokens_param = "max_tokens"

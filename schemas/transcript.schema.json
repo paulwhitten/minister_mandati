@@ -854,6 +854,14 @@
             "null"
           ]
         },
+        "converted": {
+          "description": "Arguments mima converted to their declared type before the call\n(rule `tools.convert_args`): `[{arg, from}]`, `from` as the model sent it.",
+          "items": true,
+          "type": [
+            "array",
+            "null"
+          ]
+        },
         "duration_ms": {
           "format": "uint64",
           "minimum": 0,

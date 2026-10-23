@@ -250,6 +250,31 @@ fn trial_config(
         &["session", "transcripts"],
         toml::Value::Boolean(false),
     );
+    // mima's own sandbox inside the trial: commands may read the toolchains
+    // (PATH entries, rustup, Go) and write the trial's own home (CARGO_HOME
+    // and Go's caches live there; it is this trial's scratch space). Without
+    // the toolchains, `cargo` and `rustc` under ~/.cargo were denied.
+    let mut read: Vec<toml::Value> = c
+        .get("security")
+        .and_then(|v| v.get("sandbox_read_paths"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    read.extend(
+        crate::exec::toolchain_dirs()
+            .iter()
+            .map(|d| s(&d.display().to_string())),
+    );
+    set(
+        &mut c,
+        &["security", "sandbox_read_paths"],
+        toml::Value::Array(read),
+    );
+    set(
+        &mut c,
+        &["security", "sandbox_writable_paths"],
+        toml::Value::Array(vec![s(&dirs.home.display().to_string())]),
+    );
     // mima gives shell commands only an allowlisted environment; pass on the
     // trial settings that commands must see.
     set(

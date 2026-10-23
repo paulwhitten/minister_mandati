@@ -880,10 +880,7 @@ impl EditFile {
         let shown = text_arg("path")?;
         let old = text_arg("old_string")?;
         let new = text_arg("new_string")?;
-        let replace_all = args
-            .get("replace_all")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let replace_all = super::arg_bool(args, "replace_all").unwrap_or(false);
 
         let path = ensure_allowed(Path::new(&shown), &self.allowed)?;
         if !path.is_file() {

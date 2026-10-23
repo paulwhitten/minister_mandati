@@ -318,3 +318,99 @@ async fn step_limit_warns_then_asks_for_a_summary() {
         .collect();
     assert_eq!(got, expected);
 }
+
+#[tokio::test]
+async fn replies_that_stay_empty_end_without_an_answer() {
+    // Pro-task calibration: models that reasoned until the reply limit, three
+    // times, used to end the turn as "answered" with an empty answer.
+    let d = tmp("no-answer");
+    let base = mock_model(vec![answer(""), answer(""), answer("")]).await;
+    let cfg = config(base, &d);
+    let registry = ToolRegistry::init_default(&cfg);
+    let mut ctx = AgentContext::new(cfg, registry.specs());
+    ctx.session.enable(json!({ "mode": "test" })).unwrap();
+    let mut presenter = CliPresenter::default();
+    let result = run_turn(&mut ctx, &registry, &mut presenter, "Say done.").await;
+    assert!(
+        matches!(
+            &result,
+            Ok(crate::agent::TurnOutcome::NoAnswer {
+                truncated: false,
+                ..
+            })
+        ),
+        "{result:?}"
+    );
+    record_outcome(&mut ctx, &result);
+    let path = ctx.session.transcript_path().unwrap().to_path_buf();
+    drop(ctx);
+    crate::schema_tests::validate_transcript(&path);
+    let t = Transcript::load(&path).unwrap();
+    let outcome = t.lines.iter().rev().find_map(|l| match &l.record {
+        crate::transcript::Record::TurnEnd(e) => Some(e.outcome.clone()),
+        _ => None,
+    });
+    assert_eq!(outcome.as_deref(), Some("no_answer"));
+}
+
+#[tokio::test]
+async fn arguments_are_converted_or_refused_and_recorded() {
+    // A string line number is converted and recorded; one that is not a
+    // number is refused with the reason instead of reading from line 1.
+    let d = tmp("convert-args");
+    let work = d.join("work");
+    std::fs::write(work.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+    let a = work.join("a.txt").display().to_string();
+    let base = mock_model(vec![
+        call(
+            "r1",
+            "read_file",
+            json!({ "path": a, "offset": "2", "limit": null }),
+        ),
+        call("r2", "read_file", json!({ "path": a, "offset": "two" })),
+        answer("done"),
+    ])
+    .await;
+    let cfg = config(base, &d);
+    let registry = ToolRegistry::init_default(&cfg);
+    let mut ctx = AgentContext::new(cfg, registry.specs());
+    ctx.session.enable(json!({ "mode": "test" })).unwrap();
+    let mut presenter = CliPresenter::default();
+    let result = run_turn(&mut ctx, &registry, &mut presenter, "Read a.txt.").await;
+    record_outcome(&mut ctx, &result);
+    let path = ctx.session.transcript_path().unwrap().to_path_buf();
+    drop(ctx);
+    crate::schema_tests::validate_transcript(&path);
+    let t = Transcript::load(&path).unwrap();
+    let results: Vec<_> = t
+        .lines
+        .iter()
+        .filter_map(|l| match &l.record {
+            Record::ToolResult(r) => Some(r.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 2);
+    assert!(!results[0].failed, "{}", results[0].output);
+    let shown = &results[0].output;
+    assert!(
+        shown.contains("     2\ttwo") && !shown.contains("one"),
+        "{shown}"
+    );
+    assert_eq!(
+        results[0].converted,
+        Some(vec![
+            json!({ "arg": "limit", "from": null }),
+            json!({ "arg": "offset", "from": "2" })
+        ])
+    );
+    assert!(results[1].failed);
+    assert!(
+        results[1]
+            .output
+            .contains("read_file: argument `offset` must be a whole number, got \"two\""),
+        "{}",
+        results[1].output
+    );
+    assert!(results[1].converted.is_none());
+}

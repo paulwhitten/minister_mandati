@@ -332,7 +332,11 @@ impl Default for Agent {
     fn default() -> Self {
         Self {
             temperature: Some(0.2),
-            max_tokens: 4096,
+            // 128K, competitive with other agents (Qwen's card: 32K for most
+            // tasks, 80K for complex ones). The budget reserves at most half
+            // the window and each request caps the reply at the room left,
+            // so small windows still work.
+            max_tokens: 131072,
             max_tokens_param: TokenParam::MaxTokens,
             tool_calling: "auto".to_string(),
             stream: true,
@@ -464,6 +468,8 @@ fn default_sandbox_read_paths() -> Vec<String> {
         "~/.local/lib",
         "~/.gitconfig",
         "~/.config/git",
+        "~/.local/go",
+        "~/go/pkg/mod",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -912,7 +918,7 @@ temperature = 0.7
         assert_eq!(c.agent.temperature, Some(0.6));
         assert_eq!(c.agent.top_p, Some(0.95));
         assert_eq!(c.agent.tool_calling, "auto");
-        assert_eq!(c.agent.max_tokens, 4096);
+        assert_eq!(c.agent.max_tokens, 131072);
         assert_eq!(c.agent.max_tokens_param, super::TokenParam::MaxTokens);
         assert!(!c.security.require_approval_for_bash);
         assert!(c.security.require_approval_for_writes);

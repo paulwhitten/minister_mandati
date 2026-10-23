@@ -19,7 +19,8 @@ default_model = "gpt-5.4-mini" # on Azure, the deployment name
 
 [agent]
 temperature = "server"         # send no temperature (see below)
-max_tokens = 8192              # reasoning tokens count against this
+max_tokens = 8192              # reasoning tokens count against this; mima's default
+                               # (131072) is above many cloud models' maximum
 max_tokens_param = "max_completion_tokens"
 extra_body = { reasoning_effort = "medium" }
 
