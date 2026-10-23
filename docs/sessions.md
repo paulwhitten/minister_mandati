@@ -177,7 +177,8 @@ writes a copy in which the chosen content fields hold their digests (listed
 in `withheld`), disclosed content fields carry their own field salt (in
 `salts`), and record salts are gone, so withheld values cannot be guessed.
 Sets: `code` (all content, the default), `outputs` (tool outputs and
-diffs), or field names such as `turn_start.instruction`. The copy verifies
+diffs, plus the compaction records and context snapshots that quote tool
+output), or field names such as `turn_start.instruction`. The copy verifies
 with the same hashes and finds its heads in the ledger by session id.
 Disclosing one more value later is another export that withholds less.
 

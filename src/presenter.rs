@@ -90,7 +90,7 @@ pub fn render_preview(preview: &str, color: bool) -> String {
 
 /// Control characters (other than TAB) shown escaped, so model-supplied text
 /// cannot drive the terminal.
-fn escape_controls(line: &str) -> String {
+pub(crate) fn escape_controls(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     for c in line.chars() {
         if c.is_control() && c != '\t' {

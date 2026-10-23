@@ -503,3 +503,70 @@ async fn arguments_are_converted_or_refused_and_recorded() {
     );
     assert!(results[1].converted.is_none());
 }
+
+#[tokio::test]
+async fn turn_answers_in_the_context_match_on_rebuild_and_replay() {
+    // The step-limit summary refers to its turn_end record, so the context
+    // record covers it (eviction lists it, resume restores it); a cut-off
+    // turn's partial reply is recorded but, as live, not replayed.
+    let d = tmp("answers-in-context");
+    let work = d.join("work");
+    for n in ["a.txt", "b.txt"] {
+        std::fs::write(work.join(n), "x\n").unwrap();
+    }
+    let p = |n: &str| work.join(n).display().to_string();
+    let cut_off =
+        json!({ "role": "assistant", "content": "I was about to", "finish_reason": "length" });
+    let base = mock_model(vec![
+        call("r1", "read_file", json!({ "path": p("a.txt") })),
+        call("r2", "read_file", json!({ "path": p("b.txt") })),
+        answer("Read both files; nothing changed yet."),
+        cut_off,
+    ])
+    .await;
+    let mut cfg = config(base, &d);
+    cfg.context.window = Some(200_000); // no compaction: replay must match
+    cfg.agent.max_steps = 2;
+    let registry = ToolRegistry::init_default(&cfg);
+    let mut ctx = AgentContext::new(cfg, registry.specs());
+    ctx.session.enable(json!({ "mode": "test" })).unwrap();
+    let mut presenter = CliPresenter::default();
+    let result = run_turn(&mut ctx, &registry, &mut presenter, "Read the files.").await;
+    assert!(
+        matches!(&result, Ok(crate::agent::TurnOutcome::StepCap(Some(_)))),
+        "{result:?}"
+    );
+    record_outcome(&mut ctx, &result);
+    assert!(
+        ctx.messages().last().unwrap().origin.is_some(),
+        "summary has its record"
+    );
+    ctx.config.agent.max_steps = 10;
+    let result = run_turn(&mut ctx, &registry, &mut presenter, "Now explain.").await;
+    assert!(
+        matches!(
+            &result,
+            Ok(crate::agent::TurnOutcome::NoAnswer {
+                truncated: true,
+                ..
+            })
+        ),
+        "{result:?}"
+    );
+    record_outcome(&mut ctx, &result);
+    let expected = messages_json(&ctx);
+    assert!(!expected.iter().any(|m| m["content"] == "I was about to"));
+    let path = ctx.session.transcript_path().unwrap().to_path_buf();
+    drop(ctx);
+    crate::schema_tests::validate_transcript(&path);
+    let t = Transcript::load(&path).unwrap();
+    let as_json = |ms: &[crate::context::Message]| -> Vec<Value> {
+        ms.iter()
+            .map(|m| serde_json::to_value(m).unwrap())
+            .collect()
+    };
+    let r = rebuild(&t, 4096);
+    assert_eq!(r.method, "context", "{:?}", r.reason);
+    assert_eq!(as_json(&r.messages), expected);
+    assert_eq!(as_json(&replay(&t, 4096).messages), expected);
+}

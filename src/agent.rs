@@ -138,7 +138,9 @@ pub fn finish_turn(
         json!({ "turn": turn, "outcome": outcome, "answer": answer, "error": error,
                 "tokens": tokens, "workspace": workspace }),
     );
-    if outcome == "answered" {
+    // The answers kept in the context (see `answer_in_context`) refer to
+    // this record, so eviction lists them and resume restores them exactly.
+    if crate::transcript::answer_in_context(outcome) {
         ctx.set_answer_origin(seq);
     }
     // After the turn (including a cancelled one, already rolled back), so a

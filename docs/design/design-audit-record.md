@@ -216,7 +216,8 @@ The full transcript keeps every value and the salts. `mima --audit-export
 already in their `c:` form (listed in `withheld`), disclosed content fields
 carry their own field salt (in `salts`), and record salts are dropped, so a
 withheld value cannot be guessed from a salt in the copy. Sets: `code` (all
-content fields), `outputs` (tool outputs and previews only), or a list of
+content fields), `outputs` (tool outputs and previews, and the compaction records and
+context snapshots that quote them), or a list of
 field names. The verifier computes the disclosure form from either copy and
 gets the same hashes. Checked against an anchored head, a shared copy proves
 its metadata (what ran, when, who approved it, which rule decided) is

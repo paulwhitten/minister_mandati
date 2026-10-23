@@ -124,8 +124,9 @@ struct Cli {
     audit_export: Option<String>,
 
     /// With --audit-export: what to withhold, comma-separated: "code" (all
-    /// content, the default), "outputs" (tool outputs and diffs), or field
-    /// names such as turn_start.instruction.
+    /// content, the default), "outputs" (tool outputs and diffs, with the
+    /// compaction and context records that quote them), or field names such
+    /// as turn_start.instruction.
     #[arg(
         long,
         value_name = "SET",

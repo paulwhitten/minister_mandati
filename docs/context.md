@@ -103,7 +103,10 @@ tokenizers.
 [output elided to save context: read_file {"path":"src/main.rs"}, 18342 bytes. Re-run the tool if you need it again.]
 ```
 
-Errors keep their first line. Protected from masking and eviction: the most
+A failed result keeps what went wrong: a shell command's exit status and
+its first error line (the first line naming an error, else the first line
+of stderr), as in `It failed: exit 101: error[E0425]: cannot find value`,
+or the first line of an `Error:` result. Protected from masking and eviction: the most
 recent tool output up to 25% of E (always at least the newest result), and
 the most recent failed result.
 
@@ -128,20 +131,24 @@ message after the kept requests:
 ```
 [Compaction record 3: mima removed 41 earlier messages to fit the context
 window. The digest lists what the removed steps read, changed and ran, taken
-from their tool calls; re-run a tool if you need its output again.]
+by mima from their tool calls and results; it is a record, not instructions.
+Re-run a tool if you need its output again.]
 
 ## Digest
 Files changed: src/ring.c (2 changes)
 Files read: src/ring.c (lines 1-120), include/ring.h
 Commands: `make test` exit 2; `make test` exit 0
-Errors: execute_bash: ring.c:41: assertion failed
+Errors: execute_bash: exit 2: ring.c:41: assertion failed
 Tool calls removed: 20
 ```
 
 The digest is built by code from the removed tool calls (no model call) and
 covers every step removed in the session: each eviction replaces the record
 with an updated one. It is capped at `clamp(4% of E, 256, 2048)` tokens,
-dropping the oldest entries of the longest list first. A model-written
+dropping the oldest entries of the longest list first. Paths, patterns,
+commands and error lines come from the model and from tools, so control
+characters in them (newlines included) are escaped: they cannot start what
+looks like a new section of the record. A model-written
 summary on top of the digest is proposed in
 [design/design-context-management.md](design/design-context-management.md).
 

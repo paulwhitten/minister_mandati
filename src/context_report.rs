@@ -3,6 +3,7 @@
 //! the data; this module renders it.
 
 use crate::budget::Budget;
+use crate::presenter::escape_controls;
 
 /// Where the context window came from, as shown after `Window W`.
 pub const WINDOW_CONFIGURED: &str = "configured";
@@ -130,15 +131,23 @@ fn pct(part: usize, whole: usize) -> usize {
     (part * 100 + whole / 2) / whole.max(1)
 }
 
-/// First line of `text`, at most `max` characters, with a marker when cut.
+/// First non-blank line of `text`, at most `max` characters, with a marker
+/// when cut, and control characters escaped: it is printed to the terminal.
 pub fn snippet(text: &str, max: usize) -> String {
+    let text = text.trim_start();
     let line = text.lines().next().unwrap_or_default();
     let cut: String = line.chars().take(max).collect();
-    if cut.len() < line.len() || text.lines().nth(1).is_some() {
+    let cut = escape_controls(&cut);
+    if line.chars().count() > max || text.lines().nth(1).is_some() {
         format!("{cut}...")
     } else {
         cut
     }
+}
+
+/// Model-, tool- or file-supplied text made safe to print.
+pub fn safe(text: &str) -> String {
+    escape_controls(text)
 }
 
 /// `text` after `lead`, wrapped at word boundaries to `width` columns, with
@@ -173,8 +182,8 @@ pub fn describe_call(name: &str, args: &str) -> String {
         .iter()
         .find_map(|k| parsed.get(*k).and_then(serde_json::Value::as_str))
     {
-        Some(v) => format!("{name} {v}"),
-        None => format!("{name} {args}"),
+        Some(v) => safe(&format!("{name} {v}")),
+        None => safe(&format!("{name} {args}")),
     }
 }
 
@@ -255,7 +264,9 @@ impl ContextReport {
         let mask_at = b.of(self.mask_at);
         let mut s = format!(
             "Context: session {}, turn {}, model {}\n\n",
-            self.session, self.turn, self.model
+            self.session,
+            self.turn,
+            safe(&self.model)
         );
         s += &format!(
             "  Window W {} ({}) = usable U {} + reply reserve {} + safety margin {}\n",
@@ -441,6 +452,12 @@ mod tests {
         assert_eq!(snippet("short", 10), "short");
         assert_eq!(snippet("a longer line", 4), "a lo...");
         assert_eq!(snippet("one\ntwo", 10), "one...");
+        assert_eq!(snippet("\n\nI fixed it", 20), "I fixed it");
+        assert_eq!(snippet("ls\u{1b}[2J", 20), "ls\\u{1b}[2J");
+        assert_eq!(
+            describe_call("execute_bash", r#"{"command":"ls\u001b[2J"}"#),
+            "execute_bash ls\\u{1b}[2J"
+        );
         assert_eq!(
             describe_call("edit_file", r#"{"new_string":"x","path":"a.c"}"#),
             "edit_file a.c"

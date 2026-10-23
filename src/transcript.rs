@@ -877,6 +877,13 @@ fn latest_digest(t: &Transcript, upto: u64) -> (Digest, usize) {
 /// recording was off are noted for the model. Masking is not replayed (the
 /// budget pass decides afresh at the next request); compaction records are,
 /// since they hold what the evicted steps did.
+/// Whether a turn's recorded answer stays in the context the model sees: a
+/// final answer, or the summary requested at the step limit. The partial
+/// reply of a `no_answer` or `truncated` turn is recorded but not kept.
+pub fn answer_in_context(outcome: &str) -> bool {
+    matches!(outcome, "answered" | "step_cap")
+}
+
 pub fn replay(t: &Transcript, default_cap: usize) -> Rebuilt {
     let mut messages: Vec<Message> = Vec::new();
     let mut turn_begin: Option<usize> = None; // index where the open turn starts
@@ -967,7 +974,9 @@ pub fn replay(t: &Transcript, default_cap: usize) -> Rebuilt {
                     }
                     continue;
                 }
-                if let Some(answer) = r.answer.as_deref().filter(|a| !a.is_empty()) {
+                if let Some(answer) = r.answer.as_deref().filter(|a| !a.is_empty())
+                    && answer_in_context(&r.outcome)
+                {
                     messages.push(Message::assistant(answer).with_origin(Some(l.seq)));
                 }
             }

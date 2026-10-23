@@ -111,7 +111,7 @@ Options:
           Write a copy of a transcript to share, with content withheld (see --withhold); it verifies with the same hashes. Then exit
 
       --withhold <SET>
-          With --audit-export: what to withhold, comma-separated: "code" (all content, the default), "outputs" (tool outputs and diffs), or field names such as turn_start.instruction
+          With --audit-export: what to withhold, comma-separated: "code" (all content, the default), "outputs" (tool outputs and diffs, with the compaction and context records that quote them), or field names such as turn_start.instruction
           
           [default: code]
 

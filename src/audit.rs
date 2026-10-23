@@ -336,7 +336,16 @@ pub fn export(transcript: &[u8], withhold: &[String]) -> Result<String, String> 
     let wanted = |name: &str| {
         withhold.iter().any(|w| match w.as_str() {
             "code" => true,
-            "outputs" => matches!(name, "tool_result.output" | "approval.preview"),
+            // Compaction records and context snapshots quote tool output
+            // (first lines of failures, masked placeholders), so they go too.
+            "outputs" => matches!(
+                name,
+                "tool_result.output"
+                    | "approval.preview"
+                    | "compaction.text"
+                    | "compaction.digest"
+                    | "context.entries/*/text"
+            ),
             other => other == name,
         })
     };
@@ -1640,6 +1649,41 @@ mod tests {
 
         assert!(export(&full, &["nonsense".into()]).is_err());
         assert!(export(b"{\"seq\":0}\n", &["code".into()]).is_err());
+    }
+
+    #[test]
+    fn withholding_outputs_covers_compaction_and_context_records() {
+        // Both quote tool output: a failing command's first line, placeholders.
+        let mut records = sample();
+        let end = records.pop().unwrap();
+        let mut extra = vec![
+            json!({"seq":5,"ts":"t5","type":"compaction","turn":1,"stage":"evict","method":"digest",
+                   "reason":"threshold","before":9,"after":3,"target":4,
+                   "text":"[Compaction record 1] Errors: execute_bash: exit 1: SECRET=abc123",
+                   "digest":{"errors":["execute_bash: exit 1: SECRET=abc123"],"calls":1}}),
+            json!({"seq":6,"ts":"t6","type":"context","cause":"turn_end","context_schema":2,
+                   "entries":[{"text":"[output elided: It failed: SECRET=abc123.]"}]}),
+        ];
+        for r in &mut extra {
+            let kind = r["type"].as_str().unwrap().to_string();
+            attribute(&kind, r);
+        }
+        let mut end = end;
+        end["seq"] = json!(7);
+        records.extend(extra);
+        records.push(end);
+        let d = temp("withheld-outputs");
+        let p = d.join("t.jsonl");
+        write_chain(&p, &records);
+        let outputs = export(&std::fs::read(&p).unwrap(), &["outputs".into()]).unwrap();
+        assert!(!outputs.contains("abc123"), "{outputs}");
+        assert!(
+            outputs.contains("fix the bug"),
+            "the instruction stays readable"
+        );
+        let shared = d.join("shared.jsonl");
+        std::fs::write(&shared, &outputs).unwrap();
+        assert_eq!(level(&verify(&shared, None), "chain"), Level::Pass);
     }
 
     #[test]

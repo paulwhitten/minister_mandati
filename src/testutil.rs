@@ -50,12 +50,16 @@ pub async fn mock_model(script: Vec<Value>) -> String {
                     let mut s = script.lock().unwrap();
                     let i = s.1.min(s.0.len() - 1);
                     s.1 += 1;
-                    let message = s.0[i].clone();
+                    let mut message = s.0[i].clone();
+                    // A script entry may carry the choice's finish_reason.
+                    let finish = message
+                        .as_object_mut()
+                        .and_then(|m| m.remove("finish_reason"));
                     // Report roughly what a real server would: ~4 bytes/token.
                     let prompt = (buf.len() - head_end) / 4;
                     (
                         "200 OK",
-                        json!({ "choices": [{ "message": message }],
+                        json!({ "choices": [{ "message": message, "finish_reason": finish }],
                                 "usage": { "prompt_tokens": prompt, "completion_tokens": 10,
                                            "total_tokens": prompt + 10 } })
                         .to_string(),
