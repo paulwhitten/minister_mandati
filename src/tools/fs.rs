@@ -35,17 +35,28 @@ fn canonical_or_parent(target: &Path) -> Result<PathBuf> {
             path: target.display().to_string(),
         });
     }
-    let parent = target
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let file = target.file_name().context(PathNotAllowedSnafu {
+    let not_allowed = || PathNotAllowedSnafu {
         path: target.display().to_string(),
-    })?;
-    let parent_canon = parent.canonicalize().context(FsSnafu {
-        path: parent.display().to_string(),
-    })?;
-    Ok(parent_canon.join(file))
+    };
+    for ancestor in target.ancestors().skip(1) {
+        let existing = if ancestor.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            ancestor
+        };
+        let Ok(canon) = existing.canonicalize() else {
+            continue;
+        };
+        let rest = target.strip_prefix(ancestor).ok().context(not_allowed())?;
+        // Missing components are taken literally, so `..` there could escape.
+        ensure!(
+            rest.components()
+                .all(|c| matches!(c, std::path::Component::Normal(_))),
+            not_allowed()
+        );
+        return Ok(canon.join(rest));
+    }
+    not_allowed().fail()
 }
 
 fn arg_str<'a>(args: &'a Value, tool: &str, key: &str) -> Result<&'a str> {
@@ -276,6 +287,11 @@ impl BaseTool for WriteFile {
     #[tracing::instrument(skip_all)]
     async fn execute(&self, args: &Value, _env: &ToolEnv) -> Result<String> {
         let (safe, _, content, _) = self.prepare(args).await?;
+        if let Some(dir) = safe.parent() {
+            tokio::fs::create_dir_all(dir).await.context(FsSnafu {
+                path: dir.display().to_string(),
+            })?;
+        }
         atomic_write(&safe, content.as_bytes()).await?;
         self.tracker.record(&safe, content.as_bytes());
         Ok(format!(
@@ -360,6 +376,19 @@ mod tests {
         let (root, _) = fixture("inside");
         assert!(ensure_allowed(&root.join("ok.txt"), &roots(&root)).is_ok());
         assert!(ensure_allowed(&root.join("sub/new.txt"), &roots(&root)).is_ok());
+        assert_eq!(
+            ensure_allowed(&root.join("a/b/new.txt"), &roots(&root)).unwrap(),
+            root.canonicalize().unwrap().join("a/b/new.txt")
+        );
+    }
+
+    #[test]
+    fn rejects_dotdot_through_missing_directories() {
+        let (root, _) = fixture("missing-dotdot");
+        let target = root.join("nope/../../outside/new.txt");
+        assert!(ensure_allowed(&target, &roots(&root)).is_err());
+        let target = root.join("nope/../ok2.txt");
+        assert!(ensure_allowed(&target, &roots(&root)).is_err());
     }
 
     #[test]
@@ -525,6 +554,17 @@ mod tests {
             .to_string();
         assert!(err.contains("write_file refused"), "{err}");
         assert_eq!(fs::read_to_string(root.join("ok.txt")).unwrap(), "ok");
+    }
+
+    #[tokio::test]
+    async fn write_creates_missing_directories() {
+        let (root, _) = fixture("write-dirs");
+        let t = tools(&root);
+        let path = root.join("test/deep/hello.c").display().to_string();
+        let create = json!({ "path": path, "content": "int main(void) { return 0; }\n" });
+        t.write.preview(&create).await.unwrap();
+        t.write.execute(&create, &env(10_000)).await.unwrap();
+        assert!(root.join("test/deep/hello.c").is_file());
     }
 
     #[tokio::test]

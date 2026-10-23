@@ -62,7 +62,8 @@ their permissions. Writes are atomic (temporary file, then rename).
 
 ### `write_file {path, content}`
 
-Creates a new file without further checks. Overwriting an existing file
+Creates a new file without further checks, along with any missing parent
+directories inside the allowed paths. Overwriting an existing file
 requires a current read, like `edit_file`, and shows a diff.
 
 ## Stale-file protection
@@ -76,7 +77,7 @@ reads.
 
 ## Approval
 
-`edit_file` and overwriting `write_file` require approval when
+`edit_file` and `write_file` (new files included) require approval when
 `[security].require_approval_for_writes` is on (the default). The tool first
 validates and plans the change without touching the file; if the call cannot
 succeed (no match, several matches, not read), the error goes straight back

@@ -13,12 +13,15 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::context::{CONTINUE, FINAL_SUMMARY, Message, NOT_EXECUTED, NUDGE, STEPS_LEFT};
+use crate::context::{
+    CONTINUE, FINAL_SUMMARY, Kind, Message, NOT_EXECUTED, NUDGE, STEPS_LEFT, drop_turn,
+};
+use crate::digest::Digest;
 use crate::tools::truncate_middle;
 
 /// Layout version of `context` records. Bump only for breaking changes
 /// (evolution rule 10); readers that do not know a version replay instead.
-pub const CONTEXT_SCHEMA: u32 = 1;
+pub const CONTEXT_SCHEMA: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // Record types
@@ -353,6 +356,23 @@ pub struct Compaction {
     pub est_tokens_after: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<u64>,
+    /// Open enum: digest (eviction left a compaction record).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    /// Number of the compaction record this event wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requests_removed: Option<u64>,
+    /// Records the removed messages were built from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seqs: Option<Vec<u64>>,
+    /// Cumulative digest of everything evicted so far.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<Digest>,
+    /// The compaction record's text, as the model sees it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -471,6 +491,8 @@ pub enum View {
     Masked,
     Noted,
     Synthetic,
+    /// A compaction record; `seq` is its `compaction` record (schema 2).
+    Record,
 }
 
 impl View {
@@ -682,6 +704,9 @@ pub struct Rebuilt {
     pub first_instruction: Option<String>,
     pub masked_total: usize,
     pub evicted_total: usize,
+    /// Digest and number of the latest compaction record.
+    pub digest: Digest,
+    pub records: usize,
     /// "context" or "replay".
     pub method: &'static str,
     /// Why replay was used.
@@ -735,9 +760,9 @@ fn from_context(t: &Transcript) -> Result<Rebuilt, String> {
             _ => None,
         })
         .ok_or("no context record")?;
-    if rec.context_schema != CONTEXT_SCHEMA {
+    if rec.context_schema > CONTEXT_SCHEMA {
         return Err(format!(
-            "context record version {} is not {CONTEXT_SCHEMA}",
+            "context record version {} is newer than {CONTEXT_SCHEMA}",
             rec.context_schema
         ));
     }
@@ -758,7 +783,7 @@ fn from_context(t: &Transcript) -> Result<Rebuilt, String> {
             let text = e.text.as_deref().unwrap_or_default();
             let mut m = match (role, &e.call_id) {
                 ("tool", Some(id)) => Message::tool_result(id, text),
-                ("user", _) => Message::user(text),
+                ("user", _) => Message::notice(text),
                 ("assistant", _) => Message::assistant(text),
                 _ => return Err(format!("unsupported synthetic entry ({role})")),
             };
@@ -771,6 +796,12 @@ fn from_context(t: &Transcript) -> Result<Rebuilt, String> {
             .get(&s)
             .ok_or(format!("dangling reference to seq {s}"))?;
         let mut m = match record {
+            Record::Compaction(c) if e.view == View::Record => {
+                Message::record(c.text.as_deref().ok_or("compaction record without text")?)
+            }
+            _ if e.view == View::Record => {
+                return Err(format!("seq {s} is not a compaction record"));
+            }
             Record::TurnStart(r) => {
                 if first_instruction.is_none() && messages.is_empty() {
                     first_instruction = Some(r.instruction.clone());
@@ -782,14 +813,14 @@ fn from_context(t: &Transcript) -> Result<Rebuilt, String> {
                 tool_message(r, e.cap_bytes.filter(|_| e.view == View::Capped))
             }
             Record::TurnEnd(r) => Message::assistant(r.answer.as_deref().unwrap_or_default()),
-            Record::LoopGuard(g) if g.action == "continue" => Message::user(CONTINUE),
-            Record::LoopGuard(g) if g.action == "steps" => Message::user(STEPS_LEFT),
-            Record::LoopGuard(g) if g.action == "final" => Message::user(FINAL_SUMMARY),
-            Record::LoopGuard(_) => Message::user(NUDGE),
+            Record::LoopGuard(g) if g.action == "continue" => Message::notice(CONTINUE),
+            Record::LoopGuard(g) if g.action == "steps" => Message::notice(STEPS_LEFT),
+            Record::LoopGuard(g) if g.action == "final" => Message::notice(FINAL_SUMMARY),
+            Record::LoopGuard(_) => Message::notice(NUDGE),
             _ => return Err(format!("seq {s} is not a message record")),
         };
         match e.view {
-            View::Full | View::Capped => {}
+            View::Full | View::Capped | View::Record => {}
             View::Masked => {
                 m.content = e.text.clone();
                 m.masked = true;
@@ -810,46 +841,99 @@ fn from_context(t: &Transcript) -> Result<Rebuilt, String> {
             got.messages, rec.check.messages, got.chars, rec.check.chars
         ));
     }
+    let (digest, records_n) = latest_digest(t, seq);
     Ok(Rebuilt {
         messages,
         first_instruction,
         masked_total: rec.masked_total as usize,
         evicted_total: rec.evicted_total as usize,
+        digest,
+        records: records_n,
         method: "context",
         reason: None,
         from_seq: Some(seq),
     })
 }
 
+/// The cumulative digest and record number of the last compaction record
+/// written before `upto`.
+fn latest_digest(t: &Transcript, upto: u64) -> (Digest, usize) {
+    t.lines
+        .iter()
+        .rev()
+        .filter(|l| l.seq < upto)
+        .find_map(|l| match &l.record {
+            Record::Compaction(c) if c.digest.is_some() => Some((
+                c.digest.clone().unwrap_or_default(),
+                c.record.unwrap_or(0) as usize,
+            )),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
 /// Rebuilds the conversation from the event records. Cancelled and
 /// unfinished turns are dropped (as the live rollback did); gaps where
-/// recording was off are noted for the model. Compaction is not replayed:
-/// the budget pass decides afresh at the next request.
+/// recording was off are noted for the model. Masking is not replayed (the
+/// budget pass decides afresh at the next request); compaction records are,
+/// since they hold what the evicted steps did.
 pub fn replay(t: &Transcript, default_cap: usize) -> Rebuilt {
     let mut messages: Vec<Message> = Vec::new();
     let mut turn_begin: Option<usize> = None; // index where the open turn starts
     let mut pending_nudge: Option<u64> = None;
     let mut first_instruction = None;
     let mut gap = false;
+    let (mut digest, mut records, mut evicted) = (Digest::default(), 0usize, 0usize);
     let flush_nudge = |messages: &mut Vec<Message>, nudge: &mut Option<u64>| {
         if let Some(s) = nudge.take() {
-            messages.push(Message::user(NUDGE).with_origin(Some(s)));
+            messages.push(Message::notice(NUDGE).with_origin(Some(s)));
         }
     };
     for l in &t.lines {
         match &l.record {
             Record::TranscriptDisabled(_) => gap = true,
             Record::SessionStart(_) if gap => {
-                messages.push(Message::user(
+                messages.push(Message::notice(
                     "[Note: part of this conversation was not recorded and is missing here.]",
                 ));
                 gap = false;
+            }
+            Record::Compaction(c) if c.method.as_deref() == Some("digest") => {
+                let seqs = c.seqs.as_deref().unwrap_or_default();
+                let mut i = 0;
+                while i < messages.len() {
+                    let m = &messages[i];
+                    if m.kind == Kind::Record || m.origin.is_some_and(|o| seqs.contains(&o)) {
+                        messages.remove(i);
+                        if let Some(b) = turn_begin.as_mut()
+                            && *b > i
+                        {
+                            *b -= 1;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+                let lead = usize::from(messages.first().is_some_and(|m| m.kind == Kind::Request));
+                let at = (lead..messages.len())
+                    .find(|&i| messages[i].kind != Kind::Request)
+                    .unwrap_or(messages.len());
+                let text = c.text.as_deref().unwrap_or_default();
+                messages.insert(at, Message::record(text).with_origin(Some(l.seq)));
+                if let Some(b) = turn_begin.as_mut()
+                    && *b >= at
+                {
+                    *b += 1;
+                }
+                evicted += c.messages_removed.unwrap_or(0) as usize;
+                digest = c.digest.clone().unwrap_or_default();
+                records = c.record.unwrap_or(0) as usize;
             }
             Record::TurnStart(r) => {
                 flush_nudge(&mut messages, &mut pending_nudge);
                 // A previous turn that never ended is dropped.
                 if let Some(b) = turn_begin.take() {
-                    messages.truncate(b);
+                    drop_turn(&mut messages, b);
                 }
                 turn_begin = Some(messages.len());
                 if messages.is_empty() {
@@ -872,14 +956,14 @@ pub fn replay(t: &Transcript, default_cap: usize) -> Rebuilt {
                     "steps" => STEPS_LEFT,
                     _ => FINAL_SUMMARY,
                 };
-                messages.push(Message::user(text).with_origin(Some(l.seq)));
+                messages.push(Message::notice(text).with_origin(Some(l.seq)));
             }
             Record::TurnEnd(r) => {
                 pending_nudge = None;
                 let begin = turn_begin.take();
                 if r.outcome == "cancelled" {
                     if let Some(b) = begin {
-                        messages.truncate(b);
+                        drop_turn(&mut messages, b);
                     }
                     continue;
                 }
@@ -892,10 +976,10 @@ pub fn replay(t: &Transcript, default_cap: usize) -> Rebuilt {
     }
     // An unfinished last turn (crash) is dropped.
     if let Some(b) = turn_begin {
-        messages.truncate(b);
+        drop_turn(&mut messages, b);
     }
     if gap {
-        messages.push(Message::user(
+        messages.push(Message::notice(
             "[Note: the end of this conversation was not recorded.]",
         ));
     }
@@ -933,7 +1017,9 @@ pub fn replay(t: &Transcript, default_cap: usize) -> Rebuilt {
         messages: fixed,
         first_instruction,
         masked_total: 0,
-        evicted_total: 0,
+        evicted_total: evicted,
+        digest,
+        records,
         method: "replay",
         reason: None,
         from_seq: None,

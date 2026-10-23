@@ -236,6 +236,9 @@ pub struct Context {
     pub mask_to: f64,
     /// Newest tool output (fraction of E) protected from masking.
     pub keep_recent: f64,
+    /// Earlier operator requests kept verbatim when steps are evicted
+    /// (fraction of E, at most 20k tokens).
+    pub keep_requests: f64,
     /// Count each request exactly with the server's `/tokenize` endpoint
     /// (vLLM) when it has one; otherwise estimate from reported usage.
     pub server_tokenize: bool,
@@ -272,6 +275,7 @@ impl Default for Context {
             mask_at: 0.6,
             mask_to: 0.4,
             keep_recent: 0.25,
+            keep_requests: 0.15,
             server_tokenize: true,
         }
     }

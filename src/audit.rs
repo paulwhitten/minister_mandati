@@ -39,6 +39,8 @@ const CONTENT: &[(&str, &str)] = &[
     ("tool_result", "converted/*/from"),
     ("turn_end", "answer"),
     ("context", "entries/*/text"),
+    ("compaction", "text"),
+    ("compaction", "digest"),
     ("session_start", "system_prompt/text"),
 ];
 

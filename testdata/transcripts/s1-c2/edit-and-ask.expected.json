@@ -1,0 +1,79 @@
+{
+  "messages": [
+    {
+      "content": "Read the files and fix line 7 of a.txt.",
+      "role": "user"
+    },
+    {
+      "content": "[Compaction record 2: mima removed 4 earlier messages to fit the context window. The digest lists what the removed steps read, changed and ran, taken from their tool calls; re-run a tool if you need its output again.]\n\n## Digest\nFiles read: /var/folders/_8/qjnx61px1n14zwqzzl0qv1sc0000gp/T/mima-resume-exact-92066/work/a.txt, /var/folders/_8/qjnx61px1n14zwqzzl0qv1sc0000gp/T/mima-resume-exact-92066/work/b.txt\nTool calls removed: 2",
+      "role": "user"
+    },
+    {
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "function": {
+            "arguments": "{\"path\":\"/var/folders/_8/qjnx61px1n14zwqzzl0qv1sc0000gp/T/mima-resume-exact-92066/work/c.txt\"}",
+            "name": "read_file"
+          },
+          "id": "r3",
+          "type": "function"
+        }
+      ]
+    },
+    {
+      "content": "[output elided to save context: read_file {\"path\":\"/var/folders/_8/qjnx61px1n14zwqzzl0qv1sc0000gp/T/mima-resume-exact-92066/work/c.txt\"}, 3720 bytes. Re-run the tool if you need it again.]",
+      "role": "tool",
+      "tool_call_id": "r3"
+    },
+    {
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "function": {
+            "arguments": "{\"new_string\":\"line seven\",\"old_string\":\"line 7 of a long file\",\"path\":\"/var/folders/_8/qjnx61px1n14zwqzzl0qv1sc0000gp/T/mima-resume-exact-92066/work/a.txt\"}",
+            "name": "edit_file"
+          },
+          "id": "e1",
+          "type": "function"
+        }
+      ]
+    },
+    {
+      "content": "Edited /var/folders/_8/qjnx61px1n14zwqzzl0qv1sc0000gp/T/mima-resume-exact-92066/work/a.txt: replaced lines 7-7 with 1 lines.\n     4\tline 4 of a long file\n     5\tline 5 of a long file\n     6\tline 6 of a long file\n     7\tline seven\n     8\tline 8 of a long file\n     9\tline 9 of a long file\n    10\tline 10 of a long file",
+      "role": "tool",
+      "tool_call_id": "e1"
+    },
+    {
+      "content": "Edited a.txt.",
+      "role": "assistant"
+    },
+    {
+      "content": "What does line 7 say now?",
+      "role": "user"
+    },
+    {
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "function": {
+            "arguments": "{\"limit\":5,\"offset\":5,\"path\":\"/var/folders/_8/qjnx61px1n14zwqzzl0qv1sc0000gp/T/mima-resume-exact-92066/work/a.txt\"}",
+            "name": "read_file"
+          },
+          "id": "r4",
+          "type": "function"
+        }
+      ]
+    },
+    {
+      "content": "[/var/folders/_8/qjnx61px1n14zwqzzl0qv1sc0000gp/T/mima-resume-exact-92066/work/a.txt lines 5-9 of 600]\n     5\tline 5 of a long file\n     6\tline 6 of a long file\n     7\tline seven\n     8\tline 8 of a long file\n     9\tline 9 of a long file\n[591 more lines; next: offset=10]",
+      "role": "tool",
+      "tool_call_id": "r4"
+    },
+    {
+      "content": "Line 7 now reads: line seven.",
+      "role": "assistant"
+    }
+  ],
+  "method": "context"
+}

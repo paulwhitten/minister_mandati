@@ -419,12 +419,23 @@ async fn parse_json_response(
     if let Some(f) = payload.pointer("/choices/0/finish_reason").cloned() {
         message["finish_reason"] = f;
     }
+    note_ids(&mut message, &payload);
+    Ok(build_response(&message, usage, cfg))
+}
+
+/// Copies the payload's `id` and `model` into `response_id` and
+/// `served_model` unless already set. Empty values are skipped: Azure's first
+/// streamed chunk (prompt filter results) has `"id": ""` and `"model": ""`.
+fn note_ids(message: &mut Value, payload: &Value) {
     for (from, to) in [("id", "response_id"), ("model", "served_model")] {
-        if let Some(v) = payload.get(from).filter(|v| v.is_string()) {
+        if message.get(to).is_none()
+            && let Some(v) = payload
+                .get(from)
+                .filter(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+        {
             message[to] = v.clone();
         }
     }
-    Ok(build_response(&message, usage, cfg))
 }
 
 /// Partial tool call accumulated across streamed deltas, keyed by array index.
@@ -469,13 +480,7 @@ async fn read_stream(
             if let Some(u) = TokenUsage::from_payload(&json) {
                 usage = Some(u);
             }
-            for (from, to) in [("id", "response_id"), ("model", "served_model")] {
-                if ids.get(to).is_none()
-                    && let Some(v) = json.get(from).filter(|v| v.is_string())
-                {
-                    ids[to] = v.clone();
-                }
-            }
+            note_ids(&mut ids, &json);
             if let Some(f) = json
                 .pointer("/choices/0/finish_reason")
                 .and_then(Value::as_str)
@@ -665,6 +670,21 @@ mod tests {
         );
         let m = json!({ "role": "assistant", "content": "ok" });
         assert_eq!(build_response(&m, None, &cfg).reasoning, None);
+    }
+
+    #[test]
+    fn ids_skip_azure_prompt_filter_chunk() {
+        let mut ids = json!({});
+        note_ids(&mut ids, &json!({ "id": "", "model": "", "choices": [] }));
+        note_ids(
+            &mut ids,
+            &json!({ "id": "chatcmpl-1", "model": "gpt-5.4-mini" }),
+        );
+        note_ids(&mut ids, &json!({ "id": "chatcmpl-2", "model": "other" }));
+        assert_eq!(
+            ids,
+            json!({ "response_id": "chatcmpl-1", "served_model": "gpt-5.4-mini" })
+        );
     }
 
     #[test]

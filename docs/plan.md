@@ -66,7 +66,8 @@ Headline conclusions:
 | Exact token counts via the server's `/tokenize`, calibrated estimate as fallback | Done | [context.md](context.md) |
 | Sessions, JSONL transcripts, resume | Done | [sessions.md](sessions.md), [design/session-resume.md](design/session-resume.md) |
 | Cloud endpoints (Azure OpenAI) | Done | [cloud-providers.md](cloud-providers.md) |
-| Summarizing compaction: a short progress note when steps are evicted | Planned | |
+| Summarizing compaction: a compaction record (code-built digest plus optional model summary) in place of evicted steps; `/compact [focus]` | Partial (digest record done; summary and `/compact` proposed) | [design/design-context-management.md](design/design-context-management.md) |
+| `/context-status`: context use by category, limits, thresholds, compaction history | Done | [design/design-context-reporting.md](design/design-context-reporting.md) |
 | `recall_output` tool: fetch a masked tool output back by call ID from the transcript | Planned | |
 | Project instructions: `AGENTS.md` from the repository root to the working directory plus a global file, cleaned, capped, labeled, recorded; workspace `agent.toml` can no longer set the system prompt | Done (paired A/B pending) | [design/design-project-instructions.md](design/design-project-instructions.md) |
 | Verifier-gated self-refine wired into the loop | Planned | |
@@ -208,8 +209,10 @@ Ordered by dependency, then impact:
    run it after edits, feed failures back, and require a passing check (or a
    stated reason) before the final answer.
 4. The TODO tool (project instructions done; measure them with a paired A/B using hand-written AGENTS.md files on a task subset).
-5. Summarizing compaction and `recall_output`, measured on the 8k-window
+5. `/context-status`, then summarizing compaction (digest record first,
+   then `/compact`) and `recall_output`, measured on the 8k-window
    regression task.
+   See [design/design-context-management.md](design/design-context-management.md).
 6. Prompt-injection red-team track, then taint tracking and tool-argument
    sanitization.
 7. Linux and kernel eval tasks, plus harder tasks for saturated models.

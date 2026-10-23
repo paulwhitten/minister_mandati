@@ -99,7 +99,12 @@ Each entry is one message of the request, in order:
 (rule 8): `full` (default), `capped` (tool output cut to `cap_bytes` by the
 stage 0 rule), `masked` (body replaced by `text`, the placeholder),
 `noted` (record text plus `text` appended: the eviction note on the first
-instruction), `synthetic` (no record). Evicted messages are simply absent.
+instruction, written before context schema 2), `synthetic` (no record),
+`record` (context schema 2: a compaction record; `seq` is the `compaction`
+record whose `text` the model sees). Evicted messages are simply absent.
+Replay applies `compaction` records with `method: "digest"`: it drops the
+messages built from `seqs` and inserts the record's `text`. Readers accept
+context records of their own schema or older.
 
 `check` detects drift between what was written and what a later mima
 rebuilds (for example if the capping code changes): the message count, total

@@ -132,6 +132,23 @@
       ],
       "type": "object"
     },
+    "Changed": {
+      "properties": {
+        "count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "count"
+      ],
+      "type": "object"
+    },
     "Check": {
       "description": "Drift detection over the rebuilt messages (not security).",
       "properties": {
@@ -175,6 +192,17 @@
             "null"
           ]
         },
+        "digest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Digest"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Cumulative digest of everything evicted so far."
+        },
         "dropped_results": {
           "format": "uint64",
           "minimum": 0,
@@ -207,9 +235,45 @@
             "null"
           ]
         },
+        "method": {
+          "description": "Open enum: digest (eviction left a compaction record).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "reason": {
           "type": [
             "string",
+            "null"
+          ]
+        },
+        "record": {
+          "description": "Number of the compaction record this event wrote.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "requests_removed": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "seqs": {
+          "description": "Records the removed messages were built from.",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": [
+            "array",
             "null"
           ]
         },
@@ -222,6 +286,13 @@
           "minimum": 0,
           "type": [
             "integer",
+            "null"
+          ]
+        },
+        "text": {
+          "description": "The compaction record's text, as the model sees it.",
+          "type": [
+            "string",
             "null"
           ]
         }
@@ -300,6 +371,72 @@
         "entries",
         "check"
       ],
+      "type": "object"
+    },
+    "Digest": {
+      "properties": {
+        "calls": {
+          "default": 0,
+          "description": "Tool calls covered.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "changed": {
+          "default": [],
+          "description": "Files written or edited, with the number of successful changes.",
+          "items": {
+            "$ref": "#/$defs/Changed"
+          },
+          "type": "array"
+        },
+        "commands": {
+          "default": [],
+          "description": "Shell commands with their exit status, oldest first.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "dropped": {
+          "default": 0,
+          "description": "Entries dropped from the lists above to bound their size.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "errors": {
+          "default": [],
+          "description": "First lines of failed tool results, oldest first.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "read": {
+          "default": [],
+          "description": "Files and directories read, oldest first, each once.",
+          "items": {
+            "$ref": "#/$defs/Read"
+          },
+          "type": "array"
+        },
+        "requests_removed": {
+          "default": 0,
+          "description": "Operator requests removed.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "searches": {
+          "default": [],
+          "description": "Searches (`find_files`, `search_files`), oldest first.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
       "type": "object"
     },
     "Entry": {
@@ -557,6 +694,32 @@
         "turn",
         "step",
         "duration_ms"
+      ],
+      "type": "object"
+    },
+    "Read": {
+      "properties": {
+        "lines": {
+          "default": [],
+          "description": "Line ranges read (first, last), merged; empty means the whole file.",
+          "items": {
+            "items": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "maxItems": 2,
+            "minItems": 2,
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
       ],
       "type": "object"
     },
@@ -1026,14 +1189,23 @@
     },
     "View": {
       "description": "How the model's view of a message differs from its record. A closed enum\n(evolution rule 8): an unknown value makes the record unusable, and the\nreader replays instead of guessing.",
-      "enum": [
-        "full",
-        "capped",
-        "masked",
-        "noted",
-        "synthetic"
-      ],
-      "type": "string"
+      "oneOf": [
+        {
+          "enum": [
+            "full",
+            "capped",
+            "masked",
+            "noted",
+            "synthetic"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "record",
+          "description": "A compaction record; `seq` is its `compaction` record (schema 2).",
+          "type": "string"
+        }
+      ]
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1287,7 +1459,7 @@
   },
   "x-mima-retired": [],
   "x-mima-versions": {
-    "context_schema": 1,
+    "context_schema": 2,
     "schema": 1
   }
 }

@@ -57,6 +57,7 @@ allowed_paths = ["./"]
 # mask_at = 0.6       # compact above this fraction of the operating budget ...
 # mask_to = 0.4       # ... down to this fraction (hide old tool output, then drop old steps)
 # keep_recent = 0.25  # newest tool output protected from compaction (fraction of budget)
+# keep_requests = 0.15  # earlier operator requests kept when steps are evicted (fraction of budget, max 20k tokens)
 # server_tokenize = true  # count each request exactly via the server's /tokenize (vLLM)
 
 # Sessions and transcripts (see docs/sessions.md). Transcripts are off by

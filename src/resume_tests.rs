@@ -110,7 +110,7 @@ async fn context_record_restores_exactly_what_the_model_saw() {
         record_outcome(&mut ctx, &result);
     }
     assert!(
-        ctx.stats().masked_total > 0,
+        ctx.report().masked_total > 0,
         "the test should exercise masking"
     );
     let expected = messages_json(&ctx);
@@ -161,9 +161,98 @@ async fn context_record_restores_exactly_what_the_model_saw() {
 
     // Save as the golden fixture for this schema version (MIMA_BLESS=1).
     if std::env::var("MIMA_BLESS").is_ok_and(|v| v == "1") {
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/transcripts/s1-c1");
+        let dir = fixture_dir();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::copy(&path, dir.join("edit-and-ask.jsonl")).unwrap();
+    }
+}
+
+/// Golden fixtures for the current transcript and context schema versions.
+fn fixture_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+        "testdata/transcripts/s{}-c{}",
+        crate::session::SCHEMA,
+        crate::transcript::CONTEXT_SCHEMA
+    ))
+}
+
+#[tokio::test]
+async fn compaction_record_is_restored_and_replayed() {
+    let d = tmp("record");
+    let work = d.join("work");
+    let big: String = (1..=600)
+        .map(|i| format!("line {i} of a long file\n"))
+        .collect();
+    std::fs::write(work.join("a.txt"), &big).unwrap();
+    let p = work.join("a.txt").display().to_string();
+    let mut script: Vec<Value> = (0..24)
+        .map(|i| {
+            call(
+                &format!("r{i}"),
+                "read_file",
+                json!({ "path": p, "offset": 1 + i * 20, "limit": 20 }),
+            )
+        })
+        .collect();
+    script.push(answer("Read all of a.txt."));
+    script.push(answer("It has 600 lines."));
+    let base = mock_model(script).await;
+    let mut cfg = config(base, &d);
+    cfg.agent.max_steps = 40;
+    let registry = ToolRegistry::init_default(&cfg);
+    let mut ctx = AgentContext::new(cfg, registry.specs());
+    ctx.session.enable(json!({ "mode": "test" })).unwrap();
+    let mut presenter = CliPresenter::default();
+    for instruction in ["Read a.txt in pieces.", "How long is it?"] {
+        let result = run_turn(&mut ctx, &registry, &mut presenter, instruction).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+        record_outcome(&mut ctx, &result);
+    }
+    let records = ctx.report().records;
+    assert!(records > 0, "the test should exercise eviction");
+    let expected = messages_json(&ctx);
+    let record_text = |m: &crate::context::Message| {
+        (m.kind == crate::context::Kind::Record).then(|| m.content.clone().unwrap_or_default())
+    };
+    let live: Vec<String> = ctx.messages().iter().filter_map(record_text).collect();
+    assert_eq!(live.len(), 1);
+    assert!(live[0].contains("a.txt (lines 1-"), "{}", live[0]);
+    let path = ctx.session.transcript_path().unwrap().to_path_buf();
+    drop(ctx);
+    crate::schema_tests::validate_transcript(&path);
+
+    let t = Transcript::load(&path).unwrap();
+    let r = rebuild(&t, 4096);
+    assert_eq!(r.method, "context", "{:?}", r.reason);
+    let got: Vec<Value> = r
+        .messages
+        .iter()
+        .map(|m| serde_json::to_value(m).unwrap())
+        .collect();
+    assert_eq!(got, expected);
+    assert_eq!(r.records, records);
+    assert!(r.digest.calls > 0);
+    let rebuilt: Vec<String> = r.messages.iter().filter_map(record_text).collect();
+    assert_eq!(rebuilt, live, "the record comes back as a record");
+
+    // Replay applies the record too: evicted steps stay out, pairing holds.
+    let replayed = replay(&t, 4096);
+    assert_pairing(&replayed.messages);
+    let replayed_records: Vec<String> = replayed.messages.iter().filter_map(record_text).collect();
+    assert_eq!(replayed_records, live);
+    assert_eq!(replayed.records, records);
+    assert!(
+        !replayed
+            .messages
+            .iter()
+            .any(|m| m.tool_call_id.as_deref() == Some("r0")),
+        "evicted results are not replayed"
+    );
+
+    if std::env::var("MIMA_BLESS").is_ok_and(|v| v == "1") {
+        let dir = fixture_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy(&path, dir.join("compaction-record.jsonl")).unwrap();
     }
 }
 

@@ -1,0 +1,97 @@
+{
+  "messages": [
+    {
+      "content": "Read a.txt in pieces.",
+      "role": "user"
+    },
+    {
+      "content": "[Compaction record 20: mima removed 40 earlier messages to fit the context window. The digest lists what the removed steps read, changed and ran, taken from their tool calls; re-run a tool if you need its output again.]\n\n## Digest\nFiles read: /var/folders/_8/qjnx61px1n14zwqzzl0qv1sc0000gp/T/mima-resume-record-92066/work/a.txt (lines 1-400)\nTool calls removed: 20",
+      "role": "user"
+    },
+    {
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "function": {
+            "arguments": "{\"limit\":20,\"offset\":401,\"path\":\"/var/folders/_8/qjnx61px1n14zwqzzl0qv1sc0000gp/T/mima-resume-record-92066/work/a.txt\"}",
+            "name": "read_file"
+          },
+          "id": "r20",
+          "type": "function"
+        }
+      ]
+    },
+    {
+      "content": "[/var/folders/_8/qjnx61px1n14zwqzzl0qv1sc0000gp/T/mima-resume-record-92066/work/a.txt lines 401-420 of 600]\n   401\tline 401 of a long file\n   402\tline 402 of a long file\n   403\tline 403 of a long file\n   404\tline 404 of a long file\n   405\tline 405 of a long file\n   406\tline 406 of a long file\n   407\tline 407 of a long file\n   408\tline 408 of a long file\n   409\tline 409 of a long file\n   410\tline 410 of a long file\n   411\tline 411 of a long file\n   412\tline 412 of a long file\n   413\tline 413 of a long file\n   414\tline 414 of a long file\n   415\tline 415 of a long file\n   416\tline 416 of a long file\n   417\tline 417 of a long file\n   418\tline 418 of a long file\n   419\tline 419 of a long file\n   420\tline 420 of a long file\n[180 more lines; next: offset=421]",
+      "role": "tool",
+      "tool_call_id": "r20"
+    },
+    {
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "function": {
+            "arguments": "{\"limit\":20,\"offset\":421,\"path\":\"/var/folders/_8/qjnx61px1n14zwqzzl0qv1sc0000gp/T/mima-resume-record-92066/work/a.txt\"}",
+            "name": "read_file"
+          },
+          "id": "r21",
+          "type": "function"
+        }
+      ]
+    },
+    {
+      "content": "[/var/folders/_8/qjnx61px1n14zwqzzl0qv1sc0000gp/T/mima-resume-record-92066/work/a.txt lines 421-440 of 600]\n   421\tline 421 of a long file\n   422\tline 422 of a long file\n   423\tline 423 of a long file\n   424\tline 424 of a long file\n   425\tline 425 of a long file\n   426\tline 426 of a long file\n   427\tline 427 of a long file\n   428\tline 428 of a long file\n   429\tline 429 of a long file\n   430\tline 430 of a long file\n   431\tline 431 of a long file\n   432\tline 432 of a long file\n   433\tline 433 of a long file\n   434\tline 434 of a long file\n   435\tline 435 of a long file\n   436\tline 436 of a long file\n   437\tline 437 of a long file\n   438\tline 438 of a long file\n   439\tline 439 of a long file\n   440\tline 440 of a long file\n[160 more lines; next: offset=441]",
+      "role": "tool",
+      "tool_call_id": "r21"
+    },
+    {
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "function": {
+            "arguments": "{\"limit\":20,\"offset\":441,\"path\":\"/var/folders/_8/qjnx61px1n14zwqzzl0qv1sc0000gp/T/mima-resume-record-92066/work/a.txt\"}",
+            "name": "read_file"
+          },
+          "id": "r22",
+          "type": "function"
+        }
+      ]
+    },
+    {
+      "content": "[/var/folders/_8/qjnx61px1n14zwqzzl0qv1sc0000gp/T/mima-resume-record-92066/work/a.txt lines 441-460 of 600]\n   441\tline 441 of a long file\n   442\tline 442 of a long file\n   443\tline 443 of a long file\n   444\tline 444 of a long file\n   445\tline 445 of a long file\n   446\tline 446 of a long file\n   447\tline 447 of a long file\n   448\tline 448 of a long file\n   449\tline 449 of a long file\n   450\tline 450 of a long file\n   451\tline 451 of a long file\n   452\tline 452 of a long file\n   453\tline 453 of a long file\n   454\tline 454 of a long file\n   455\tline 455 of a long file\n   456\tline 456 of a long file\n   457\tline 457 of a long file\n   458\tline 458 of a long file\n   459\tline 459 of a long file\n   460\tline 460 of a long file\n[140 more lines; next: offset=461]",
+      "role": "tool",
+      "tool_call_id": "r22"
+    },
+    {
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "function": {
+            "arguments": "{\"limit\":20,\"offset\":461,\"path\":\"/var/folders/_8/qjnx61px1n14zwqzzl0qv1sc0000gp/T/mima-resume-record-92066/work/a.txt\"}",
+            "name": "read_file"
+          },
+          "id": "r23",
+          "type": "function"
+        }
+      ]
+    },
+    {
+      "content": "[/var/folders/_8/qjnx61px1n14zwqzzl0qv1sc0000gp/T/mima-resume-record-92066/work/a.txt lines 461-480 of 600]\n   461\tline 461 of a long file\n   462\tline 462 of a long file\n   463\tline 463 of a long file\n   464\tline 464 of a long file\n   465\tline 465 of a long file\n   466\tline 466 of a long file\n   467\tline 467 of a long file\n   468\tline 468 of a long file\n   469\tline 469 of a long file\n   470\tline 470 of a long file\n   471\tline 471 of a long file\n   472\tline 472 of a long file\n   473\tline 473 of a long file\n   474\tline 474 of a long file\n   475\tline 475 of a long file\n   476\tline 476 of a long file\n   477\tline 477 of a long file\n   478\tline 478 of a long file\n   479\tline 479 of a long file\n   480\tline 480 of a long file\n[120 more lines; next: offset=481]",
+      "role": "tool",
+      "tool_call_id": "r23"
+    },
+    {
+      "content": "Read all of a.txt.",
+      "role": "assistant"
+    },
+    {
+      "content": "How long is it?",
+      "role": "user"
+    },
+    {
+      "content": "It has 600 lines.",
+      "role": "assistant"
+    }
+  ],
+  "method": "context"
+}

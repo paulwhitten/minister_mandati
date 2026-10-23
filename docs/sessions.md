@@ -122,8 +122,8 @@ ledger" below; the example lines omit them).
 | `model_response` | a completion returns | `turn`, `step`, `duration_ms`, `content`, `tool_calls`, `usage` (server-reported), `counted_prompt_tokens` and `count_source` (the count before sending; see [context.md](context.md)) |
 | `model_error` | a completion fails | `turn`, `step`, `error`, `overflow` (bool), `retry` |
 | `approval` | before a tool runs | `call_id`, `decision`: `not_required`, `auto_approved`, `approved`, `denied`, `skipped_duplicate`, `not_requested_invalid` (the call could not succeed, so nothing was asked); `preview` (the diff shown, for edits and overwrites); `actor`, and `rule` (with `matched`) or the operator's `answer`, `shown_sha256`, `wait_ms` (see Attribution) |
-| `tool_result` | a tool finishes | `call_id`, `tool`, `duration_ms`, `failed`, `bytes`, `sent_bytes` (after the stage 0 cap), `output` (full), `cap_bytes` (the cap in effect), `file` (`{path, fnv1a64}` after a read, edit or write) |
-| `compaction` | a context stage acts | `stage` (`normalize`, `mask`, `evict`), `reason`, `call_ids`, `messages_removed`, token estimates before and after |
+| `tool_result` | a tool finishes | `call_id`, `tool`, `duration_ms` (the tool's run time, without the approval wait; 0 if it did not run), `failed`, `bytes`, `sent_bytes` (after the stage 0 cap), `output` (full), `cap_bytes` (the cap in effect), `file` (`{path, fnv1a64}` after a read, edit or write) |
+| `compaction` | a context stage acts | `stage` (`normalize`, `mask`, `evict`), `reason`, `call_ids`, `messages_removed`, token estimates before and after; eviction also writes `method: "digest"`, `record` (its number), `requests_removed`, `seqs` (records of the removed messages), `digest` (cumulative, structured) and `text` (the compaction record the model sees) |
 | `loop_guard` | a nudge or stop | `action`, `repeats`, `tool` |
 | `turn_end` | a turn finishes | `turn`, `outcome` (`answered`, `no_answer` (only empty replies after the continue prompts), `truncated` (replies still cut off at `max_tokens`; `answer` holds any partial text), `loop_guard`, `step_cap`, `cancelled`, `error`), `answer`, `tokens` |
 | `transcript_disabled` | `/disable_transcript` | `turns` |
@@ -167,7 +167,8 @@ salt || 0x00 || canonical(value)))`, where the field salt is `SHA-256(salt ||
 path)`. Content fields: `turn_start.instruction`, `model_response.content`,
 `.reasoning` and `.tool_calls/*/args`, `approval.preview`,
 `tool_result.output`, `.output_full_sha256` and `.converted/*/from`, `turn_end.answer`,
-`context.entries/*/text`, `session_start.system_prompt/text` (it includes
+`context.entries/*/text`, `compaction.text` and `.digest`,
+`session_start.system_prompt/text` (it includes
 the project instructions). Canonical encoding: keys sorted, no whitespace,
 minimal escaping, integers as written, floats in shortest round-trip form.
 

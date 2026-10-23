@@ -26,6 +26,10 @@ pub struct Budget {
     pub usable: usize,
     /// Operating budget E = min(U, configured budget).
     pub operating: usize,
+    /// Reply reserve R.
+    pub reserve: usize,
+    /// Safety margin S.
+    pub margin: usize,
 }
 
 impl Budget {
@@ -51,6 +55,8 @@ impl Budget {
             window,
             usable,
             operating,
+            reserve,
+            margin,
         }
     }
 

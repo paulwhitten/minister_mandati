@@ -75,7 +75,7 @@ tokenizer:
   anchors the count.
 
 Cumulative totals (`/tokens`, transcripts) always use the server's reported
-usage. Logs, `/context` and transcripts label each count's source:
+usage. Logs, `/context-status` and transcripts label each count's source:
 `tokenize`, `usage`, `tokenize+estimate`, `usage+estimate`, or
 `default-ratio`. Set `[context].server_tokenize = false` to skip the
 `/tokenize` calls.
@@ -93,7 +93,7 @@ tokenizers.
 |---|---|---|---|
 | 0 cap | every tool result | keep the head and tail of output over `clamp(8% of E, 1k, 16k)` tokens, with a notice of how much was cut | -- |
 | 1 mask | above 60% of E | replace the oldest tool-result bodies with a placeholder; skipped unless it frees at least 10% of E | 40% of E |
-| 2 evict | masking cannot reach the target, or the server rejects the prompt as too long | drop the oldest whole steps (a tool-call message with all its results) | 40% of E (on rejection: below 70% of the current size) |
+| 2 evict | masking cannot reach the target, or the server rejects the prompt as too long | drop the oldest whole steps (a tool-call message with all its results) and leave a compaction record with a digest of them | 40% of E (on rejection: below 70% of the current size) |
 | 3 stop | the server still rejects the prompt and nothing more can be removed | end the turn with an error | -- |
 
 **Stage 1 (masking).** A masked result keeps its message and `tool_call_id`
@@ -118,8 +118,34 @@ output accumulate, so eventually masking alone cannot reach the target. Steps
 are then removed oldest first (by that point mostly placeholders), earlier
 turns before the current one. Never removed: the system prompt, the first
 instruction, the current turn's instruction, the newest step, and steps
-holding protected output. The first instruction gets a short note saying how
-many earlier messages were removed. On a prompt-too-long error, `mima` masks
+holding protected output. Earlier operator requests are kept verbatim up to
+`keep_requests` (15% of E, at most 20,000 tokens); beyond that, and as a last
+resort, the oldest go.
+
+In place of the removed steps `mima` puts one **compaction record**, a user
+message after the kept requests:
+
+```
+[Compaction record 3: mima removed 41 earlier messages to fit the context
+window. The digest lists what the removed steps read, changed and ran, taken
+from their tool calls; re-run a tool if you need its output again.]
+
+## Digest
+Files changed: src/ring.c (2 changes)
+Files read: src/ring.c (lines 1-120), include/ring.h
+Commands: `make test` exit 2; `make test` exit 0
+Errors: execute_bash: ring.c:41: assertion failed
+Tool calls removed: 20
+```
+
+The digest is built by code from the removed tool calls (no model call) and
+covers every step removed in the session: each eviction replaces the record
+with an updated one. It is capped at `clamp(4% of E, 256, 2048)` tokens,
+dropping the oldest entries of the longest list first. A model-written
+summary on top of the digest is proposed in
+[design/design-context-management.md](design/design-context-management.md).
+
+On a prompt-too-long error, `mima` masks
 and evicts regardless of the minimum-gain rule, then retries the request at
 most twice.
 
@@ -152,17 +178,23 @@ nearly fills the budget. Serve models with a window of 32k or more.
 # mask_at = 0.6       # compact above this fraction of the operating budget E
 # mask_to = 0.4       # ... down to this fraction
 # keep_recent = 0.25  # newest tool output protected (fraction of E)
+# keep_requests = 0.15  # earlier operator requests kept by eviction (fraction of E, max 20k)
 # server_tokenize = true  # exact counts via the server's /tokenize when available
 ```
 
-The REPL command `/context` shows the window, budget, current estimate and
-the counts of masked and evicted messages.
+The REPL command `/context-status` (alias `/context`) shows the limits, the
+tokens in use by category (system prompt, project instructions, tool
+definitions, requests, assistant messages, tool outputs full and masked,
+mima's notices), the largest items, the thresholds and the compaction so
+far; `/context-status messages` lists every message. See
+[design/design-context-reporting.md](design/design-context-reporting.md).
 
 ## Status and next steps
 
 Implemented: budget from the window (config, `/v1/models`, or the server's
 error), exact counting via `/tokenize` with an anchored estimate as fallback, stages 0-3,
-normalization, eviction notice, per-event logging, overflow retry. Tested
+normalization, compaction records with a code-built digest (operator
+requests kept), per-event logging, overflow retry. Tested
 with unit tests and against a mock OpenAI-compatible server; exact counting
 also checked live against vLLM. Not yet evaluated on real tasks.
 
@@ -178,11 +210,12 @@ Planned, in order:
    Next: a read-only `recall_output(call_id)` tool so placeholders can point
    to the stored output instead of asking for a re-run. Only possible when the
    session is being recorded (transcripts are off by default).
-3. **Optional `/compact`**: a structured LLM summary of the masked span
-   (goal, constraints, files, done and pending work, errors, next step),
-   treating history as untrusted input and rejected if it does not shrink the
-   context. Untrained summarization has weak evidence over masking, so it
-   stays opt-in.
+3. **`/compact` and model summaries**: on top of the digest record (done),
+   an optional model-written summary and an on-demand `/compact [focus]`.
+   Untrained summarization has weak evidence over masking, so the model
+   summary stays opt-in. Proposal:
+   [design/design-context-management.md](design/design-context-management.md);
+   reporting: [design/design-context-reporting.md](design/design-context-reporting.md).
 4. **Notes/todo recitation**: re-inject a short notes file near the end of
    context after compaction.
 

@@ -143,7 +143,7 @@ Modes:
 `-i` matters only when you also pass an instruction: plain `mima` on a
 terminal already starts the REPL, so `mima -i` on its own behaves the same.
 
-In the REPL, `/help` lists commands (`/tokens`, `/context`, `/session`, `/sessions`, `/resume`, `/new`,
+In the REPL, `/help` lists commands (`/tokens`, `/context-status`, `/session`, `/sessions`, `/resume`, `/new`,
 `/enable_transcript`, `/disable_transcript`, `/exit`). Ctrl-C
 cancels the current turn and returns to the prompt; Ctrl-D exits. The prompt
 supports line editing (arrow keys, Home/End, Delete) and Up/Down history for
@@ -290,8 +290,9 @@ path. See [docs/eval.md](docs/eval.md).
 reads from the server (vLLM reports `max_model_len`) or from `[context].window`.
 As the conversation grows it first hides old tool outputs behind one-line
 placeholders, keeping its own reasoning and tool calls, and only then drops
-the oldest steps. Tool calls and their results are never split. `/context`
-shows the current budget. Details and the research behind the approach:
+the oldest steps. Tool calls and their results are never split.
+`/context-status` shows the budget, what fills the context, and the
+compaction thresholds. Details and the research behind the approach:
 [docs/context.md](docs/context.md).
 
 ## Observability

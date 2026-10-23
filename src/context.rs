@@ -16,6 +16,8 @@ use serde_json::{Value, json};
 use crate::budget::{Budget, CountSource, Estimator, FALLBACK_WINDOW, MIN_MASK_GAIN};
 use crate::client::{CompletionResponse, TokenUsage};
 use crate::config::Config;
+use crate::context_report::{self as report, ContextReport, LastCompaction};
+use crate::digest::Digest;
 use crate::schema;
 use crate::session::{Session, expand_home};
 use crate::tools::ToolSpec;
@@ -46,6 +48,21 @@ pub struct Message {
     /// Made up by mima rather than recorded (a "not executed" result).
     #[serde(skip)]
     pub synthetic: bool,
+    #[serde(skip)]
+    pub kind: Kind,
+}
+
+/// Who a message speaks for, beyond its role.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Kind {
+    #[default]
+    Normal,
+    /// An instruction from the operator (a turn's request).
+    Request,
+    /// A prompt mima adds (loop-guard nudge, continue, step limit, notes).
+    Notice,
+    /// A compaction record standing in for evicted steps.
+    Record,
 }
 
 impl Message {
@@ -59,6 +76,7 @@ impl Message {
             origin: None,
             cap_bytes: None,
             synthetic: false,
+            kind: Kind::Normal,
         }
     }
 
@@ -72,8 +90,25 @@ impl Message {
         Self::new("system", Some(content.into()))
     }
 
+    /// An operator request.
     pub fn user(content: &str) -> Self {
-        Self::new("user", Some(content.into()))
+        let mut m = Self::new("user", Some(content.into()));
+        m.kind = Kind::Request;
+        m
+    }
+
+    /// A user-role prompt written by mima, not the operator.
+    pub fn notice(content: &str) -> Self {
+        let mut m = Self::new("user", Some(content.into()));
+        m.kind = Kind::Notice;
+        m
+    }
+
+    /// A compaction record (user role, written by mima).
+    pub fn record(content: &str) -> Self {
+        let mut m = Self::new("user", Some(content.into()));
+        m.kind = Kind::Record;
+        m
     }
 
     /// A plain assistant reply (no tool calls), e.g. a turn's final answer.
@@ -144,15 +179,12 @@ pub struct TokenLedger {
     pub unreported_requests: u64,
 }
 
-/// Snapshot of the context budget, for `/context` and logs.
+/// Snapshot of the context budget and current size, for logs.
 #[derive(Debug, Clone, Copy)]
 pub struct ContextStats {
     pub budget: Budget,
     pub tokens: usize,
     pub token_source: &'static str,
-    pub messages: usize,
-    pub masked_total: usize,
-    pub evicted_total: usize,
 }
 
 /// Result text for a requested tool call that never ran (turn aborted, loop
@@ -177,6 +209,12 @@ pub const FINAL_SUMMARY: &str = "The step limit has been reached. Without callin
                                  you verified it, and what remains to be done.";
 /// Longest tool-call argument text quoted in a placeholder.
 const PLACEHOLDER_ARGS_CHARS: usize = 200;
+/// Share of E for a compaction record's digest (clamped to 256-2048 tokens).
+const RECORD_SHARE: f64 = 0.04;
+/// Room for the record's header line, in characters.
+const RECORD_HEADER_CHARS: usize = 400;
+/// Most tokens of earlier operator requests kept by eviction.
+const MAX_KEPT_REQUEST_TOKENS: usize = 20_000;
 
 /// Ids of the calls in an assistant message's OpenAI `tool_calls` array.
 fn tool_call_ids(tool_calls: &Value) -> Vec<String> {
@@ -196,6 +234,23 @@ fn tool_call_ids(tool_calls: &Value) -> Vec<String> {
 pub fn is_failure(content: &str) -> bool {
     content.starts_with("Error:")
         || (content.starts_with("exit: ") && !content.starts_with("exit: 0\n"))
+}
+
+/// Rollback point for a cancellable turn (`AgentContext::checkpoint`).
+#[derive(Clone, Copy, Debug)]
+pub struct Checkpoint {
+    len: usize,
+    turns: u64,
+}
+
+/// Removes the messages from `start` on (a cancelled or unfinished turn),
+/// keeping a compaction record among them: it covers steps evicted earlier.
+pub fn drop_turn(messages: &mut Vec<Message>, start: usize) {
+    if start >= messages.len() {
+        return;
+    }
+    let tail = messages.split_off(start);
+    messages.extend(tail.into_iter().filter(|m| m.kind == Kind::Record));
 }
 
 /// Prefix of `s` at most `max` bytes long, cut on a character boundary.
@@ -244,6 +299,16 @@ pub struct AgentContext {
     chars_at_last_request: usize,
     masked_total: usize,
     evicted_total: usize,
+    mask_events: usize,
+    /// Where the window came from (`context_report::WINDOW_*`).
+    window_source: &'static str,
+    last_compaction: Option<LastCompaction>,
+    /// What evicted steps read, changed and ran (the compaction record).
+    digest: Digest,
+    /// Compaction records written this session.
+    records: usize,
+    /// Turns begun on this context, to tell whether a checkpoint's turn began.
+    turns_begun: u64,
 }
 
 impl AgentContext {
@@ -269,6 +334,11 @@ impl AgentContext {
         }
         tracing::debug!(%system_prompt, "composed system prompt");
         let window = config.context.window.unwrap_or(FALLBACK_WINDOW);
+        let window_source = if config.context.window.is_some() {
+            report::WINDOW_CONFIGURED
+        } else {
+            report::WINDOW_FALLBACK
+        };
         let budget = Budget::new(window, &config);
         let tool_schema_chars = schema::to_openai_tools(&tool_specs).to_string().len();
         let session = Session::new(
@@ -290,18 +360,25 @@ impl AgentContext {
             first_instruction: None,
             usage: TokenLedger::default(),
             budget,
+            window_source,
             estimator: Estimator::default(),
             tool_schema_chars,
             chars_at_last_request: 0,
             masked_total: 0,
             evicted_total: 0,
+            mask_events: 0,
+            last_compaction: None,
+            digest: Digest::default(),
+            records: 0,
+            turns_begun: 0,
             tools_disabled: false,
         }
     }
 
     /// Adopt a context window learned from the server (`/v1/models` or an
     /// overflow error) and recompute the budget.
-    pub fn set_window(&mut self, window: usize) {
+    pub fn set_window(&mut self, window: usize, source: &'static str) {
+        self.window_source = source;
         if window == self.budget.window {
             return;
         }
@@ -319,9 +396,6 @@ impl AgentContext {
             budget: self.budget,
             tokens: self.estimated_tokens(),
             token_source: self.estimator.source(self.total_chars()),
-            messages: self.messages.len(),
-            masked_total: self.masked_total,
-            evicted_total: self.evicted_total,
         }
     }
 
@@ -383,6 +457,7 @@ impl AgentContext {
     /// then append the instruction and protect it from eviction for this turn.
     pub fn begin_turn(&mut self, instruction: &str, origin: Option<u64>) {
         self.normalize();
+        self.turns_begun += 1;
         self.turn_start = Some(self.messages.len());
         self.add_message(Message::user(instruction).with_origin(origin));
     }
@@ -427,7 +502,9 @@ impl AgentContext {
                         content.strip_prefix(original).filter(|n| !n.is_empty())
                     })
                     .flatten();
-                if m.masked {
+                if m.kind == Kind::Record {
+                    e.view = View::Record;
+                } else if m.masked {
                     e.view = View::Masked;
                     e.text = m.content.clone();
                 } else if let Some(note) = noted {
@@ -495,6 +572,13 @@ impl AgentContext {
         self.evicted_total = evicted_total;
     }
 
+    /// Restores the digest and record count of a resumed session, so the
+    /// next compaction record continues them.
+    pub fn restore_compaction(&mut self, digest: Digest, records: usize) {
+        self.digest = digest;
+        self.records = records;
+    }
+
     pub fn add_message(&mut self, message: Message) {
         // Pin the first user instruction alongside the system prompt.
         if self.pinned == 1 && message.role == "user" {
@@ -504,20 +588,26 @@ impl AgentContext {
         self.messages.push(message);
     }
 
-    /// Current history length, used as a rollback point for a cancellable turn.
-    pub fn checkpoint(&self) -> usize {
-        self.messages.len()
+    /// Where a cancellable turn starts, for `rollback_to`.
+    pub fn checkpoint(&self) -> Checkpoint {
+        Checkpoint {
+            len: self.messages.len(),
+            turns: self.turns_begun,
+        }
     }
 
-    /// Discard messages appended since a `checkpoint`, so a cancelled turn leaves
-    /// no dangling assistant tool-call without its tool results. Never trims the
-    /// pinned leaders (system prompt + first instruction).
-    pub fn rollback_to(&mut self, len: usize) {
-        let target = len.max(self.pinned.max(1));
-        if target < self.messages.len() {
-            self.messages.truncate(target);
-        }
-        if self.turn_start.is_some_and(|t| t >= self.messages.len()) {
+    /// Removes a cancelled turn, so no assistant tool call is left without
+    /// its results. Compaction during the turn may have removed earlier
+    /// messages and moved the turn, so the turn is found by its start, not by
+    /// the old length; a compaction record is kept. Never trims the pinned
+    /// leaders (system prompt + first instruction).
+    pub fn rollback_to(&mut self, cp: Checkpoint) {
+        let start = match self.turn_start {
+            Some(t) if self.turns_begun > cp.turns => t,
+            _ => cp.len,
+        };
+        drop_turn(&mut self.messages, start.max(self.pinned.max(1)));
+        if self.turns_begun > cp.turns {
             self.turn_start = None;
         }
     }
@@ -531,6 +621,10 @@ impl AgentContext {
         self.usage = TokenLedger::default();
         self.masked_total = 0;
         self.evicted_total = 0;
+        self.mask_events = 0;
+        self.last_compaction = None;
+        self.digest = Digest::default();
+        self.records = 0;
     }
 
     /// Run before every model request without a server count: normalize,
@@ -594,7 +688,7 @@ impl AgentContext {
         server_prompt_tokens: Option<u64>,
     ) -> bool {
         if let Some(w) = server_window {
-            self.set_window(w);
+            self.set_window(w, report::WINDOW_SERVER);
         }
         if let Some(p) = server_prompt_tokens {
             self.estimator
@@ -716,6 +810,7 @@ impl AgentContext {
             count += 1;
         }
         self.masked_total += count;
+        self.mask_events += 1;
         tracing::info!(
             stage = "mask",
             reason,
@@ -727,6 +822,7 @@ impl AgentContext {
             "context compaction"
         );
         let after = self.estimated_tokens();
+        self.note_compaction("mask", reason, before, after);
         self.session.record(
             "compaction",
             json!({ "stage": "mask", "reason": reason, "call_ids": call_ids,
@@ -782,50 +878,155 @@ impl AgentContext {
     }
 
     /// Stage 2: drop whole oldest steps until the estimate is at or below
-    /// `target`, then note the removal on the pinned first instruction.
+    /// `target` and put one compaction record, with a digest of everything
+    /// removed so far, in their place. Operator requests stay within
+    /// `keep_requests`; beyond it, and as a last resort, the oldest go.
     /// Returns the number of messages removed.
     fn evict(&mut self, target: usize, reason: &str) -> usize {
         let before = self.estimated_tokens();
-        let mut removed = 0;
-        let mut call_ids: Vec<String> = Vec::new();
-        while self.estimated_tokens() > target {
+        let old_record = self
+            .messages
+            .iter()
+            .find(|m| m.kind == Kind::Record)
+            .map_or(0, |m| self.estimator.tokens(m.chars()));
+        let allowance = self
+            .estimator
+            .tokens(self.record_cap_chars() + RECORD_HEADER_CHARS);
+        let goal = target.saturating_sub(allowance.saturating_sub(old_record));
+        let keep = self
+            .budget
+            .of(self.config.context.keep_requests)
+            .min(MAX_KEPT_REQUEST_TOKENS);
+
+        let mut removed: Vec<Message> = Vec::new();
+        while self.request_tokens() > keep {
+            let Some(m) = self.evict_oldest_request() else {
+                break;
+            };
+            removed.push(m);
+        }
+        while self.estimated_tokens() > goal {
             let group = self.evict_oldest_group();
             if group.is_empty() {
                 break;
             }
-            removed += group.len();
-            call_ids.extend(group.into_iter().filter_map(|m| m.tool_call_id));
+            removed.extend(group);
         }
-        if removed == 0 {
+        while self.estimated_tokens() > goal {
+            let Some(m) = self.evict_oldest_request() else {
+                break;
+            };
+            removed.push(m);
+        }
+        if removed.is_empty() {
             return 0;
         }
-        self.evicted_total += removed;
-        if self.pinned == 2
-            && let Some(original) = &self.first_instruction
-        {
-            self.messages[1].content = Some(format!(
-                "{original}\n\n[Note: {} earlier messages were removed to fit the context window.]",
-                self.evicted_total
-            ));
+
+        self.evicted_total += removed.len();
+        self.digest.add(&removed);
+        self.records += 1;
+        if let Some(i) = self.messages.iter().position(|m| m.kind == Kind::Record) {
+            self.remove_at(i);
         }
+        let text = self.record_text();
+        let record = Message::record(&text);
+        let after = self.estimated_tokens() + self.estimator.tokens(record.chars());
+        let call_ids: Vec<String> = removed
+            .iter()
+            .filter_map(|m| m.tool_call_id.clone())
+            .collect();
+        let seqs: Vec<u64> = removed.iter().filter_map(|m| m.origin).collect();
+        let requests = removed.iter().filter(|m| m.kind == Kind::Request).count();
         tracing::info!(
             stage = "evict",
             reason,
-            messages_removed = removed,
+            messages_removed = removed.len(),
+            requests_removed = requests,
+            record = self.records,
             est_tokens_before = before,
-            est_tokens_after = self.estimated_tokens(),
+            est_tokens_after = after,
             target,
             source = self.estimator.source(self.total_chars()),
             "context compaction"
         );
-        let after = self.estimated_tokens();
-        self.session.record(
+        self.note_compaction("evict", reason, before, after);
+        let seq = self.session.record(
             "compaction",
-            json!({ "stage": "evict", "reason": reason, "messages_removed": removed,
-                    "call_ids": call_ids, "est_tokens_before": before,
-                    "est_tokens_after": after, "target": target }),
+            json!({ "stage": "evict", "reason": reason, "method": "digest",
+                    "record": self.records, "messages_removed": removed.len(),
+                    "requests_removed": requests, "call_ids": call_ids, "seqs": seqs,
+                    "digest": self.digest, "text": text,
+                    "est_tokens_before": before, "est_tokens_after": after,
+                    "target": target }),
         );
-        removed
+        // Everything removed is older than the first remaining non-request.
+        let at = (self.pinned..self.messages.len())
+            .find(|&i| self.messages[i].kind != Kind::Request)
+            .unwrap_or(self.messages.len());
+        self.insert_at(at, record.with_origin(seq));
+        removed.len()
+    }
+
+    /// Largest compaction record text, in characters.
+    fn record_cap_chars(&self) -> usize {
+        self.estimator
+            .chars(self.budget.of(RECORD_SHARE).clamp(256, 2_048))
+    }
+
+    fn record_text(&self) -> String {
+        let mut head = format!(
+            "[Compaction record {}: mima removed {} earlier messages to fit the context \
+             window. The digest lists what the removed steps read, changed and ran, \
+             taken from their tool calls; re-run a tool if you need its output again.",
+            self.records, self.evicted_total
+        );
+        if self.digest.requests_removed > 0 {
+            head.push_str(&format!(
+                " {} earlier operator requests were removed too.",
+                self.digest.requests_removed
+            ));
+        }
+        format!(
+            "{head}]\n\n## Digest\n{}",
+            self.digest.render(self.record_cap_chars())
+        )
+    }
+
+    /// Estimated tokens of operator requests that eviction may remove (not
+    /// the pinned first one, not the current turn's).
+    fn request_tokens(&self) -> usize {
+        self.messages
+            .iter()
+            .enumerate()
+            .skip(self.pinned)
+            .filter(|(i, m)| m.kind == Kind::Request && self.turn_start != Some(*i))
+            .map(|(_, m)| self.estimator.tokens(m.chars()))
+            .sum()
+    }
+
+    fn evict_oldest_request(&mut self) -> Option<Message> {
+        let i = (self.pinned..self.messages.len())
+            .find(|&i| self.messages[i].kind == Kind::Request && self.turn_start != Some(i))?;
+        Some(self.remove_at(i))
+    }
+
+    fn remove_at(&mut self, i: usize) -> Message {
+        let m = self.messages.remove(i);
+        if let Some(t) = self.turn_start.as_mut()
+            && *t > i
+        {
+            *t -= 1;
+        }
+        m
+    }
+
+    fn insert_at(&mut self, i: usize, m: Message) {
+        self.messages.insert(i, m);
+        if let Some(t) = self.turn_start.as_mut()
+            && *t >= i
+        {
+            *t += 1;
+        }
     }
 
     /// Removes the oldest evictable group and returns it (empty when none).
@@ -837,8 +1038,10 @@ impl AgentContext {
         let len = self.messages.len();
         let mut start = self.pinned;
         while start < len {
-            if self.turn_start == Some(start) {
-                start += 1; // the current instruction stays
+            if self.turn_start == Some(start)
+                || matches!(self.messages[start].kind, Kind::Request | Kind::Record)
+            {
+                start += 1; // requests and the record are handled by `evict`
                 continue;
             }
             let end = self.group_end(start);
@@ -875,6 +1078,227 @@ impl AgentContext {
     /// Characters of the full request: messages plus tool schemas.
     fn total_chars(&self) -> usize {
         self.tool_schema_chars + self.messages.iter().map(Message::chars).sum::<usize>()
+    }
+
+    fn note_compaction(&mut self, stage: &'static str, reason: &str, before: usize, after: usize) {
+        self.last_compaction = Some(LastCompaction {
+            turn: self.session.turn(),
+            stage,
+            reason: reason.to_string(),
+            before,
+            after,
+        });
+    }
+
+    /// Characters of the system message taken by the project instructions
+    /// section (`set_instructions` appends it after a blank line).
+    fn instructions_chars(&self) -> usize {
+        let system = self.messages[0].content.as_deref().unwrap_or_default();
+        match self.instructions.prompt_section() {
+            Some(section) if system.ends_with(&section) => (section.len() + 2).min(system.len()),
+            _ => 0,
+        }
+    }
+
+    /// What fills the context, by category and by message, for
+    /// `/context-status`. Category and message figures share the total in
+    /// proportion to their characters.
+    pub fn report(&self) -> ContextReport {
+        use report::{
+            ASSISTANT, INSTRUCTIONS, NOTICES, OUTPUTS_FULL, OUTPUTS_MASKED, RECORDS, REQUESTS,
+            SYSTEM, TOOLS,
+        };
+        let total = self.estimated_tokens();
+        let names: Vec<(String, String)> = self
+            .messages
+            .iter()
+            .filter_map(|m| m.tool_calls.as_ref().and_then(Value::as_array))
+            .flatten()
+            .map(|c| {
+                let f = &c["function"];
+                (
+                    c["id"].as_str().unwrap_or_default().to_string(),
+                    report::describe_call(
+                        f["name"].as_str().unwrap_or("tool"),
+                        f["arguments"].as_str().unwrap_or_default(),
+                    ),
+                )
+            })
+            .collect();
+        let instructions = self.instructions_chars();
+
+        // Parts to share the total: the system message as two parts, every
+        // other message, then the tool schemas.
+        let mut weights = Vec::with_capacity(self.messages.len() + 2);
+        let mut rows = Vec::with_capacity(self.messages.len());
+        let (mut calls, mut capped) = (0usize, 0usize);
+        for (i, m) in self.messages.iter().enumerate() {
+            let content = m.content.as_deref().unwrap_or_default();
+            let (category, view, what) = if i == 0 {
+                weights.push(m.chars() - instructions);
+                weights.push(instructions);
+                (SYSTEM, "full", String::new())
+            } else {
+                weights.push(m.chars());
+                match m.role.as_str() {
+                    "user" if m.kind == Kind::Record => (
+                        RECORDS,
+                        "record",
+                        format!("compaction record {}", self.records),
+                    ),
+                    "user" if m.synthetic || m.kind == Kind::Notice => {
+                        (NOTICES, "notice", report::snippet(content, 60))
+                    }
+                    "user" => {
+                        let noted = i == 1
+                            && self.pinned == 2
+                            && self.first_instruction.as_deref() != Some(content);
+                        let view = if noted { "noted" } else { "full" };
+                        (
+                            REQUESTS,
+                            view,
+                            format!("\"{}\"", report::snippet(content, 60)),
+                        )
+                    }
+                    "assistant" => {
+                        let mut what = Vec::new();
+                        if let Some(tc) = m.tool_calls.as_ref().and_then(Value::as_array) {
+                            calls += tc.len();
+                            let mut counts: Vec<(&str, usize)> = Vec::new();
+                            for c in tc {
+                                let name = c["function"]["name"].as_str().unwrap_or("tool");
+                                match counts.iter_mut().find(|(n, _)| *n == name) {
+                                    Some((_, k)) => *k += 1,
+                                    None => counts.push((name, 1)),
+                                }
+                            }
+                            what.extend(counts.into_iter().map(|(n, k)| match k {
+                                1 => n.to_string(),
+                                k => format!("{n} x{k}"),
+                            }));
+                        }
+                        if !content.is_empty() {
+                            what.push(format!("\"{}\"", report::snippet(content, 50)));
+                        }
+                        (ASSISTANT, "full", what.join(", "))
+                    }
+                    _ => {
+                        let id = m.tool_call_id.as_deref().unwrap_or_default();
+                        let call = names
+                            .iter()
+                            .find(|(c, _)| c == id)
+                            .map_or("tool call", |(_, d)| d.as_str());
+                        let what = report::snippet(call, 70);
+                        if m.synthetic {
+                            (NOTICES, "synthetic", what)
+                        } else if m.masked {
+                            (OUTPUTS_MASKED, "masked", what)
+                        } else if m.cap_bytes.is_some() {
+                            capped += 1;
+                            (OUTPUTS_FULL, "capped", what)
+                        } else {
+                            (OUTPUTS_FULL, "full", what)
+                        }
+                    }
+                }
+            };
+            rows.push(report::Row {
+                index: i,
+                role: m.role.clone(),
+                view,
+                category,
+                tokens: 0,
+                what,
+            });
+        }
+        weights.push(self.tool_schema_chars);
+        let parts = report::allocate(total, &weights);
+
+        let mut tokens = [0usize; report::CATEGORY_NAMES.len()];
+        let mut items = [0usize; report::CATEGORY_NAMES.len()];
+        let (system, instructions_tokens) = (parts[0], parts[1]);
+        tokens[SYSTEM] = system;
+        tokens[INSTRUCTIONS] = instructions_tokens;
+        tokens[TOOLS] = parts[parts.len() - 1];
+        for (row, &t) in rows.iter_mut().skip(1).zip(&parts[2..]) {
+            row.tokens = t;
+            tokens[row.category] += t;
+            items[row.category] += 1;
+        }
+        rows[0].tokens = system + instructions_tokens;
+        rows[0].what = format!(
+            "system prompt {} + project instructions {}",
+            report::num(system),
+            report::num(instructions_tokens)
+        );
+
+        let loaded: Vec<String> = self
+            .instructions
+            .files
+            .iter()
+            .filter(|f| f.skipped.is_none())
+            .map(|f| f.source.clone())
+            .collect();
+        let label = |c: usize| -> String {
+            match c {
+                SYSTEM => "1".into(),
+                INSTRUCTIONS if instructions == 0 => "none".into(),
+                INSTRUCTIONS => loaded.join(", "),
+                TOOLS => format!("{} tools", self.tool_specs.len()),
+                ASSISTANT => format!("{} messages, {calls} calls", items[c]),
+                OUTPUTS_FULL if capped > 0 => format!("{} ({capped} capped)", items[c]),
+                OUTPUTS_MASKED => format!("{} placeholders", items[c]),
+                _ => items[c].to_string(),
+            }
+        };
+        let categories = report::CATEGORY_NAMES
+            .iter()
+            .enumerate()
+            .map(|(c, name)| report::Category {
+                name,
+                tokens: tokens[c],
+                items: label(c),
+            })
+            .collect();
+
+        let spec_chars: Vec<usize> = self
+            .tool_specs
+            .iter()
+            .map(|s| {
+                schema::to_openai_tools(std::slice::from_ref(s))
+                    .to_string()
+                    .len()
+            })
+            .collect();
+        let tools = self
+            .tool_specs
+            .iter()
+            .map(|s| s.name.clone())
+            .zip(report::allocate(tokens[TOOLS], &spec_chars))
+            .collect();
+
+        ContextReport {
+            session: self.session.id().to_string(),
+            turn: self.session.turn(),
+            model: self.config.provider.default_model.clone(),
+            budget: self.budget,
+            window_source: self.window_source,
+            budget_configured: self.budget.operating < self.budget.usable,
+            total,
+            source: self.estimator.source(self.total_chars()),
+            categories,
+            rows,
+            tools,
+            mask_at: self.config.context.mask_at,
+            mask_to: self.config.context.mask_to,
+            keep_recent: self.config.context.keep_recent,
+            output_cap: self.budget.output_cap_tokens(),
+            masked_total: self.masked_total,
+            mask_events: self.mask_events,
+            evicted_total: self.evicted_total,
+            records: self.records,
+            last: self.last_compaction.clone(),
+        }
     }
 
     fn estimated_tokens(&self) -> usize {
@@ -1005,10 +1429,10 @@ mod tests {
         for n in 0..5 {
             step(&mut c, &[&format!("c{n}")], 1_500);
         }
-        let s = c.stats();
+        let s = c.report();
         assert!(s.masked_total > 0, "old outputs masked");
         assert_eq!(s.evicted_total, 0, "no step evicted while masking suffices");
-        assert!(s.tokens <= c.budget.of(0.6));
+        assert!(s.total <= c.budget.of(0.6));
         // All assistant tool-call messages are still present.
         let calls = c
             .messages()
@@ -1072,7 +1496,7 @@ mod tests {
         step(&mut c, &["b"], 200);
         // Over mask_at, but masking small outputs cannot free 10% of E.
         assert!(c.stats().tokens > c.budget.of(0.6));
-        assert_eq!(c.stats().masked_total, 0);
+        assert_eq!(c.report().masked_total, 0);
     }
 
     #[test]
@@ -1086,14 +1510,14 @@ mod tests {
                 assert_valid(&c);
             }
             assert!(
-                c.stats().evicted_total > 0,
+                c.report().evicted_total > 0,
                 "size {size}: eviction exercised"
             );
         }
     }
 
     #[test]
-    fn eviction_keeps_instructions_and_newest_step_and_adds_note() {
+    fn eviction_leaves_one_compaction_record_and_keeps_requests() {
         let mut c = ctx();
         c.begin_turn("first task", None);
         step(&mut c, &["x"], 100);
@@ -1105,19 +1529,140 @@ mod tests {
             step(&mut c, &[&format!("s{n}")], 1_500);
         }
         assert_valid(&c);
-        assert!(c.stats().evicted_total > 0);
+        let rep = c.report();
+        assert!(rep.evicted_total > 0);
+        assert!(rep.records >= 2, "several evictions: {}", rep.records);
         let t = texts(&c);
-        assert!(t[1].starts_with("first task"), "pinned first instruction");
-        assert!(
-            t[1].contains("earlier messages were removed"),
-            "eviction note"
+        assert_eq!(t[1], "first task", "pinned first instruction, unchanged");
+        assert_eq!(t[2], "second task", "current instruction kept in order");
+        let records: Vec<&Message> = c
+            .messages()
+            .iter()
+            .filter(|m| m.kind == Kind::Record)
+            .collect();
+        assert_eq!(records.len(), 1, "one record, replaced at each eviction");
+        assert_eq!(
+            c.messages()[3].kind,
+            Kind::Record,
+            "record after the requests"
         );
+        let record = records[0].content.as_deref().unwrap();
+        assert!(record.starts_with(&format!("[Compaction record {}:", rep.records)));
+        assert!(record.contains("## Digest\nFiles read: "), "{record}");
         assert!(
-            t.contains(&"second task".to_string()),
-            "current instruction"
+            record.contains("x.rs"),
+            "digest covers earlier turns: {record}"
         );
+        assert!(record.contains("s0.rs"), "{record}");
         let last = c.messages().last().unwrap();
         assert_eq!(last.tool_call_id.as_deref(), Some("s59"));
+        assert!(
+            c.stats().tokens <= c.budget.of(0.4) + 100,
+            "near the target"
+        );
+    }
+
+    #[test]
+    fn old_requests_beyond_the_budget_are_removed_and_counted() {
+        let mut c = ctx();
+        c.config.context.keep_requests = 0.05; // ~170 tokens of earlier requests
+        for turn in 0..8 {
+            c.begin_turn(&format!("request {turn} {}", "r".repeat(300)), None);
+            for n in 0..6 {
+                step(&mut c, &[&format!("t{turn}s{n}")], 1_500);
+            }
+            c.add_message(Message::assistant("done"));
+        }
+        assert_valid(&c);
+        let kept: Vec<&str> = c
+            .messages()
+            .iter()
+            .filter(|m| m.kind == Kind::Request)
+            .filter_map(|m| m.content.as_deref())
+            .collect();
+        assert!(kept[0].starts_with("request 0"), "first request pinned");
+        assert!(
+            kept.last().unwrap().starts_with("request 7"),
+            "current kept"
+        );
+        assert!(kept.len() < 8, "some old requests removed: {}", kept.len());
+        let record = c
+            .messages()
+            .iter()
+            .find(|m| m.kind == Kind::Record)
+            .and_then(|m| m.content.as_deref())
+            .unwrap();
+        assert!(
+            record.contains("earlier operator requests were removed"),
+            "{record}"
+        );
+    }
+
+    #[test]
+    fn rollback_removes_a_turn_compacted_midway_and_keeps_the_record() {
+        let mut c = ctx();
+        c.begin_turn("first task", None);
+        step(&mut c, &["x"], 100);
+        c.add_message(Message::assistant("first answer"));
+        let before: Vec<String> = texts(&c);
+
+        let cp = c.checkpoint();
+        c.begin_turn("second task", None);
+        for n in 0..60 {
+            step(&mut c, &[&format!("s{n}")], 1_500);
+        }
+        assert!(c.report().evicted_total > 0, "the turn compacted midway");
+        c.rollback_to(cp);
+
+        assert_valid(&c);
+        let ids: Vec<&str> = c
+            .messages()
+            .iter()
+            .filter_map(|m| m.tool_call_id.as_deref())
+            .collect();
+        assert!(
+            ids.iter().all(|id| !id.starts_with('s')),
+            "no step of the cancelled turn remains: {ids:?}"
+        );
+        let t = texts(&c);
+        assert!(!t.contains(&"second task".to_string()));
+        assert_eq!(t[1], "first task", "pinned first instruction kept");
+        assert_eq!(
+            c.messages()
+                .iter()
+                .filter(|m| m.kind == Kind::Record)
+                .count(),
+            1,
+            "the record of evicted earlier steps stays"
+        );
+        assert!(t.len() < before.len() + 1, "{t:?}");
+
+        // A later turn starts cleanly after the rollback.
+        c.begin_turn("third task", None);
+        step(&mut c, &["t0"], 100);
+        assert_valid(&c);
+    }
+
+    #[test]
+    fn rollback_without_a_new_turn_changes_nothing() {
+        let mut c = ctx();
+        c.begin_turn("task", None);
+        step(&mut c, &["a"], 100);
+        let before = texts(&c);
+        let cp = c.checkpoint();
+        c.rollback_to(cp);
+        assert_eq!(texts(&c), before);
+    }
+
+    #[test]
+    fn cancelling_the_first_turn_keeps_its_instruction() {
+        let mut c = ctx();
+        let cp = c.checkpoint();
+        c.begin_turn("only task", None);
+        step(&mut c, &["a"], 100);
+        c.rollback_to(cp);
+        assert_eq!(texts(&c)[1..], ["only task".to_string()]);
+        assert_valid(&c);
     }
 
     #[test]
@@ -1209,6 +1754,93 @@ mod tests {
         c.add_message(Message::tool_result("w", &"y".repeat(400)));
         assert!(c.stats().tokens > 1_234);
         assert_eq!(c.stats().token_source, "usage+estimate");
+    }
+
+    #[test]
+    fn report_categories_cover_every_message_and_add_up() {
+        use crate::context_report as r;
+        let mut c = ctx();
+        c.set_instructions(crate::instructions::Loaded {
+            files: vec![crate::instructions::File {
+                source: "AGENTS.md".into(),
+                path: "/repo/AGENTS.md".into(),
+                scope: crate::instructions::Scope::Repository,
+                bytes: 600,
+                raw_sha256: "00".repeat(32),
+                text: "Run `cargo test` before finishing.\n".repeat(15),
+                truncated: false,
+                removed_chars: 0,
+                skipped: None,
+            }],
+            cap: 8192,
+            overridden: false,
+        });
+        c.begin_turn("task", None);
+        for n in 0..5 {
+            step(&mut c, &[&format!("c{n}")], 1_500);
+        }
+        c.messages.last_mut().unwrap().cap_bytes = Some(1_500);
+        c.add_message(Message::notice(NUDGE));
+        c.add_message(Message::assistant("done"));
+
+        let rep = c.report();
+        assert_eq!(rep.rows.len(), c.messages().len(), "one row per message");
+        let sum: usize = rep.categories.iter().map(|k| k.tokens).sum();
+        assert_eq!(sum, rep.total, "categories add up to the total");
+        let rows: usize = rep.rows.iter().map(|k| k.tokens).sum();
+        assert_eq!(rows + rep.categories[r::TOOLS].tokens, rep.total);
+        assert!(rep.categories[r::INSTRUCTIONS].tokens > 100);
+        assert_eq!(rep.categories[r::INSTRUCTIONS].items, "AGENTS.md");
+        assert!(rep.categories[r::OUTPUTS_MASKED].tokens > 0);
+        assert_eq!(rep.categories[r::NOTICES].items, "1");
+        assert_eq!(rep.categories[r::REQUESTS].items, "1");
+        assert!(rep.categories[r::OUTPUTS_FULL].items.contains("1 capped"));
+        assert!(rep.rows.iter().any(|k| k.view == "capped"));
+        assert!(rep.mask_events > 0 && rep.last.is_some());
+
+        let text = rep.render(false);
+        for line in [
+            "Window W 4,000 (configured) = usable U 3,388 + reply reserve 100 + safety margin 512",
+            "Project instructions",
+            "Largest items",
+            "Last: turn 0, mask (threshold)",
+            "Hint: The window is small",
+        ] {
+            assert!(text.contains(line), "missing {line:?} in\n{text}");
+        }
+        let detail = rep.render(true);
+        assert!(detail.contains("read_file c4.rs"), "{detail}");
+    }
+
+    #[test]
+    fn report_without_instructions_or_requests() {
+        let c = ctx();
+        let rep = c.report();
+        assert_eq!(
+            rep.categories.iter().map(|k| k.tokens).sum::<usize>(),
+            rep.total
+        );
+        assert_eq!(
+            rep.categories[crate::context_report::INSTRUCTIONS].tokens,
+            0
+        );
+        assert_eq!(rep.source, "default-ratio");
+        assert!(rep.render(false).contains("Last: none"));
+    }
+
+    #[test]
+    fn report_names_the_window_source() {
+        let mut config = Config::default();
+        config.context.window = None;
+        let mut c = AgentContext::new(config, Vec::new());
+        let text = c.report().render(false);
+        assert!(text.contains("Window W 32,768 (assumed) ="), "{text}");
+        assert!(text.contains("set\n        [context].window"), "{text}");
+        assert!(text.lines().all(|l| l.len() <= 90), "{text}");
+        c.set_window(65_536, crate::context_report::WINDOW_SERVER);
+        let text = c.report().render(false);
+        assert!(text.contains("Window W 65,536 (from server) ="), "{text}");
+        assert!(!text.contains("[context].window"), "{text}");
     }
 
     #[test]

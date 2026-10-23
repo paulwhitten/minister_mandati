@@ -60,7 +60,7 @@ pub async fn configure_window(ctx: &mut AgentContext) {
     match window {
         Some(w) => {
             tracing::info!(window = w, "context window discovered from server");
-            ctx.set_window(w);
+            ctx.set_window(w, crate::context_report::WINDOW_SERVER);
         }
         None => tracing::warn!(
             window = budget::FALLBACK_WINDOW,
@@ -299,7 +299,7 @@ async fn run_turn_inner(
                     json!({ "turn": turn, "action": "continue", "repeats": continues,
                             "tool": "" }),
                 );
-                ctx.add_message(Message::user(context::CONTINUE).with_origin(seq));
+                ctx.add_message(Message::notice(context::CONTINUE).with_origin(seq));
                 continue;
             }
             // Still empty or cut off after the continue prompts: no answer.
@@ -361,7 +361,7 @@ async fn run_turn_inner(
             let repeats = guards.observe(fp);
             let policy = registry.dedupe_policy(&call.name);
 
-            let started = Instant::now();
+            let mut ran_ms = 0u64;
             // Evidence (audit record): files changed by a shell command, and
             // a file tool's target before the call.
             let mut workspace_changes: Option<Value> = None;
@@ -473,7 +473,9 @@ async fn run_turn_inner(
                         } else {
                             None
                         };
+                        let ran = Instant::now();
                         let executed = registry.execute(&call.name, &call.args, &env).await;
+                        ran_ms = ran.elapsed().as_millis() as u64;
                         if let Some((_, before)) = watch
                             && let Some((_, after)) =
                                 crate::evidence::marks(registry.runner()).await
@@ -500,7 +502,7 @@ async fn run_turn_inner(
             let stored = ctx.session.stored_output(&output);
             let failed = context::is_failure(&output);
             let mut fields = json!({ "turn": turn, "call_id": call.id, "tool": call.name,
-                    "duration_ms": started.elapsed().as_millis() as u64,
+                    "duration_ms": ran_ms,
                     "failed": failed, "bytes": output.len(), "sent_bytes": sent.len(),
                     "output": stored, "cap_bytes": cap });
             if !failed && let Some(mut file) = file_state(&call) {
@@ -553,14 +555,14 @@ async fn run_turn_inner(
             }
         }
         if let Some(seq) = nudge {
-            ctx.add_message(Message::user(context::NUDGE).with_origin(seq));
+            ctx.add_message(Message::notice(context::NUDGE).with_origin(seq));
         }
         if max_steps > STEPS_WARNING * 2 && step + 1 == max_steps - STEPS_WARNING {
             let seq = ctx.session.record(
                 "loop_guard",
                 json!({ "turn": turn, "action": "steps", "repeats": STEPS_WARNING, "tool": "" }),
             );
-            ctx.add_message(Message::user(context::STEPS_LEFT).with_origin(seq));
+            ctx.add_message(Message::notice(context::STEPS_LEFT).with_origin(seq));
         }
     }
 
@@ -582,7 +584,7 @@ async fn final_summary(
         "loop_guard",
         json!({ "turn": turn, "action": "final", "repeats": 0, "tool": "" }),
     );
-    ctx.add_message(Message::user(context::FINAL_SUMMARY).with_origin(seq));
+    ctx.add_message(Message::notice(context::FINAL_SUMMARY).with_origin(seq));
     prepare_request(ctx).await;
     ctx.tools_disabled = true;
     let started = Instant::now();

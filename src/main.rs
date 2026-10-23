@@ -10,6 +10,8 @@ mod budget;
 mod client;
 mod config;
 mod context;
+mod context_report;
+mod digest;
 mod evidence;
 mod instructions;
 mod loop_guard;
@@ -592,7 +594,8 @@ async fn run_repl(
                 }
                 "tokens" => print_tokens(ctx),
                 "instructions" => println!("{}", ctx.instructions.details()),
-                "context" => print_context(ctx),
+                "context" | "context-status" => println!("{}", ctx.report().render(false)),
+                "context-status messages" => println!("{}", ctx.report().render(true)),
                 "help" => print_help(),
                 other => println!("unknown command: /{other} (try /help)"),
             }
@@ -723,6 +726,7 @@ fn resume_session(ctx: &mut AgentContext, id: &str, accept_break: bool) -> Resul
         rebuilt.masked_total,
         rebuilt.evicted_total,
     );
+    ctx.restore_compaction(rebuilt.digest, rebuilt.records);
 
     let cwd = std::env::current_dir().unwrap_or_default();
     let changed = transcript::changed_files(&t, &cwd);
@@ -805,6 +809,11 @@ async fn run_turn_cancellable(
             record_outcome(ctx, &result);
             if let Err(e) = result {
                 eprintln!("error: {e}"); // keep the REPL alive on turn errors
+                let mut source = std::error::Error::source(&e);
+                while let Some(cause) = source {
+                    eprintln!("  caused by: {cause}");
+                    source = cause.source();
+                }
             }
         }
         None => {
@@ -813,30 +822,6 @@ async fn run_turn_cancellable(
             eprintln!("\n^C — cancelled; back to prompt.");
         }
     }
-}
-
-/// Prints the context budget and current estimate (REPL `/context`).
-fn print_context(ctx: &AgentContext) {
-    let s = ctx.stats();
-    let b = s.budget;
-    let pct = s.tokens * 100 / b.operating.max(1);
-    println!(
-        "context — window: {}, usable: {}, budget: {}, tokens: {} ({pct}% of budget, {}), \
-         counting: {}, messages: {}, masked: {}, evicted: {}",
-        b.window,
-        b.usable,
-        b.operating,
-        s.tokens,
-        s.token_source,
-        if ctx.token_counter.is_some() {
-            "exact (/tokenize)"
-        } else {
-            "usage + estimate"
-        },
-        s.messages,
-        s.masked_total,
-        s.evicted_total
-    );
 }
 
 /// Prints the cumulative token ledger to stdout (REPL `/tokens`).
@@ -855,7 +840,9 @@ fn print_help() {
          /help                show this help\n  \
          /tokens              show token usage\n  \
          /instructions        show the AGENTS.md files loaded and their text\n  \
-         /context             show context budget\n  \
+         /context-status      show context use by category, limits and compaction\n  \
+         /context-status messages  list every message in the context\n  \
+         /context             alias of /context-status\n  \
          /session             show session id, start time and transcript\n  \
          /new                 start a new session (alias: /reset)\n  \
          /sessions            list recorded sessions\n  \
