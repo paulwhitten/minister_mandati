@@ -26,15 +26,7 @@ fn pts(x: f64) -> String {
 
 /// Writes both reports into `run_dir`; returns the summary text.
 pub fn write(run_dir: &Path) -> Result<String, String> {
-    let meta: Value = serde_json::from_str(
-        &std::fs::read_to_string(run_dir.join("run.json")).map_err(|e| format!("run.json: {e}"))?,
-    )
-    .map_err(|e| format!("run.json: {e}"))?;
-    let records: Vec<TrialRecord> = std::fs::read_to_string(run_dir.join("trials.jsonl"))
-        .map_err(|e| format!("trials.jsonl: {e}"))?
-        .lines()
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect();
+    let (meta, records) = load(run_dir)?;
     if records.is_empty() {
         return Err("no trials recorded yet".into());
     }
@@ -70,6 +62,165 @@ pub fn write(run_dir: &Path) -> Result<String, String> {
             .map_err(|e| e.to_string())?;
     }
     Ok(summary)
+}
+
+fn load(run_dir: &Path) -> Result<(Value, Vec<TrialRecord>), String> {
+    let at = |f: &str| format!("{}: {f}", run_dir.join(f).display());
+    let meta: Value = serde_json::from_str(
+        &std::fs::read_to_string(run_dir.join("run.json"))
+            .map_err(|e| format!("{}: {e}", at("run.json")))?,
+    )
+    .map_err(|e| format!("{}: {e}", at("run.json")))?;
+    let records = std::fs::read_to_string(run_dir.join("trials.jsonl"))
+        .map_err(|e| format!("{}: {e}", at("trials.jsonl")))?
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    Ok((meta, records))
+}
+
+fn build_label(meta: &Value) -> String {
+    let commit = meta["mima"]["git"]["commit"]
+        .as_str()
+        .map_or("?", |c| &c[..c.len().min(8)]);
+    let dirty = if meta["mima"]["git"]["dirty"].as_bool() == Some(true) {
+        ", uncommitted changes"
+    } else {
+        ""
+    };
+    format!(
+        "run `{}`, mima commit {commit}{dirty}, suite {}",
+        meta["run"].as_str().unwrap_or("?"),
+        meta["suite"].as_str().unwrap_or("?")
+    )
+}
+
+/// Paired comparison of two runs (typically two mima builds on the same
+/// models and tasks): each profile present in both runs is compared with
+/// itself, A − B, on the tasks both ran. Infrastructure failures are excluded.
+pub fn compare_runs(a_dir: &Path, b_dir: &Path) -> Result<String, String> {
+    let (meta_a, rec_a) = load(a_dir)?;
+    let (meta_b, rec_b) = load(b_dir)?;
+    let scored = |r: &[TrialRecord]| -> BTreeMap<String, Vec<TrialRecord>> {
+        let mut m: BTreeMap<String, Vec<TrialRecord>> = BTreeMap::new();
+        for t in r.iter().filter(|t| t.exit_reason != "infra") {
+            m.entry(t.profile.clone()).or_default().push(t.clone());
+        }
+        m
+    };
+    let (by_a, by_b) = (scored(&rec_a), scored(&rec_b));
+    let profiles: Vec<&String> = by_a.keys().filter(|p| by_b.contains_key(*p)).collect();
+    if profiles.is_empty() {
+        return Err("the two runs share no profile with scored trials".into());
+    }
+
+    let mut s = String::new();
+    let _ = writeln!(s, "# Run comparison\n");
+    let _ = writeln!(s, "- A: {}", build_label(&meta_a));
+    let _ = writeln!(s, "- B: {}\n", build_label(&meta_b));
+    let _ = writeln!(
+        s,
+        "Each row compares a model with itself across the two runs, on the tasks both ran: the mean of per-task differences (A − B, in percentage points), its standard error clustered by task family and 95% interval, and the smallest difference this comparison could detect. A difference whose interval includes 0 is not distinguishable from noise; with fewer than two task families there is no interval.\n"
+    );
+    let _ = writeln!(
+        s,
+        "| Model | Tasks | A pass | B pass | A − B | 95% CI | Detectable | A better / B better / same | Verdict |"
+    );
+    let _ = writeln!(s, "|---|---|---|---|---|---|---|---|---|");
+    for p in &profiles {
+        let ra: Vec<&TrialRecord> = by_a[*p].iter().collect();
+        let rb: Vec<&TrialRecord> = by_b[*p].iter().collect();
+        let (ta, tb) = (task_results(&ra), task_results(&rb));
+        let common: Vec<&str> = ta
+            .iter()
+            .filter(|t| tb.iter().any(|u| u.task == t.task))
+            .map(|t| t.task.as_str())
+            .collect();
+        let only = |v: &[TaskResult]| -> Vec<TaskResult> {
+            v.iter()
+                .filter(|t| common.contains(&t.task.as_str()))
+                .cloned()
+                .collect()
+        };
+        let (ta, tb) = (only(&ta), only(&tb));
+        let pair = stats::paired(&ta, &tb);
+        let d = &pair.diff;
+        let verdict = if d.lo.is_nan() {
+            "no interval"
+        } else if d.lo > 0.0 {
+            "A better"
+        } else if d.hi < 0.0 {
+            "B better"
+        } else {
+            "not distinguishable"
+        };
+        let _ = writeln!(
+            s,
+            "| {p} | {} | {} | {} | {} | {} – {} | ±{} | {} / {} / {} | {verdict} |",
+            common.len(),
+            pct(stats::suite(&ta).mean),
+            pct(stats::suite(&tb).mean),
+            pts(d.mean),
+            pts(d.lo),
+            pts(d.hi),
+            pts(pair.mde).trim_start_matches('+'),
+            pair.a_better,
+            pair.b_better,
+            pair.ties
+        );
+    }
+
+    let _ = writeln!(s, "\n## Behavior (all scored trials)\n");
+    let _ = writeln!(
+        s,
+        "| Model | Run | Trials | Loop-guard stops | Compactions (total) | Median steps | Median prompt tok | Exit reasons |"
+    );
+    let _ = writeln!(s, "|---|---|---|---|---|---|---|---|");
+    for p in &profiles {
+        for (run, rs) in [("A", &by_a[*p]), ("B", &by_b[*p])] {
+            let num = |r: &TrialRecord, k: &str| r.metrics[k].as_f64().unwrap_or(0.0);
+            let med = |k: &str| stats::median(&rs.iter().map(|r| num(r, k)).collect::<Vec<_>>());
+            let mut exits: BTreeMap<&str, usize> = BTreeMap::new();
+            for r in rs {
+                *exits.entry(r.exit_reason.as_str()).or_default() += 1;
+            }
+            let _ = writeln!(
+                s,
+                "| {p} | {run} | {} | {} | {} | {:.0} | {:.0} | {} |",
+                rs.len(),
+                exits.get("loop_guard").copied().unwrap_or(0),
+                rs.iter().map(|r| num(r, "compactions") as u64).sum::<u64>(),
+                med("steps"),
+                med("prompt_tokens"),
+                exits
+                    .iter()
+                    .map(|(k, v)| format!("{k} {v}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+
+    let _ = writeln!(s, "\n## Per task\n");
+    let _ = writeln!(s, "Passes out of scored trials, A then B.\n");
+    let _ = writeln!(s, "| Model | Task | A | B |");
+    let _ = writeln!(s, "|---|---|---|---|");
+    for p in &profiles {
+        let ra: Vec<&TrialRecord> = by_a[*p].iter().collect();
+        let rb: Vec<&TrialRecord> = by_b[*p].iter().collect();
+        let (ta, tb) = (task_results(&ra), task_results(&rb));
+        for t in &ta {
+            let other = tb
+                .iter()
+                .find(|u| u.task == t.task)
+                .map_or("-".to_string(), |u| format!("{}/{}", u.c, u.k));
+            let _ = writeln!(s, "| {p} | {} | {}/{} | {other} |", t.task, t.c, t.k);
+        }
+        for u in tb.iter().filter(|u| !ta.iter().any(|t| t.task == u.task)) {
+            let _ = writeln!(s, "| {p} | {} | - | {}/{} |", u.task, u.c, u.k);
+        }
+    }
+    Ok(s)
 }
 
 fn task_results(records: &[&TrialRecord]) -> Vec<TaskResult> {
@@ -599,5 +750,82 @@ fn never_passed_section(s: &mut String, by_profile: &BTreeMap<&str, Vec<&TrialRe
     );
     for n in never {
         let _ = writeln!(s, "- {n}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn run_dir(
+        name: &str,
+        commit: &str,
+        trials: &[(&str, &str, &str, bool, &str)],
+    ) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("mima-eval-cmp-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let meta = json!({ "run": name, "suite": "s.toml",
+                           "mima": { "git": { "commit": commit, "dirty": false } } });
+        std::fs::write(d.join("run.json"), meta.to_string()).unwrap();
+        let lines: Vec<String> = trials
+            .iter()
+            .enumerate()
+            .map(|(i, (profile, task, family, passed, exit))| {
+                json!({ "run": name, "profile": profile, "task": task, "family": family,
+                        "kind": "regression", "trial": i, "passed": passed, "score": 0.0,
+                        "exit_reason": exit, "checks": [], "files_changed": 0,
+                        "metrics": { "steps": 4, "compactions": 2, "prompt_tokens": 100 },
+                        "lines_added": 0, "lines_removed": 0, "agent_ms": 1, "check_ms": 1,
+                        "infra_retries": 0, "started": "" })
+                .to_string()
+            })
+            .collect();
+        std::fs::write(d.join("trials.jsonl"), lines.join("\n")).unwrap();
+        d
+    }
+
+    #[test]
+    fn compares_the_same_profile_across_runs() {
+        let a = run_dir(
+            "a",
+            "aaaaaaaaaaaa",
+            &[
+                ("m", "t1", "f1", true, "done"),
+                ("m", "t1", "f1", true, "done"),
+                ("m", "t2", "f2", true, "done"),
+                ("m", "t2", "f2", false, "done"),
+                ("m", "t3", "f3", false, "infra"),
+                ("only-a", "t1", "f1", true, "done"),
+            ],
+        );
+        let b = run_dir(
+            "b",
+            "bbbbbbbbbbbb",
+            &[
+                ("m", "t1", "f1", false, "loop_guard"),
+                ("m", "t1", "f1", true, "done"),
+                ("m", "t2", "f2", false, "done"),
+                ("m", "t2", "f2", false, "done"),
+                ("m", "t4", "f4", true, "done"),
+            ],
+        );
+        let out = compare_runs(&a, &b).unwrap();
+        assert!(out.contains("A: run `a`, mima commit aaaaaaaa"), "{out}");
+        assert!(out.contains("B: run `b`, mima commit bbbbbbbb"), "{out}");
+        // Two shared tasks: A 100% and 50%, B 50% and 0% -> +50 points.
+        assert!(out.contains("| m | 2 | 75% | 25% | +50 |"), "{out}");
+        assert!(!out.contains("| only-a |"), "{out}");
+        assert!(out.contains("| m | B | 5 | 1 | 10 |"), "{out}");
+        assert!(out.contains("| m | t4 | - | 1/1 |"), "{out}");
+        assert!(!out.contains("t3"), "infra trials are excluded: {out}");
+    }
+
+    #[test]
+    fn compare_needs_a_shared_profile() {
+        let a = run_dir("x", "1", &[("m1", "t", "f", true, "done")]);
+        let b = run_dir("y", "2", &[("m2", "t", "f", true, "done")]);
+        assert!(compare_runs(&a, &b).is_err());
     }
 }

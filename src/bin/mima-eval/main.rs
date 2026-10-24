@@ -84,6 +84,9 @@ enum Command {
     Fetch { suite: PathBuf },
     /// Rewrite summary.md and compare.md for a run directory.
     Report { run_dir: PathBuf },
+    /// Paired comparison of two runs (e.g. two mima builds on the same
+    /// models and tasks), A − B per profile, printed as Markdown.
+    Compare { run_a: PathBuf, run_b: PathBuf },
     /// Measure how strong each task's checks are: apply the reference
     /// solution plus one small code mutation at a time and count how many
     /// mutants the checks reject.
@@ -279,6 +282,10 @@ fn real_main() -> Result<(), String> {
         }
         Command::Report { run_dir } => {
             println!("{}", report::write(&run_dir)?);
+            Ok(())
+        }
+        Command::Compare { run_a, run_b } => {
+            println!("{}", report::compare_runs(&run_a, &run_b)?);
             Ok(())
         }
     }

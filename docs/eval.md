@@ -308,6 +308,11 @@ confined by its path checks, not by the sandbox.
 
 `--resume <run-dir>` continues an interrupted run, skipping recorded trials.
 `mima-eval report <run-dir>` rewrites the reports.
+`mima-eval compare <run-a> <run-b>` compares two runs, typically two `mima`
+builds (`--mima`) on the same profiles and suite: for each profile in both,
+the paired difference A − B on the tasks both ran, with its interval and
+detectable effect, then loop-guard stops, compactions, steps and prompt
+tokens per run, and a per-task grid. It prints Markdown.
 
 **Metrics** come from each trial's transcript: steps, tokens, peak context,
 wall time, tool calls, tool errors by cause (for `edit_file`: not found, not
