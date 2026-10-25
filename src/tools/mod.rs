@@ -72,6 +72,9 @@ pub struct ToolEnv {
     /// Largest output (bytes) that reaches the model uncut; tools that can
     /// stop at a clean boundary (read_file at a whole line) use it.
     pub output_budget: usize,
+    /// Replaces the shell tool's own time limit for this call (the
+    /// verifier's runs use `[verify].timeout_secs`).
+    pub timeout: Option<Duration>,
 }
 
 #[async_trait]
@@ -707,7 +710,7 @@ impl BaseTool for BashExecutor {
         }
     }
 
-    async fn execute(&self, args: &Value, _env: &ToolEnv) -> Result<String> {
+    async fn execute(&self, args: &Value, env: &ToolEnv) -> Result<String> {
         let cmd = args["command"].as_str().context(MissingArgSnafu {
             tool: "execute_bash".to_string(),
             arg: "command".to_string(),
@@ -731,11 +734,12 @@ impl BaseTool for BashExecutor {
             Some(Err(e)) => return Err(Error::Sandbox { reason: e.clone() }),
         };
         let argv: Vec<String> = self.wrapper.iter().cloned().chain(inner).collect();
-        let output = shell::run(&argv, &self.env, self.timeout)
+        let timeout = env.timeout.unwrap_or(self.timeout);
+        let output = shell::run(&argv, &self.env, timeout)
             .await
             .context(SpawnSnafu)?
             .map_err(|_| Error::Timeout {
-                secs: self.timeout.as_secs(),
+                secs: timeout.as_secs(),
             })?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -767,6 +771,7 @@ mod tests {
     fn env() -> ToolEnv {
         ToolEnv {
             output_budget: 1 << 20,
+            timeout: None,
         }
     }
 
@@ -825,6 +830,21 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::Timeout { .. }));
         assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn a_call_can_replace_the_time_limit() {
+        // The verifier's runs use their own limit, longer than the tool's.
+        let bash = BashExecutor::new(Duration::from_millis(200), Vec::new(), &[]);
+        let env = ToolEnv {
+            timeout: Some(Duration::from_secs(10)),
+            ..env()
+        };
+        let out = bash
+            .execute(&json!({ "command": "sleep 1; echo ok" }), &env)
+            .await
+            .unwrap();
+        assert!(out.contains("STDOUT:\nok\n"), "{out}");
     }
 
     #[tokio::test]

@@ -436,6 +436,7 @@ mod tests {
     fn env(budget: usize) -> ToolEnv {
         ToolEnv {
             output_budget: budget,
+            timeout: None,
         }
     }
 

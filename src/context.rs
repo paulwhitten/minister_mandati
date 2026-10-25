@@ -207,6 +207,10 @@ pub const STEPS_LEFT: &str = "Only a few tool steps remain before the step limit
 pub const FINAL_SUMMARY: &str = "The step limit has been reached. Without calling any more \
                                  tools, reply with a brief summary: what you changed, whether \
                                  you verified it, and what remains to be done.";
+/// Sent at the time limit (`[agent].max_seconds`), like [`FINAL_SUMMARY`].
+pub const TIME_SUMMARY: &str = "The time limit has been reached. Without calling any more \
+                                tools, reply with a brief summary: what you changed, whether \
+                                you verified it, and what remains to be done.";
 /// Longest tool-call argument text quoted in a placeholder.
 const PLACEHOLDER_ARGS_CHARS: usize = 200;
 /// Share of E for a compaction record's digest (clamped to 256-2048 tokens).

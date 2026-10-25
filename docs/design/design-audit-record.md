@@ -216,8 +216,8 @@ The full transcript keeps every value and the salts. `mima --audit-export
 already in their `c:` form (listed in `withheld`), disclosed content fields
 carry their own field salt (in `salts`), and record salts are dropped, so a
 withheld value cannot be guessed from a salt in the copy. Sets: `code` (all
-content fields), `outputs` (tool outputs and previews, and the compaction records and
-context snapshots that quote them), or a list of
+content fields), `outputs` (tool outputs and previews, and the compaction records,
+context snapshots and verifier results that quote them), or a list of
 field names. The verifier computes the disclosure form from either copy and
 gets the same hashes. Checked against an anchored head, a shared copy proves
 its metadata (what ran, when, who approved it, which rule decided) is
@@ -383,7 +383,7 @@ mima --audit-verify <...> --head <hex> --json   # planned
 | V2 | every `hash` recomputes from the previous hash and the line's body; `chain_reset` records listed | fail |
 | V3 | `seq` increases by one | fail |
 | V4 | header has the audit fields | warn ("written before audit records") |
-| V5 | every `tool_result` follows an `approval` for its `call_id`; every allowed call has a result or a cancelled turn; denied calls were not executed | fail |
+| V5 | every `tool_result` follows an `approval` for its `call_id`; every allowed call has a result (a `tool_result`, or for a verifier run its `verification` record) or a cancelled turn; denied calls were not executed | fail |
 | V6 | rule ids are known to this mima | warn (written by a newer mima) |
 | V7 | each file's `before_sha256` equals its previous `after_sha256` in the record | warn: "changed outside the record", with the turn boundary if it happened between turns |
 | V8 | `session_end` present | warn: incomplete (crash or truncation) |

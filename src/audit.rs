@@ -41,6 +41,8 @@ const CONTENT: &[(&str, &str)] = &[
     ("context", "entries/*/text"),
     ("compaction", "text"),
     ("compaction", "digest"),
+    ("verification", "output"),
+    ("verification", "message"),
     ("session_start", "system_prompt/text"),
 ];
 
@@ -64,6 +66,12 @@ pub const RULES: &[&str] = &[
     "context.mask",
     "context.evict",
     "session.step_cap_summary",
+    "session.time_limit_summary",
+    "verify.baseline",
+    "verify.gate",
+    "verify.syntax_guard",
+    "verify.wrap_up",
+    "verify.limit",
 ];
 
 /// Fills in `actor` (and `rule`, where the record type implies one) when the
@@ -77,7 +85,7 @@ pub fn attribute(kind: &str, record: &mut Value) {
         "turn_start" | "transcript_disabled" => "operator",
         "model_response" => "model",
         "tool_result" => "tool",
-        "approval" | "compaction" | "loop_guard" => "rule",
+        "approval" | "compaction" | "loop_guard" | "verification" => "rule",
         _ => "system",
     };
     obj.entry("actor").or_insert_with(|| json!(actor));
@@ -98,6 +106,15 @@ pub fn attribute(kind: &str, record: &mut Value) {
             "terminate" => Some("loop_guard.terminate"),
             "steps" => Some("loop_guard.steps_left"),
             "final" => Some("session.step_cap_summary"),
+            "final_time" => Some("session.time_limit_summary"),
+            _ => None,
+        },
+        "verification" => match text("kind").as_str() {
+            "baseline" => Some("verify.baseline"),
+            "gate" | "unverified" => Some("verify.gate"),
+            "syntax" | "syntax_note" => Some("verify.syntax_guard"),
+            "wrap_up" => Some("verify.wrap_up"),
+            "limit" | "end" => Some("verify.limit"),
             _ => None,
         },
         _ => None,
@@ -345,6 +362,8 @@ pub fn export(transcript: &[u8], withhold: &[String]) -> Result<String, String> 
                     | "compaction.text"
                     | "compaction.digest"
                     | "context.entries/*/text"
+                    | "verification.output"
+                    | "verification.message"
             ),
             other => other == name,
         })
@@ -1081,6 +1100,15 @@ fn check_approvals(c: &Chain) -> Finding {
             "approval" => {
                 pending.insert(text(r, "call_id"), (i, text(r, "decision")));
             }
+            // A verifier run is the result of its approval, like a tool
+            // result (it has no tool_result record).
+            "verification" if !text(r, "call_id").is_empty() => {
+                if let Some((_, d)) = pending.remove(&text(r, "call_id"))
+                    && d == "denied"
+                {
+                    ran_when_denied.push(i)
+                }
+            }
             "tool_result" => match pending.remove(&text(r, "call_id")) {
                 None => orphans.push(i),
                 Some((_, d)) if d == "denied" && r.get("executed") != Some(&Value::Bool(false)) => {
@@ -1090,8 +1118,10 @@ fn check_approvals(c: &Chain) -> Finding {
             },
             "turn_end" => {
                 let cancelled = text(r, "outcome") == "cancelled";
-                for (_, (n, _)) in pending.drain() {
-                    if !cancelled {
+                // A denied call needs no result (one that has a result
+                // must say it did not run, checked above).
+                for (_, (n, d)) in pending.drain() {
+                    if !cancelled && d != "denied" {
                         unanswered.push(n);
                     }
                 }

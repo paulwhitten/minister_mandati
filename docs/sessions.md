@@ -168,7 +168,7 @@ path)`. Content fields: `turn_start.instruction`, `model_response.content`,
 `.reasoning` and `.tool_calls/*/args`, `approval.preview`,
 `tool_result.output`, `.output_full_sha256` and `.converted/*/from`, `turn_end.answer`,
 `context.entries/*/text`, `compaction.text` and `.digest`,
-`session_start.system_prompt/text` (it includes
+`verification.output` and `.message`, `session_start.system_prompt/text` (it includes
 the project instructions). Canonical encoding: keys sorted, no whitespace,
 minimal escaping, integers as written, floats in shortest round-trip form.
 
@@ -177,8 +177,8 @@ writes a copy in which the chosen content fields hold their digests (listed
 in `withheld`), disclosed content fields carry their own field salt (in
 `salts`), and record salts are gone, so withheld values cannot be guessed.
 Sets: `code` (all content, the default), `outputs` (tool outputs and
-diffs, plus the compaction records and context snapshots that quote tool
-output), or field names such as `turn_start.instruction`. The copy verifies
+diffs, plus the compaction records, context snapshots and verifier
+results that quote tool output), or field names such as `turn_start.instruction`. The copy verifies
 with the same hashes and finds its heads in the ledger by session id.
 Disclosing one more value later is another export that withholds less.
 
@@ -212,6 +212,12 @@ Records decided by a rule also name it in `rule`:
 | `context.mask` | old tool outputs replaced by placeholders |
 | `context.evict` | old steps removed |
 | `session.step_cap_summary` | at the step limit, a final summary is requested |
+| `session.time_limit_summary` | at the time limit (`[agent].max_seconds`), a final summary is requested |
+| `verify.baseline` | verifier gate: the project's check, run before the turn's first file change or shell command |
+| `verify.gate` | verifier gate: the check run on a final answer; new failures send it back |
+| `verify.syntax_guard` | an edit that broke a file's syntax was reverted, or a new file that does not parse was noted |
+| `verify.wrap_up` | at `[agent].wrap_up_percent` of the step or time limit, the budget notice (with the verifier's result) |
+| `verify.limit` | end check: the verifier at the repair point or the time limit, and once more as the turn ends after a repair notice |
 
 **Header and evidence.** `session_start` records `build` (version, commit,
 whether the tree had uncommitted changes, profile, target, compiler),

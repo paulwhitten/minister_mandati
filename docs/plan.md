@@ -61,6 +61,7 @@ Headline conclusions:
 | `Presenter` abstraction with the plain CLI as default | Done | |
 | One-shot and REPL modes, slash commands, in-memory line editing | Done | [../README.md](../README.md) |
 | Loop guards: duplicate-write skip, no-progress window, continue on empty or truncated replies | Done | [design/design-loop-guards.md](design/design-loop-guards.md) |
+| Progress guard: stall counter, redundant-read notes, status line in tool results (replaces the identical-call guard) | Partial | branch `dev/progress_guard`; paired comparison on Qwen 3.6 showed no significant difference |
 | Composable system prompt (prefix, body, suffix; full override) | Done | [design/design-composable-system-prompt.md](design/design-composable-system-prompt.md) |
 | Context budget from the model window; output masking; step eviction; overflow recovery | Done | [context.md](context.md) |
 | Exact token counts via the server's `/tokenize`, calibrated estimate as fallback | Done | [context.md](context.md) |
@@ -70,7 +71,8 @@ Headline conclusions:
 | `/context-status`: context use by category, limits, thresholds, compaction history | Done | [design/design-context-reporting.md](design/design-context-reporting.md) |
 | `recall_output` tool: fetch a masked tool output back by call ID from the transcript | Planned | |
 | Project instructions: `AGENTS.md` from the repository root to the working directory plus a global file, cleaned, capped, labeled, recorded; workspace `agent.toml` can no longer set the system prompt | Done (paired A/B pending) | [design/design-project-instructions.md](design/design-project-instructions.md) |
-| Verifier-gated self-refine wired into the loop | Planned | |
+| Verifier-gated self-refine wired into the loop: completion gate on the project's tests (new failures only, max 3 rounds, `UNVERIFIED:` exit) and a syntax guard; off by default | Partial | branch `dev/self_refinement`, on hold: no measurable effect on three models; [design/design-verifier-gate.md](design/design-verifier-gate.md#status-and-next-steps) |
+| Self-refine on by default, once a paired comparison shows a gain (no measurable effect so far on Qwen 3.6, gpt-4o-mini, Nano 30B) | Planned | [design/design-verifier-gate.md](design/design-verifier-gate.md#results) |
 
 Exit criteria:
 
@@ -205,9 +207,11 @@ Ordered by dependency, then impact:
 2. Rerun the baseline with the current `mima` (3 trials) and add paired
    run-to-run comparison to `mima-eval`. Every item below is measured
    against it.
-3. Verifier-gated self-refine: detect the project's build and test command,
-   run it after edits, feed failures back, and require a passing check (or a
-   stated reason) before the final answer.
+3. Verifier-gated self-refine: on branch `dev/self_refinement` (no measurable
+   effect on the base tasks for Qwen 3.6, gpt-4o-mini and Nano 30B; Qwen is
+   saturated there). Being revisited on the pro tasks, where many failures
+   end "done"; see
+   [design/design-verifier-gate.md](design/design-verifier-gate.md#status-and-next-steps).
 4. The TODO tool (project instructions done; measure them with a paired A/B using hand-written AGENTS.md files on a task subset).
 5. `/context-status`, then summarizing compaction (digest record first,
    then `/compact`) and `recall_output`, measured on the 8k-window

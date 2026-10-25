@@ -37,6 +37,8 @@ system_prompt_override = ""
 # loop_guard_window = 6               # sliding window for repeat detection
 # loop_guard_repeat_threshold = 3     # repeats within the window that intervene
 # max_steps = 50                      # hard cap on tool/reasoning steps per task
+# max_seconds = 1500                  # wall-clock limit per task (default: none)
+# wrap_up_percent = 0                 # budget notice at this share of the step or time limit
 
 [security]
 require_approval_for_bash = true
@@ -66,6 +68,18 @@ allowed_paths = ["./"]
 # transcripts = false
 # transcript_dir = "~/.mima/transcripts"
 # max_output_bytes = 1048576  # per tool output stored in a transcript
+
+# Verifier gate (see docs/design/design-verifier-gate.md). Off by default.
+[verify]
+# enabled = false       # check the project before accepting an answer that changed files;
+#                       # the settings below, except syntax_guard, need it
+# syntax_guard = false  # revert edits that break JSON/TOML/Python/shell files
+# commands = []         # e.g. ["cargo test"]; empty: detect (cargo, make test, go, npm, pytest)
+# detect = true
+# max_rounds = 3        # times an answer can be sent back with new failures
+# timeout_secs = 300
+# end_check = false     # also report changed test files and new files, check at the limits
+# repair_steps = 0      # with end_check: last steps of the limit kept for repair
 
 # Project instructions (see docs/design/design-project-instructions.md):
 # AGENTS.md files from the repository root down to the working directory,

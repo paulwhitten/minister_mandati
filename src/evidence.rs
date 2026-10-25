@@ -246,10 +246,14 @@ pub fn changes(before: &BTreeMap<String, Mark>, after: &BTreeMap<String, Mark>) 
     }
 }
 
-/// The workspace's root and a snapshot of its changed paths, for comparing
-/// before and after a shell command. `None` outside a git repository.
-pub async fn marks(runner: &CommandRunner) -> Option<(PathBuf, BTreeMap<String, Mark>)> {
-    let root = workspace_root(&std::env::current_dir().ok()?)?;
+/// The root of the repository that contains `dir` and a snapshot of its
+/// changed paths, for comparing before and after a shell command. `None`
+/// outside a git repository.
+pub async fn marks_in(
+    runner: &CommandRunner,
+    dir: &Path,
+) -> Option<(PathBuf, BTreeMap<String, Mark>)> {
+    let root = workspace_root(dir)?;
     let state = git_state(runner, &root).await.ok()?;
     let snap = snapshot(&root, &state);
     Some((root, snap))

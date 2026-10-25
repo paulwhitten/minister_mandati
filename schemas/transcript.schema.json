@@ -1119,7 +1119,7 @@
           ]
         },
         "outcome": {
-          "description": "Open enum: answered, loop_guard, step_cap, error, cancelled.",
+          "description": "Open enum: answered, no_answer, truncated, loop_guard, step_cap,\ntime_limit, error, cancelled.",
           "type": "string"
         },
         "tokens": {
@@ -1184,6 +1184,74 @@
       "required": [
         "prompt",
         "completion"
+      ],
+      "type": "object"
+    },
+    "Verification": {
+      "description": "One run of a verifier (docs/design/design-verifier-gate.md).",
+      "properties": {
+        "call_id": {
+          "default": null,
+          "description": "Call id of the approval this run answers (absent for tier 1 and\nmessage-only records).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "command": {
+          "type": "string"
+        },
+        "duration_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exit_code": {
+          "format": "int32",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "kind": {
+          "description": "Open enum: baseline (before the turn's first change), gate (at a\nfinal answer), unverified (gate rounds used up), syntax (tier 1, an\nedit reverted), syntax_note (tier 1, a new file that does not parse),\nwrap_up (the budget notice), limit (end check at the repair point or\nthe time limit), end (end check as the turn ends after a repair\nnotice). A record without a command only carries a message.",
+          "type": "string"
+        },
+        "message": {
+          "default": null,
+          "description": "The message sent to the model (gate feedback), if any.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "output": {
+          "description": "Verifier output (cut at `[session].max_output_bytes`).",
+          "type": "string"
+        },
+        "passed": {
+          "type": "boolean"
+        },
+        "round": {
+          "description": "Gate round this run belongs to (0 before any feedback).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "turn": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "turn",
+        "kind",
+        "round",
+        "command",
+        "passed",
+        "duration_ms",
+        "output"
       ],
       "type": "object"
     },
@@ -1320,6 +1388,19 @@
       "properties": {
         "type": {
           "const": "loop_guard",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "$ref": "#/$defs/Verification",
+      "properties": {
+        "type": {
+          "const": "verification",
           "type": "string"
         }
       },

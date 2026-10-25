@@ -27,6 +27,7 @@ mod session;
 mod testutil;
 mod tools;
 mod transcript;
+mod verify;
 
 use agent::{finish_turn, ledger_json, record_outcome, run_turn};
 use config::Config;
@@ -125,8 +126,8 @@ struct Cli {
 
     /// With --audit-export: what to withhold, comma-separated: "code" (all
     /// content, the default), "outputs" (tool outputs and diffs, with the
-    /// compaction and context records that quote them), or field names such
-    /// as turn_start.instruction.
+    /// compaction, context and verifier records that quote them), or field
+    /// names such as turn_start.instruction.
     #[arg(
         long,
         value_name = "SET",

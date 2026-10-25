@@ -8,7 +8,7 @@ use std::path::Path;
 
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct Metrics {
-    /// How the turn ended: done, loop_guard, step_cap, error,
+    /// How the turn ended: done, loop_guard, step_cap, time_limit, error,
     /// context_exceeded; set by the runner to agent_timeout, crash or infra
     /// when the transcript has no ending.
     pub exit_reason: String,
@@ -26,6 +26,22 @@ pub struct Metrics {
     pub edit_tolerances: u64,
     pub compactions: u64,
     pub loop_guard_trips: u64,
+    /// Verifier gate (docs/design/design-verifier-gate.md): verifier runs at
+    /// final answers, rounds that sent failures back, turns accepted as
+    /// unverified, and edits reverted by the syntax guard.
+    pub verify_gate_runs: u64,
+    pub verify_feedback_rounds: u64,
+    pub verify_unverified: u64,
+    pub verify_syntax_reverts: u64,
+    /// End check and budget: answers held back only for workspace facts
+    /// (test files changed, new files), budget notices, repair notices at
+    /// the repair point or time limit, and the verifier's last result after
+    /// a repair notice (runs, passes).
+    pub verify_facts_rounds: u64,
+    pub verify_wrap_ups: u64,
+    pub verify_repair_notices: u64,
+    pub verify_end_runs: u64,
+    pub verify_end_passed: u64,
     pub model_errors: u64,
     /// Replies cut off at `max_tokens` (finish_reason "length"): often a
     /// harness setting, not a model failure.
@@ -95,6 +111,32 @@ pub fn from_transcript(path: &Path) -> Metrics {
                     m.loop_guard_trips += 1;
                 }
             }
+            "verification" => match r["kind"].as_str().unwrap_or_default() {
+                "gate" if r["command"].as_str().unwrap_or_default().is_empty() => {
+                    m.verify_facts_rounds += 1;
+                    m.verify_feedback_rounds += 1;
+                }
+                "gate" => {
+                    m.verify_gate_runs += 1;
+                    if r["message"].is_string() {
+                        m.verify_feedback_rounds += 1;
+                    }
+                }
+                "wrap_up" if r["message"].is_string() => m.verify_wrap_ups += 1,
+                "limit" if r["message"].is_string() => m.verify_repair_notices += 1,
+                "end" => {
+                    m.verify_end_runs += 1;
+                    if r["passed"].as_bool() == Some(true) {
+                        m.verify_end_passed += 1;
+                    }
+                }
+                "unverified" => {
+                    m.verify_gate_runs += 1;
+                    m.verify_unverified += 1;
+                }
+                "syntax" => m.verify_syntax_reverts += 1,
+                _ => {}
+            },
             "turn_end" => {
                 m.final_answer = r["answer"].as_str().unwrap_or_default().to_string();
                 let err = r["error"].as_str().unwrap_or_default();

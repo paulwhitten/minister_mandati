@@ -14,7 +14,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::context::{
-    CONTINUE, FINAL_SUMMARY, Kind, Message, NOT_EXECUTED, NUDGE, STEPS_LEFT, drop_turn,
+    CONTINUE, FINAL_SUMMARY, Kind, Message, NOT_EXECUTED, NUDGE, STEPS_LEFT, TIME_SUMMARY,
+    drop_turn,
 };
 use crate::digest::Digest;
 use crate::tools::truncate_middle;
@@ -72,6 +73,7 @@ pub enum Record {
     ToolResult(ToolResult),
     Compaction(Compaction),
     LoopGuard(LoopGuard),
+    Verification(Verification),
     TurnEnd(TurnEnd),
     Context(ContextRecord),
     TranscriptDisabled(TranscriptDisabled),
@@ -385,11 +387,41 @@ pub struct LoopGuard {
     pub tool: String,
 }
 
+/// One run of a verifier (docs/design/design-verifier-gate.md).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+pub struct Verification {
+    pub turn: u64,
+    /// Open enum: baseline (before the turn's first change), gate (at a
+    /// final answer), unverified (gate rounds used up), syntax (tier 1, an
+    /// edit reverted), syntax_note (tier 1, a new file that does not parse),
+    /// wrap_up (the budget notice), limit (end check at the repair point or
+    /// the time limit), end (end check as the turn ends after a repair
+    /// notice). A record without a command only carries a message.
+    pub kind: String,
+    /// Gate round this run belongs to (0 before any feedback).
+    pub round: u64,
+    pub command: String,
+    pub exit_code: Option<i32>,
+    pub passed: bool,
+    pub duration_ms: u64,
+    /// Verifier output (cut at `[session].max_output_bytes`).
+    pub output: String,
+    /// The message sent to the model (gate feedback), if any.
+    #[serde(default)]
+    pub message: Option<String>,
+    /// Call id of the approval this run answers (absent for tier 1 and
+    /// message-only records).
+    #[serde(default)]
+    pub call_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct TurnEnd {
     pub turn: u64,
-    /// Open enum: answered, loop_guard, step_cap, error, cancelled.
+    /// Open enum: answered, no_answer, truncated, loop_guard, step_cap,
+    /// time_limit, error, cancelled.
     pub outcome: String,
     pub answer: Option<String>,
     pub error: Option<String>,
@@ -816,7 +848,12 @@ fn from_context(t: &Transcript) -> Result<Rebuilt, String> {
             Record::LoopGuard(g) if g.action == "continue" => Message::notice(CONTINUE),
             Record::LoopGuard(g) if g.action == "steps" => Message::notice(STEPS_LEFT),
             Record::LoopGuard(g) if g.action == "final" => Message::notice(FINAL_SUMMARY),
+            Record::LoopGuard(g) if g.action == "final_time" => Message::notice(TIME_SUMMARY),
             Record::LoopGuard(_) => Message::notice(NUDGE),
+            Record::Verification(v) => match &v.message {
+                Some(m) => Message::notice(m),
+                None => return Err(format!("seq {s} is a verification without a message")),
+            },
             _ => return Err(format!("seq {s} is not a message record")),
         };
         match e.view {
@@ -881,13 +918,14 @@ fn latest_digest(t: &Transcript, upto: u64) -> (Digest, usize) {
 /// final answer, or the summary requested at the step limit. The partial
 /// reply of a `no_answer` or `truncated` turn is recorded but not kept.
 pub fn answer_in_context(outcome: &str) -> bool {
-    matches!(outcome, "answered" | "step_cap")
+    matches!(outcome, "answered" | "step_cap" | "time_limit")
 }
 
 pub fn replay(t: &Transcript, default_cap: usize) -> Rebuilt {
     let mut messages: Vec<Message> = Vec::new();
     let mut turn_begin: Option<usize> = None; // index where the open turn starts
     let mut pending_nudge: Option<u64> = None;
+    let mut pending_answer: Option<(u64, ModelResponse)> = None;
     let mut first_instruction = None;
     let mut gap = false;
     let (mut digest, mut records, mut evicted) = (Digest::default(), 0usize, 0usize);
@@ -938,6 +976,7 @@ pub fn replay(t: &Transcript, default_cap: usize) -> Rebuilt {
             }
             Record::TurnStart(r) => {
                 flush_nudge(&mut messages, &mut pending_nudge);
+                pending_answer = None;
                 // A previous turn that never ended is dropped.
                 if let Some(b) = turn_begin.take() {
                     drop_turn(&mut messages, b);
@@ -950,30 +989,60 @@ pub fn replay(t: &Transcript, default_cap: usize) -> Rebuilt {
             }
             Record::ModelResponse(r) if !r.tool_calls.is_empty() => {
                 flush_nudge(&mut messages, &mut pending_nudge);
+                pending_answer = None;
                 messages.push(assistant_message(r).with_origin(Some(l.seq)));
+            }
+            // A reply without tool calls: a final answer unless the verifier
+            // gate sends it back (a `gate` verification record with a message
+            // follows), or cut off (a `continue` record follows, and the live
+            // loop did not keep it).
+            Record::ModelResponse(r) => pending_answer = Some((l.seq, r.clone())),
+            Record::Verification(v) => {
+                if let Some(m) = &v.message {
+                    // Live, a nudge went in right after its step's results.
+                    flush_nudge(&mut messages, &mut pending_nudge);
+                    if let Some((seq, r)) = pending_answer.take()
+                        && v.kind == "gate"
+                        && r.content.as_deref().is_some_and(|c| !c.is_empty())
+                    {
+                        messages.push(assistant_message(&r).with_origin(Some(seq)));
+                    }
+                    messages.push(Message::notice(m).with_origin(Some(l.seq)));
+                }
             }
             Record::ToolResult(r) => {
                 let cap = r.cap_bytes.or(Some(default_cap as u64));
                 messages.push(tool_message(r, cap).with_origin(Some(l.seq)));
             }
             Record::LoopGuard(g) if g.action == "nudge" => pending_nudge = Some(l.seq),
-            Record::LoopGuard(g) if matches!(g.action.as_str(), "continue" | "steps" | "final") => {
+            Record::LoopGuard(g)
+                if matches!(
+                    g.action.as_str(),
+                    "continue" | "steps" | "final" | "final_time"
+                ) =>
+            {
                 let text = match g.action.as_str() {
                     "continue" => CONTINUE,
                     "steps" => STEPS_LEFT,
+                    "final_time" => TIME_SUMMARY,
                     _ => FINAL_SUMMARY,
                 };
+                flush_nudge(&mut messages, &mut pending_nudge);
+                pending_answer = None;
                 messages.push(Message::notice(text).with_origin(Some(l.seq)));
             }
             Record::TurnEnd(r) => {
-                pending_nudge = None;
+                pending_answer = None;
                 let begin = turn_begin.take();
                 if r.outcome == "cancelled" {
+                    pending_nudge = None;
                     if let Some(b) = begin {
                         drop_turn(&mut messages, b);
                     }
                     continue;
                 }
+                // A nudge before the turn's last reply stays, as it did live.
+                flush_nudge(&mut messages, &mut pending_nudge);
                 if let Some(answer) = r.answer.as_deref().filter(|a| !a.is_empty())
                     && answer_in_context(&r.outcome)
                 {
