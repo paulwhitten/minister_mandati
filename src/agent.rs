@@ -1105,13 +1105,6 @@ async fn run_check(
     command: &str,
     call_id: String,
 ) -> Result<Option<CheckRun>, snafu::Whatever> {
-    let secs = ctx.config.verify.timeout_secs;
-    let wrapped = format!(
-        "timeout --kill-after=10 {secs} sh -c '{}'",
-        command.replace('\'', r"'\''")
-    );
-    // Approval is judged on the command as configured (so allowlists and
-    // prompts see `make test`), execution adds only the timeout.
     let call = crate::tools::ToolCall {
         id: call_id,
         name: "execute_bash".into(),
@@ -1148,15 +1141,14 @@ async fn run_check(
         ("approved", fields)
     };
     record_approval(ctx, turn, &call.id, decision, None, fields);
-    // The command's own `timeout` ends it first; the tool's limit only
-    // backs that up (its default, [security].bash_timeout_secs, may be lower).
+    // The verifier's own limit replaces the tool's ([security].bash_timeout_secs,
+    // which may be lower). No `timeout` command: macOS does not have one.
     let env = ToolEnv {
         output_budget: 1 << 20,
-        timeout: Some(Duration::from_secs(secs + 30)),
+        timeout: Some(Duration::from_secs(ctx.config.verify.timeout_secs)),
     };
     let started = Instant::now();
-    let args = json!({ "command": wrapped });
-    let output = match registry.execute("execute_bash", &args, &env).await {
+    let output = match registry.execute("execute_bash", &call.args, &env).await {
         Ok(out) => out,
         Err(e) => format!("Error: {e}"),
     };
