@@ -18,9 +18,14 @@ fn supported() -> bool {
 
 fn policy(read: &[&Path], write: &[&Path], network: bool) -> String {
     let sys = [
-        "/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/opt", "/var", "/proc", "/sys", "/run",
+        "/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/proc", "/sys", "/run",
     ];
     let mut r: Vec<String> = sys.iter().map(|s| s.to_string()).collect();
+    // As in mima's Linux SYSTEM_READ. Not on macOS: the temp directory, where the
+    // tests plant their secrets, is under /var there.
+    if cfg!(target_os = "linux") {
+        r.extend(["/opt".to_string(), "/var".to_string()]);
+    }
     r.extend(read.iter().map(|p| p.display().to_string()));
     let mut w: Vec<String> = vec!["/dev".into()];
     w.extend(write.iter().map(|p| p.display().to_string()));
@@ -162,9 +167,10 @@ fn restrictions_cannot_be_lifted_by_children() {
     require_sandbox!();
     let base = scratch("nest");
     // A nested helper may only narrow, never widen: the outer policy still
-    // applies to whatever the inner one grants. The outer policy can run the
-    // helper (mima adds its own binary to the read list), so the write fails
-    // because of the outer policy, not because the helper could not start.
+    // applies to whatever the inner one grants. On Linux the outer policy can
+    // run the helper (mima adds its own binary to the read list), so the write
+    // fails because of the outer policy, not because the helper could not
+    // start. Seatbelt does not nest, so on macOS the inner helper refuses (71).
     let inner = policy(&[&base], &[&base], true);
     let outer = policy(&[Path::new(mima())], &[], false);
     let nested = |script: &str| {
@@ -174,11 +180,13 @@ fn restrictions_cannot_be_lifted_by_children() {
             inner
         )
     };
-    assert_eq!(
-        sandboxed(&outer, &nested("true")).0,
-        Some(0),
-        "nested helper runs"
-    );
+    if cfg!(target_os = "linux") {
+        assert_eq!(
+            sandboxed(&outer, &nested("true")).0,
+            Some(0),
+            "nested helper runs"
+        );
+    }
     let (code, _, _) = sandboxed(&outer, &nested(&format!("echo x > {}/f", base.display())));
     assert_ne!(code, Some(0));
     assert!(!base.join("f").exists());
