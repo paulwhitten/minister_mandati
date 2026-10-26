@@ -6,7 +6,8 @@ edge-native coding agent** written in Rust: a flat Observe → Tool → Append l
 against any **OpenAI-compatible** endpoint (vLLM, Ollama, or cloud), with
 human-in-the-loop approval for state-changing actions by default.
 
-> Full design: [rust_terminal_agent_plan.md](rust_terminal_agent_plan.md).
+> Architecture and design goals: [docs/architecture.md](docs/architecture.md).
+> Original technical specification: [rust_terminal_agent_plan.md](rust_terminal_agent_plan.md).
 
 ## Why
 
@@ -336,11 +337,27 @@ MIMA_LOG_FORMAT=json cargo run -- "..." # structured JSON logs for auditing
   write only the workspace and their temp directory, and have no network.
   Keys and credentials in your home directory are unreadable to them.
   `sandbox = "required"` refuses to run commands without the sandbox;
-  `sandbox_network = true` and `sandbox_writable_paths` widen it. The
-  sandbox needs Linux: on macOS and other systems it reports itself
-  unavailable, so with `auto` shell commands run unsandboxed (still behind
-  approval) and `required` refuses them. See
+  `sandbox_network = true`, `sandbox_gpu = true` (below) and
+  `sandbox_writable_paths` widen it. On macOS commands run under Seatbelt
+  (`sandbox-exec`). Where no sandbox can be applied, `auto` runs commands
+  unsandboxed (still behind approval) and `required` refuses them. See
   [docs/design/design-shell-sandboxing.md](docs/design/design-shell-sandboxing.md).
+- CUDA programs do not run inside the default sandbox on Linux. To allow them
+  (for example on the Jetson Thor), set this in your user config:
+
+  ```toml
+  [security]
+  sandbox_gpu = true
+  ```
+
+  It makes `/proc` writable and lets Unix sockets accept connections, which
+  the CUDA driver needs; opening connections and the network stay blocked.
+  It also lets sandboxed commands change some settings of your other
+  processes (such as their out-of-memory priority). It is off by default,
+  cannot be set from a workspace `./agent.toml`, and is not granted when
+  mima runs as root or no NVIDIA device nodes exist. The startup log and
+  the sandbox summary show when it is in effect. Details:
+  [GPU access](docs/design/design-shell-sandboxing.md#tier-1-landlock--seccomp--rlimits-default).
 - `read_file`, `list_dir`, `find_files` and `search_files` are read-only and
   never prompt; the search tools skip `.git`, build and dependency
   directories and never follow symlinks.

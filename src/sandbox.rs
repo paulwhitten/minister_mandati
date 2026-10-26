@@ -25,7 +25,7 @@ use macos as platform;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!("mima's shell sandbox supports only Linux and macOS");
 
-pub use platform::{SYSTEM_READ, SYSTEM_WRITE, probe};
+pub use platform::{SYSTEM_READ, SYSTEM_WRITE, gpu_present, probe};
 
 /// What a sandboxed command may access. Serialized to the helper as JSON.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -36,6 +36,13 @@ pub struct Policy {
     pub write: Vec<PathBuf>,
     /// Allow network access (sockets of any family).
     pub network: bool,
+    /// Linux: NVIDIA GPU access (`[security].sandbox_gpu`). The CUDA driver
+    /// binds a Unix socket, so with the network off Unix sockets may bind,
+    /// listen and accept (`connect` stays denied). The driver also names its
+    /// threads through `/proc/self/task/*/comm`; the caller adds `/proc` to
+    /// `write` for that, so `write` lists every writable location.
+    #[serde(default)]
+    pub gpu: bool,
 }
 
 /// What the running system supports.
@@ -123,6 +130,7 @@ mod tests {
             read: vec!["/usr".into()],
             write: vec!["/tmp/w".into()],
             network: false,
+            gpu: true,
         };
         let argv = wrap(
             Path::new("/bin/mima"),

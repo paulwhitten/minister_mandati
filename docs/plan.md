@@ -1,7 +1,8 @@
 # Implementation Plan (Phased Roadmap)
 
-Phased roadmap with the current status of each item. The technical design
-lives in [../rust_terminal_agent_plan.md](../rust_terminal_agent_plan.md);
+Phased roadmap with the current status of each item. The high-level design
+is [architecture.md](architecture.md); the technical specification lives in
+[../rust_terminal_agent_plan.md](../rust_terminal_agent_plan.md);
 feature documents and design proposals live in this folder and in
 [design/](design/). The ordered work queue is [Next up](#next-up).
 
@@ -15,7 +16,7 @@ Status values used below:
 - Planned: accepted, not started
 - Proposal: design written, not yet accepted for implementation
 
-Last reviewed: 2026-10-13.
+Last reviewed: 2026-10-25.
 
 ## How progress is measured
 
@@ -71,8 +72,8 @@ Headline conclusions:
 | `/context-status`: context use by category, limits, thresholds, compaction history | Done | [design/design-context-reporting.md](design/design-context-reporting.md) |
 | `recall_output` tool: fetch a masked tool output back by call ID from the transcript | Planned | |
 | Project instructions: `AGENTS.md` from the repository root to the working directory plus a global file, cleaned, capped, labeled, recorded; workspace `agent.toml` can no longer set the system prompt | Done (paired A/B pending) | [design/design-project-instructions.md](design/design-project-instructions.md) |
-| Verifier-gated self-refine wired into the loop: completion gate on the project's tests (new failures only, max 3 rounds, `UNVERIFIED:` exit) and a syntax guard; off by default | Partial | branch `dev/self_refinement`, on hold: no measurable effect on three models; [design/design-verifier-gate.md](design/design-verifier-gate.md#status-and-next-steps) |
-| Self-refine on by default, once a paired comparison shows a gain (no measurable effect so far on Qwen 3.6, gpt-4o-mini, Nano 30B) | Planned | [design/design-verifier-gate.md](design/design-verifier-gate.md#results) |
+| Verifier-gated self-refine wired into the loop: completion gate on the project's tests (new failures only, max 3 rounds, `UNVERIFIED:` exit), syntax guard, end check (workspace facts at an answer), reserved repair steps, time limit and budget notice; `[verify].enabled`, off by default | Done | on main since 8fc224d; [design/design-verifier-gate.md](design/design-verifier-gate.md) |
+| Self-refine on by default, once a paired comparison shows a gain (no measurable effect so far for the completion gate on the base tasks: Qwen 3.6, gpt-4o-mini, Nano 30B, Nano 4B; end check and budget not yet measured) | Planned | [design/design-verifier-gate.md](design/design-verifier-gate.md#results) |
 
 Exit criteria:
 
@@ -80,7 +81,10 @@ Exit criteria:
   on the `hard` and `mutations` suites, with no task group regressing beyond
   the minimum detectable effect.
 - The 8k-window compaction regression task passes without a loop-guard
-  termination.
+  termination. Met so far in the 2026-10-24 baseline (mima 2eb1364, digest
+  record): 7 of 7 trials passed (lightning30b 3, Nano 4B 3, Nano 30B 1), none
+  ended by the loop guard; the 4a61467 baseline had two loop-guard endings
+  there. Confirm when the remaining Nano 30B and Qwen trials finish.
 
 ## Phase 2: Evaluation subsystem (Partial)
 
@@ -90,11 +94,11 @@ Exit criteria:
 | Verifier vector: build, tests, sanitizer (ASan/UBSan checks), end state, cost, steps, format | Done | [eval.md](eval.md#tasks) |
 | Statistics: pass@k, pass^k, clustered standard error, paired differences, minimum detectable effect | Done | [eval.md](eval.md#statistics) |
 | Task quality tools: `validate`, `strength`, `probe`, `calibrate` | Done | [eval.md](eval.md#task-quality) |
-| Task set: 6 seed tasks here; 106 tasks in a separate repository | Done | [../evals/README.md](../evals/README.md) |
+| Task set: 6 seed tasks here; 126 tasks in a separate repository (106 base tasks plus 20 pro tasks) | Done | [../evals/README.md](../evals/README.md) |
 | Baseline: full task set, 6 models, 1 trial | Done | |
-| Rerun the baseline with the current `mima` (behavior changed after the baseline) | Planned | |
-| Paired comparison of two runs (same models, different `mima` builds) | Planned | |
-| Harder tasks for models that saturate the current set | Planned | |
+| Rerun the baseline with the current `mima` (behavior changed after the baseline) | Partial | mima 2eb1364, base tasks x3 on the AGX: lightning30b 87%, Nano 4B 48% done, Nano 30B running, Qwen 3.6 and Qwen 3.8-27B x1 queued; Qwen 3.6 pro tasks x3 on the IGX done |
+| Paired comparison of two runs (same models, different `mima` builds) | Done | `mima-eval compare`; [eval.md](eval.md#results) |
+| Harder tasks for models that saturate the current set | Partial | 20 pro tasks (Go, Rust, Python, JavaScript; MIT-licensed upstream changes); Qwen 3.6 passes about half; more for Qwen 3.8-27B if it saturates them too |
 | Linux and kernel task track (systemd, packaging, kbuild, out-of-tree modules) | Planned | [requirements.md](requirements.md) |
 | Indirect prompt-injection red-team track (attack success rate toward 0) | Planned | |
 | Vulnerability-detection track (sanitizer oracle) | Planned | Phase 4 |
@@ -102,7 +106,12 @@ Exit criteria:
 Exit criteria:
 
 - A current baseline with at least 3 trials per task exists for every model
-  profile in use.
+  profile in use. A suite the model saturates (above 90%) needs only 1
+  trial, as a regression check; the 3 trials go to a suite where it does not
+  saturate. Profiles in use: lightning30b, Nano 4B and Nano 30B (base tasks
+  x3), Qwen 3.6 (base tasks x1, pro tasks x3: done), Qwen 3.8-27B (base
+  tasks x1; pro tasks x3 still needed). Cloud profiles are used for manual
+  testing only and are not counted.
 - The red-team track runs in the same harness and reports an attack success
   rate per model.
 - The strongest model no longer saturates the `all` suite.
@@ -130,7 +139,7 @@ Safety:
 | Shell sandbox Tier 0: environment allowlist, process-group kill, private temp directory | Done | [design/design-shell-sandboxing.md](design/design-shell-sandboxing.md) |
 | Shell sandbox Tier 1: Landlock, seccomp, rlimits (Linux only) | Done | [design/design-shell-sandboxing.md](design/design-shell-sandboxing.md) |
 | Sandbox S2 remainder: escalation argument, trusted-source-only widening, `.git/hooks` integrity check, `mima sandbox --status` | Partial | [design/design-shell-sandboxing.md](design/design-shell-sandboxing.md) |
-| Sandbox S3: test matrix on the Thor (Landlock ABI 4) | Planned | [design/design-shell-sandboxing.md](design/design-shell-sandboxing.md) |
+| Sandbox S3: test matrix on the Thor (Landlock ABI 4) | Done (passes on the AGX and IGX Thor; CUDA programs need the opt-in `[security].sandbox_gpu`; known gaps: signals not scoped below ABI 6, datagrams to local daemons through `sendmsg`) | [design/design-shell-sandboxing.md](design/design-shell-sandboxing.md#s3-results-on-the-thor) |
 | Sandbox Tiers 2 and 3 (bubblewrap, systemd scope limits) | Planned | [design/design-shell-sandboxing.md](design/design-shell-sandboxing.md) |
 | macOS shell sandbox via Seatbelt (`sandbox-exec`), phases M0-M5: profile generator with base rules from measured denials, `probe()`/`wrap()`, macOS itests, CI job | Partial | [design/design-shell-sandboxing.md](design/design-shell-sandboxing.md#macos-seatbelt) |
 | Scoped least-privilege approval rules (`Tool(glob)`, per-session "always") | Planned | |
@@ -147,7 +156,9 @@ Exit criteria:
 
 - The red-team attack success rate is reported per model and does not rise
   when web tools are enabled.
-- Tier 1 is verified on the Thor.
+- Tier 1 is verified on the Thor. Met on 2026-10-26: the matrix passed on the
+  AGX and IGX Thor (CUDA with `sandbox_gpu`), with the gaps of Landlock ABI 4
+  documented in the sandbox design.
 
 ## Phase 4: Linux domain expertise and security track (Planned)
 
@@ -202,23 +213,26 @@ Exit criteria:
 
 Ordered by dependency, then impact:
 
-1. macOS shell sandbox (Seatbelt), phases M0-M2, before any further eval
-   work on macOS; M5 before macOS eval results are compared with Linux.
-2. Rerun the baseline with the current `mima` (3 trials) and add paired
-   run-to-run comparison to `mima-eval`. Every item below is measured
-   against it.
-3. Verifier-gated self-refine: on branch `dev/self_refinement` (no measurable
-   effect on the base tasks for Qwen 3.6, gpt-4o-mini and Nano 30B; Qwen is
-   saturated there). Being revisited on the pro tasks, where many failures
-   end "done"; see
-   [design/design-verifier-gate.md](design/design-verifier-gate.md#status-and-next-steps).
-4. The TODO tool (project instructions done; measure them with a paired A/B using hand-written AGENTS.md files on a task subset).
-5. `/context-status`, then summarizing compaction (digest record first,
-   then `/compact`) and `recall_output`, measured on the 8k-window
-   regression task.
-   See [design/design-context-management.md](design/design-context-management.md).
-6. Prompt-injection red-team track, then taint tracking and tool-argument
+1. Finish the baseline rerun (mima 2eb1364, AGX): Nano 30B x3, then Qwen 3.6
+   and Qwen 3.8-27B x1 on the base tasks, each compared with the 4a61467
+   baseline; then Qwen 3.8-27B on the pro tasks x3. Every item below is
+   measured against it.
+2. Self-refine end check and budget: a paired A/B on Nano 4B and Nano 30B
+   over `hard` and `mutations` (the Phase 1 exit criterion), and the Qwen 3.6
+   pro-task run against its 48K-reply control. If neither shows a gain,
+   revise the criterion rather than chase it. See
+   [design/design-verifier-gate.md](design/design-verifier-gate.md).
+3. Sandbox S2 remainder: escalation argument, trusted-source-only widening,
+   `.git/hooks` integrity check, `mima sandbox --status`.
+4. Prompt-injection red-team track, then taint tracking and tool-argument
    sanitization.
-7. Linux and kernel eval tasks, plus harder tasks for saturated models.
-8. Sandbox S2 remainder and S3 on the Thor.
+5. The TODO tool; a paired A/B for project instructions using hand-written
+   AGENTS.md files on a task subset.
+6. Summarizing compaction: the model summary and `/compact`, then
+   `recall_output` (the digest record and `/context-status` are done).
+   See [design/design-context-management.md](design/design-context-management.md).
+7. Linux and kernel eval tasks; more hard tasks if Qwen 3.8-27B saturates
+   the pro tasks.
+8. macOS: M4 (CI green on macOS) and M5 before macOS eval results are
+   compared with Linux.
 9. Parallel read-only tools and `/undo`.

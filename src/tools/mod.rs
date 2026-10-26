@@ -592,9 +592,14 @@ impl BashExecutor {
             None => "off".into(),
             Some(Err(e)) => e.clone(),
             Some(Ok(run)) => format!(
-                "{}, network {}, writable: {}",
+                "{}, network {}{}, writable: {}",
                 crate::sandbox::probe().describe(),
                 if run.policy.network { "on" } else { "off" },
+                if run.policy.gpu {
+                    ", GPU access (Unix sockets may accept connections)"
+                } else {
+                    ""
+                },
                 run.policy
                     .write
                     .iter()
@@ -623,6 +628,31 @@ fn looks_like_sandbox_denial(stderr: &str) -> bool {
 
 /// Decides whether and how commands are sandboxed. Paths come only from the
 /// session's configuration and starting directory, never from a tool call.
+/// `[security].sandbox_gpu`, unless it cannot help or is unsafe: without
+/// NVIDIA device nodes there is nothing to grant, and as root a writable
+/// `/proc` would let a command change kernel settings (for example
+/// `kernel.core_pattern`, which runs a program outside the sandbox).
+fn gpu_access(sec: &crate::config::Security) -> bool {
+    if !sec.sandbox_gpu {
+        return false;
+    }
+    if !crate::sandbox::gpu_present() {
+        tracing::warn!(
+            "[security].sandbox_gpu is set but no NVIDIA device nodes exist; not granted"
+        );
+        return false;
+    }
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    if unsafe { libc::geteuid() } == 0 {
+        tracing::warn!(
+            "[security].sandbox_gpu is not granted when mima runs as root (a writable /proc \
+             would let commands change kernel settings)"
+        );
+        return false;
+    }
+    true
+}
+
 fn sandbox_setup(
     sec: &crate::config::Security,
     tmp: Option<&std::path::Path>,
@@ -679,14 +709,20 @@ fn sandbox_setup(
             .iter()
             .filter_map(|p| canon(expand_home(p))),
     );
+    let gpu = gpu_access(sec);
+    if gpu {
+        write.push("/proc".into());
+    }
     let policy = crate::sandbox::Policy {
         read,
         write,
         network: sec.sandbox_network,
+        gpu,
     };
     tracing::info!(
         support = %support.describe(),
         network = sec.sandbox_network,
+        gpu = policy.gpu,
         "shell commands are sandboxed"
     );
     Some(Ok(SandboxRun { exe, policy }))

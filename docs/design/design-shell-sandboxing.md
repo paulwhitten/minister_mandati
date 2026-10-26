@@ -2,7 +2,10 @@
 
 Status: Tier 0 implemented (`src/tools/shell.rs`); Tier 1 implemented
 (`src/sandbox/linux.rs`, tests in `itests/sandbox.rs`), tested on the dev host
-(x86_64, Landlock ABI 6), not yet on the Thor; approval integration (S2)
+(x86_64, Landlock ABI 6) and on the AGX and IGX Thor (Landlock ABI 4; see
+[S3 results](#s3-results-on-the-thor)); CUDA programs need the opt-in
+`[security].sandbox_gpu`; approval
+integration (S2)
 partly done (failure notes); Tiers 2-3 not started. macOS (Seatbelt):
 M0-M2 implemented (`src/sandbox/macos.rs`, macOS cases in
 `itests/sandbox.rs`) and tested on macOS 26.7.1; M3 network-on profile done;
@@ -11,15 +14,25 @@ M0-M2 implemented (`src/sandbox/macos.rs`, macOS cases in
 
 Implementation notes for Tier 1 (differences from the proposal below):
 
-- Settings are in `[security]`: `sandbox` ("auto" | "required" | "off"),
-  `sandbox_network`, `sandbox_read_paths` (default `~/.cargo`, `~/.rustup`,
-  `~/.local/bin`, `~/.local/lib`, `~/.gitconfig`, `~/.config/git`),
-  `sandbox_writable_paths`. Git needs `~/.config/git` readable: it treats an
+- Settings are in `[security]` (all shown with their defaults in
+  `agent.toml.example`): `sandbox` ("auto" | "required" | "off"),
+  `sandbox_network`, `sandbox_gpu` (Linux, off by default; see
+  [GPU access](#tier-1-landlock--seccomp--rlimits-default)),
+  `sandbox_read_paths` (default `~/.cargo`, `~/.rustup`, `~/.local/bin`,
+  `~/.local/lib`, `~/.gitconfig`, `~/.config/git`, `~/.local/go`,
+  `~/go/pkg/mod`), `sandbox_writable_paths`. A workspace `./agent.toml`
+  cannot widen any of them. Git needs `~/.config/git` readable: it treats an
   unreadable `ignore` file there as fatal.
 - `/run` is readable (resolver and runtime files); `/dev` is writable (DAC
   still applies).
-- `sendto`/`recvmmsg`/`sendmmsg` stay allowed: with non-Unix sockets denied
-  they only reach Unix socket pairs, which Python and others use internally.
+- With the network off, `sendto` is denied only when it names a destination
+  address (plain `send` has none), so Unix socket pairs keep working.
+  `sendmsg` and `sendmmsg` stay allowed, because the address is inside a
+  struct that seccomp cannot read. So a command can still send datagrams to
+  a local daemon's Unix datagram socket with `sendmsg` (for example
+  `/dev/log` or journald, which may forward logs off the device). This is a
+  known gap; closing it needs Landlock rules for Unix sockets (not in ABI
+  6) or a network namespace (Tier 2).
 - Landlock scopes: signals always, abstract Unix sockets when the network is
   off (ABI 6 and later).
 - On x86_64 a second filter denies all x32-ABI system calls.
@@ -193,8 +206,41 @@ subpath of a granted directory. So the policy grants narrowly:
 - not the home directory as a whole, so `~/.ssh`, `~/.aws`, `~/.netrc`,
   `~/.config/gh` and mima's own config are unreadable without a deny list.
 
-On the Thor, GPU device nodes needed by CUDA programs are added to the device
-list.
+**GPU access (`[security].sandbox_gpu`, off by default).** CUDA programs do
+not run in the default sandbox (see [S3 results](#s3-results-on-the-thor)).
+Setting `sandbox_gpu = true` in the user configuration grants what the CUDA
+driver needs beyond the already writable `/dev`:
+
+- `/proc` becomes writable, because the driver names its threads through
+  `/proc/self/task/<tid>/comm`. It is added to the policy's writable list,
+  so the startup log and sandbox summary show it;
+- with the network off, Unix sockets may `bind`, `listen` and `accept`,
+  because the driver binds an abstract Unix socket. `socket` stays limited
+  to `AF_UNIX`, and `connect` and `sendto` with an address stay denied, so
+  stream connections to local daemons are still refused.
+
+It is not granted when mima runs as root (a writable `/proc/sys` would let a
+command set `kernel.core_pattern`, which runs a program outside the sandbox)
+or when no NVIDIA device nodes exist (`/dev/nvidiactl`). A workspace
+`./agent.toml` cannot turn it on.
+
+The write cannot be narrowed to `/proc/self`: Landlock resolves that path
+once, for the helper, not for its child processes. What the setting costs:
+
+- Files of the user's other processes that the kernel does not guard with a
+  ptrace check become writable from inside: `oom_score_adj` (a command can
+  make mima or a model server the first target of the OOM killer),
+  `coredump_filter` and `clear_refs`. `/proc/<pid>/mem` and similar files
+  stay protected by Landlock's ptrace scoping.
+- A command that creates a user namespace can write its `uid_map`, so user
+  namespaces become usable inside the sandbox where the kernel allows them
+  (not on the Thor, which restricts unprivileged user namespaces; allowed on
+  the dev host). That exposes more kernel code.
+- A command can run a Unix-socket server. With `setsid` it can outlive the
+  command (the process-group kill does not reach it; it stays sandboxed),
+  and it could take an abstract socket name that an outside client expects.
+  Landlock ABI 6 does not prevent that either; Tier 3 (a systemd scope)
+  would end such processes.
 
 **Network and system calls (seccomp, deny with EPERM).**
 
@@ -202,7 +248,9 @@ list.
   `bind`, `listen`, `accept`, `accept4`, `sendto`, `sendmmsg`, `recvmmsg`.
   Denying `connect` and `sendto` outright also blocks DNS over UDP (which
   Landlock ABI 4 cannot restrict) and connections to local daemons over Unix
-  sockets (resolver, D-Bus, `systemd --user`, ssh-agent, docker).
+  sockets (resolver, D-Bus, `systemd --user`, ssh-agent, docker). As
+  implemented (see the notes at the top), `sendto` is denied only with a
+  destination address and `sendmsg`/`sendmmsg`/`recvmmsg` stay allowed.
   `socketpair(AF_UNIX)` stays allowed for pipes between processes.
 - Always: `io_uring_*` (a path around seccomp checks), `ioctl` with `TIOCSTI`
   or `TIOCLINUX`, the mount family, `keyctl`/`add_key`/`request_key`, `bpf`,
@@ -439,7 +487,9 @@ drives both platforms.
 - **Configuration.** No new settings. `sandbox`, `sandbox_network`,
   `sandbox_read_paths`, `sandbox_writable_paths` and
   `auto_approve_sandboxed` mean the same on both platforms, and so do the
-  trusted-source rules in `restrict_to_untrusted`.
+  trusted-source rules in `restrict_to_untrusted`. `sandbox_gpu` is Linux
+  only; on macOS it has no effect (mima logs that no NVIDIA device nodes
+  exist).
 
 ### Code layout and keeping Linux unchanged
 
@@ -493,6 +543,78 @@ is unavailable:
    change to `.git/hooks` is detected.
 8. seccomp filters per architecture (golden tests; x32 syscalls denied on
    x86_64).
+
+### S3 results on the Thor
+
+Run on 2026-10-25 from the working tree after a72d6f2. Binaries were built
+natively on the IGX Thor (debug profile) and copied unchanged to the AGX
+Thor, so no build ran on the AGX during an evaluation run there.
+
+| | Dev host | IGX Thor | AGX Thor |
+|---|---|---|---|
+| System | Debian 13, kernel 6.12, x86_64 | L4T R38.5, kernel 6.8.0-1019-nvidia-tegra, aarch64 | L4T R39.2, kernel 6.8.12-1021-tegra, aarch64 |
+| Landlock ABI | 6 | 4 | 4 |
+| `kernel.yama.ptrace_scope` | | 1 | 1 |
+| `dev.tty.legacy_tiocsti` | | 0 | 1 |
+| Unit tests (226 mima, 61 mima-eval) | pass | pass | pass |
+| `itests/sandbox.rs` (14, plus 1 ignored) | pass | pass | pass |
+| Not available, so skipped | strace, gdb, pytest | none | cargo, strace |
+
+Matrix items covered (numbers refer to the list above):
+
+1. Filesystem: `workspace_is_writable_and_the_rest_is_not`, including a
+   workspace symlink to a planted key.
+2. Network: socket creation, TCP connect to a local listener, Unix connect to
+   a listener standing in for D-Bus or ssh-agent, and connect to an abstract
+   Unix socket, each refused with the network off and allowed with it on.
+3. Terminal and processes: TIOCSTI on a fresh controlling pty is refused with
+   EPERM. On the AGX the same call succeeds outside the sandbox
+   (`legacy_tiocsti = 1`), so the seccomp rule is what stops it there.
+   `PTRACE_ATTACH` to a process outside fails; gdb (both Thors) and strace
+   (IGX) work on a program inside.
+4. and 5. Environment allowlist, private `TMPDIR`, new session without a
+   terminal, background processes ended with the command, and the timeout
+   killing the whole group: unit tests in `src/tools/shell.rs`.
+6. Real work: `git commit`, `make` with `cc`, Python multiprocessing,
+   `pytest`, and `cargo build` (dev host and IGX) inside the sandbox.
+7. Policy: only the nested-helper case (a nested helper cannot widen the
+   outer policy). The cases that depend on S2 (`./agent.toml` widening,
+   `.git/hooks`) wait for S2.
+8. The seccomp program builds and applies on aarch64 (all tests above).
+
+Findings:
+
+- **Signals reach processes outside the sandbox on ABI 4.** Landlock signal
+  scoping needs ABI 6, so `kill` from inside reaches any process of the same
+  user on both Thors (test
+  `linux_signals_reach_outside_processes_only_before_landlock_abi_6` pins
+  this). Abstract Unix sockets, the other ABI 6 scope, are covered by the
+  connect deny.
+- **CUDA programs fail inside the sandbox on both Thors.** `cuInit` returns
+  304 (`CUDA_ERROR_OPERATING_SYSTEM`); outside the sandbox it succeeds. Two
+  rules cause this, found with strace:
+  1. The driver names its worker thread by writing
+     `/proc/self/task/<tid>/comm` and fails when that write is refused
+     (`/proc` is read-only in the policy).
+  2. With that fixed, the driver binds an abstract Unix socket
+     (`@cuda-uvmfd-<netns>-<pid>`) and reports no device (error 100) when
+     the network-off filter refuses `bind`.
+
+  Addressed on 2026-10-26 by the opt-in `[security].sandbox_gpu` (see
+  [GPU access](#tier-1-landlock--seccomp--rlimits-default) for what it
+  costs). With it, `linux_cuda_driver_works` (opt-in, because it uses the
+  GPU) runs `cuInit`, `cuCtxCreate` and a 1 MiB `cuMemAlloc` inside the
+  sandbox on both Thors, and checks that the same calls fail without it. The
+  driver's connect to the MPS control socket (`/tmp/nvidia-mps/control`) is
+  still refused, without harm here because MPS was not running; programs
+  that use MPS would need that socket.
+  `linux_gpu_access_opens_proc_and_unix_servers_but_not_connect` checks the
+  setting's effect on any Linux host.
+- **Datagrams to local daemons.** Found in review after S3: with the network
+  off, `sendto` with an address reached a Unix datagram socket outside (such
+  as `/dev/log`). It is now denied
+  (`linux_datagrams_to_local_daemons_are_refused_with_the_network_off`);
+  `sendmsg` with an address cannot be filtered and remains a gap.
 
 ## Implementation phases
 
@@ -557,6 +679,11 @@ Linux runs wait for M5.
 - Whether the integrity check should restore changed hook files or only
   report them.
 - How to present escalation requests in non-interactive one-shot mode.
+- Whether CUDA MPS clients need the MPS control socket allowed under
+  `sandbox_gpu`.
+- Whether to deny user namespaces (`unshare`, and `clone`/`clone3` with
+  `CLONE_NEWUSER`) in the filter. `clone3` passes its flags in a struct, so
+  this needs `clone3` to return ENOSYS (glibc then falls back to `clone`).
 
 ## References
 

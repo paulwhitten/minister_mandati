@@ -30,6 +30,12 @@ pub fn describe(s: &super::Support) -> String {
     }
 }
 
+/// No GPU rules on macOS (Metal needs no device nodes).
+#[cfg(target_os = "macos")]
+pub fn gpu_present() -> bool {
+    false
+}
+
 /// Probes the system without changing anything.
 #[cfg(target_os = "macos")]
 pub fn probe() -> super::Support {
@@ -208,6 +214,7 @@ pub fn argv(policy: &Policy, command: &[String]) -> Vec<String> {
         read: policy.read.iter().map(canon).collect(),
         write: policy.write.iter().map(canon).collect(),
         network: policy.network,
+        gpu: policy.gpu,
     };
     let home = std::env::var_os("HOME").map(|h| canon(&PathBuf::from(h)));
     let protected = protected_paths(&policy.write);
@@ -248,6 +255,7 @@ mod tests {
             read: vec!["/opt/tools".into()],
             write: vec!["/work/repo".into(), "/dev/null".into()],
             network,
+            gpu: false,
         }
     }
 
@@ -257,6 +265,7 @@ mod tests {
             read: vec![],
             write: vec![r#"/work/a") (allow default) ("#.into()],
             network: false,
+            gpu: false,
         };
         let (text, params) = profile(&p, None, &[]);
         assert!(!text.contains("/work"), "{text}");

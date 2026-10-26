@@ -14,9 +14,13 @@
 //!   the session's private temp directory and device nodes. The home
 //!   directory as a whole is not granted, so `~/.ssh`, `~/.aws` and similar
 //!   are unreadable without a deny list.
-//! - Network (unless allowed): no sockets other than Unix ones, and no
-//!   `connect`/`bind`/`listen`/`accept`, which also blocks DNS over UDP and
-//!   local daemons (D-Bus, ssh-agent, the resolver).
+//! - Network (unless allowed): no sockets other than Unix ones, no
+//!   `connect`, and no `sendto` with a destination address, which also
+//!   blocks DNS over UDP and local daemons (D-Bus, ssh-agent, the resolver,
+//!   `/dev/log`). `sendmsg` with an address cannot be filtered (the address
+//!   is inside a struct), so Unix datagram sockets of local daemons stay
+//!   reachable that way. Without GPU access (`Policy::gpu`) also no
+//!   `bind`/`listen`/`accept`.
 //! - Always: no io_uring, no terminal keystroke injection (`TIOCSTI`), no
 //!   mounts, kernel keyrings, BPF, module loading or kexec.
 
@@ -32,6 +36,12 @@ pub const SYSTEM_READ: &[&str] = &[
 /// Locations every command may write: device nodes (DAC still applies, so
 /// this is /dev/null, /dev/zero, ttys and, on the Thor, GPU devices).
 pub const SYSTEM_WRITE: &[&str] = &["/dev"];
+
+/// NVIDIA device nodes exist (the Thor, or a discrete GPU), so
+/// `[security].sandbox_gpu` can take effect.
+pub fn gpu_present() -> bool {
+    Path::new("/dev/nvidiactl").exists()
+}
 
 pub fn describe(s: &Support) -> String {
     if s.usable() {
@@ -182,7 +192,12 @@ fn always_denied() -> Vec<i64> {
 }
 
 /// System calls denied when the network is off (besides non-Unix sockets).
-fn network_denied() -> Vec<i64> {
+/// With GPU access only `connect` is: sockets are Unix-only then, and the
+/// CUDA driver binds one.
+fn network_denied(gpu: bool) -> Vec<i64> {
+    if gpu {
+        return vec![libc::SYS_connect];
+    }
     vec![
         libc::SYS_connect,
         libc::SYS_bind,
@@ -212,7 +227,7 @@ pub fn seccomp_program(policy: &Policy) -> Result<seccompiler::BpfProgram, Strin
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
     let mut nrs = always_denied();
     if !policy.network {
-        nrs.extend(network_denied());
+        nrs.extend(network_denied(policy.gpu));
     }
     for nr in nrs {
         rules.insert(nr, vec![]); // empty: match unconditionally
@@ -234,6 +249,18 @@ pub fn seccomp_program(policy: &Policy) -> Result<seccompiler::BpfProgram, Strin
         vec![ioctl_rule(tiocsti)?, ioctl_rule(tioclinux)?],
     );
     if !policy.network {
+        // sendto(fd, buf, len, flags, dest_addr, addrlen) with an address: a
+        // datagram to a local daemon. Plain send() has no address.
+        rules.insert(
+            libc::SYS_sendto,
+            vec![
+                SeccompRule::new(vec![
+                    SeccompCondition::new(4, SeccompCmpArgLen::Qword, SeccompCmpOp::Ne, 0)
+                        .map_err(err)?,
+                ])
+                .map_err(err)?,
+            ],
+        );
         // socket(domain, ...) for any domain other than AF_UNIX.
         rules.insert(
             libc::SYS_socket,
@@ -301,14 +328,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn seccomp_programs_build_for_both_network_settings() {
-        for network in [false, true] {
+    fn seccomp_programs_build_for_all_settings() {
+        for (network, gpu) in [(false, false), (true, false), (false, true)] {
             let p = Policy {
                 read: vec![],
                 write: vec![],
                 network,
+                gpu,
             };
             assert!(!seccomp_program(&p).unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn gpu_access_allows_unix_servers_but_not_connect() {
+        assert!(network_denied(false).contains(&libc::SYS_bind));
+        assert_eq!(network_denied(true), vec![libc::SYS_connect]);
     }
 }

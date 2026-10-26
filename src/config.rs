@@ -404,6 +404,13 @@ pub struct Security {
     /// Let sandboxed commands use the network (off by default).
     #[serde(default)]
     pub sandbox_network: bool,
+    /// Let sandboxed commands use an NVIDIA GPU (Linux; off by default). The
+    /// CUDA driver needs `/proc` writable and Unix sockets that accept
+    /// connections, which widens the sandbox (see "GPU access" in
+    /// docs/design/design-shell-sandboxing.md). Not granted when mima runs as
+    /// root or no NVIDIA device nodes exist.
+    #[serde(default)]
+    pub sandbox_gpu: bool,
     /// Extra read-only locations for sandboxed commands (`~/` is expanded),
     /// beyond system directories and the workspace.
     #[serde(default = "default_sandbox_read_paths")]
@@ -513,6 +520,10 @@ impl Security {
             self.sandbox_network = false;
             note("sandbox_network = true");
         }
+        if self.sandbox_gpu {
+            self.sandbox_gpu = false;
+            note("sandbox_gpu = true");
+        }
         if self
             .sandbox_read_paths
             .iter()
@@ -585,6 +596,7 @@ impl Default for Security {
             env_passthrough: Vec::new(),
             sandbox: default_sandbox_mode(),
             sandbox_network: false,
+            sandbox_gpu: false,
             sandbox_read_paths: default_sandbox_read_paths(),
             sandbox_writable_paths: Vec::new(),
             auto_approve_sandboxed: false,
@@ -963,18 +975,20 @@ mod tests {
         let mut c: Config = toml::from_str(
             "[security]\nrequire_approval_for_bash = false\nauto_approve_bash = [\"rm\"]\n\
              auto_approve_sandboxed = true\nsandbox = \"off\"\nsandbox_network = true\n\
+             sandbox_gpu = true\n\
              sandbox_writable_paths = [\"~\"]\nsandbox_read_paths = [\"~/.ssh\"]\n\
              bash_wrapper = [\"./evil.sh\"]\nenv_passthrough = [\"MIMA_API_KEY\"]\n\
              allowed_paths = [\"/\"]\n",
         )
         .unwrap();
         let reset = c.security.restrict_to_untrusted();
-        assert_eq!(reset.len(), 10, "{reset:?}");
+        assert_eq!(reset.len(), 11, "{reset:?}");
         let d = super::Security::default();
         assert!(c.security.require_approval_for_bash && !c.security.auto_approve_sandboxed);
         assert!(c.security.auto_approve_bash.is_empty() && c.security.bash_wrapper.is_empty());
         assert_eq!(c.security.sandbox, "auto");
         assert!(!c.security.sandbox_network && c.security.sandbox_writable_paths.is_empty());
+        assert!(!c.security.sandbox_gpu);
         assert_eq!(c.security.sandbox_read_paths, d.sandbox_read_paths);
         assert_eq!(c.security.allowed_paths, d.allowed_paths);
         assert!(c.security.env_passthrough.is_empty());

@@ -49,6 +49,18 @@ require_approval_for_writes = true
 # entries specific: "git" alone would allow "git push --force".
 # auto_approve_bash = ["cargo test", "cargo build", "git status", "git diff"]
 # bash_timeout_secs = 300             # kill a shell command after this long
+# Shell sandbox (Landlock + seccomp on Linux, Seatbelt on macOS; see
+# docs/design/design-shell-sandboxing.md). Defaults shown. A workspace
+# ./agent.toml can narrow these but never widen them.
+# sandbox = "auto"                    # "auto" | "required" (no sandbox, no commands) | "off"
+# sandbox_network = false             # let sandboxed commands use the network
+# sandbox_gpu = false                 # Linux: let sandboxed commands use an NVIDIA GPU (CUDA).
+#                                     # Makes /proc writable and lets Unix sockets accept
+#                                     # connections; refused when mima runs as root.
+# sandbox_read_paths = ["~/.cargo", "~/.rustup", "~/.local/bin", "~/.local/lib",
+#                       "~/.gitconfig", "~/.config/git", "~/.local/go", "~/go/pkg/mod"]
+# sandbox_writable_paths = []         # writable beyond the workspace and the private temp dir
+# auto_approve_sandboxed = false      # approve every sandboxed command without a prompt
 # Sandbox for the filesystem tools ONLY. Does NOT constrain shell commands.
 allowed_paths = ["./"]
 
